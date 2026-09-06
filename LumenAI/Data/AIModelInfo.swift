@@ -234,7 +234,7 @@ struct ModelSettings: Codable, Sendable {
     // MARK: - 复现新增设置
     /// 发送时自动联网搜索（将搜索结果注入上下文）
     var cloudWebSearch: Bool
-    /// 朗读引擎："system"（系统 TTS）或 "network"（OpenAI 兼容网络 TTS）
+    /// 朗读引擎："system"（系统 TTS）、"kokoro"（本地神经 TTS）或 "network"（OpenAI 兼容网络 TTS）
     var ttsEngine: String
     /// 系统 TTS 语音标识（如 zh-CN / en-US）
     var ttsVoice: String
@@ -242,6 +242,10 @@ struct ModelSettings: Codable, Sendable {
     var ttsVoiceName: String
     /// 网络 TTS 模型名
     var ttsModel: String
+    /// Kokoro 本地 TTS 音色 ID（如 zf_xiaoxiao / zm_yunjian）
+    var ttsKokoroVoice: String
+    /// Kokoro 本地 TTS 语速（0.5 - 2.0，1.0 为原速）
+    var ttsSpeed: Double
     /// 界面语言："zh" / "en"
     var language: String
 
@@ -313,6 +317,8 @@ struct ModelSettings: Codable, Sendable {
         ttsVoice: String = "",
         ttsVoiceName: String = "alloy",
         ttsModel: String = "tts-1",
+        ttsKokoroVoice: String = "zf_xiaoxiao",
+        ttsSpeed: Double = 1.0,
         language: String = "zh",
         keepScreenOn: Bool = false,
         memoryEnabled: Bool = false,
@@ -360,6 +366,8 @@ struct ModelSettings: Codable, Sendable {
         self.ttsVoice = ttsVoice
         self.ttsVoiceName = ttsVoiceName
         self.ttsModel = ttsModel
+        self.ttsKokoroVoice = ttsKokoroVoice
+        self.ttsSpeed = ttsSpeed
         self.language = language
         self.keepScreenOn = keepScreenOn
         self.memoryEnabled = memoryEnabled
@@ -392,7 +400,7 @@ struct ModelSettings: Codable, Sendable {
         case temperature, topP, topK, maxTokens, contextLength, systemPrompt,
              gpuLayers, searchEngine, searxngURL, showThinking, showToolCalls, useMmap,
              apiEnabled, apiEndpoint, apiKey, apiModel, apiTemperature, apiMaxTokens,
-             cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, language,
+             cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsKokoroVoice, ttsSpeed, language,
              keepScreenOn, memoryEnabled, worldBookEnabled, instructionEnabled,
              promptStrategy, useMetalAuto, kvCacheQuantize, autoCheckUpdate, grayOptIn, autoExtractMemory,
              s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region,
@@ -429,6 +437,8 @@ struct ModelSettings: Codable, Sendable {
         ttsVoice = try c.decodeIfPresent(String.self, forKey: .ttsVoice) ?? ""
         ttsVoiceName = try c.decodeIfPresent(String.self, forKey: .ttsVoiceName) ?? "alloy"
         ttsModel = try c.decodeIfPresent(String.self, forKey: .ttsModel) ?? "tts-1"
+        ttsKokoroVoice = try c.decodeIfPresent(String.self, forKey: .ttsKokoroVoice) ?? "zf_xiaoxiao"
+        ttsSpeed = try c.decodeIfPresent(Double.self, forKey: .ttsSpeed) ?? 1.0
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? "zh"
         keepScreenOn = try c.decodeIfPresent(Bool.self, forKey: .keepScreenOn) ?? false
         memoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .memoryEnabled) ?? false
@@ -479,6 +489,8 @@ struct ModelSettings: Codable, Sendable {
         try c.encode(ttsVoice, forKey: .ttsVoice)
         try c.encode(ttsVoiceName, forKey: .ttsVoiceName)
         try c.encode(ttsModel, forKey: .ttsModel)
+        try c.encode(ttsKokoroVoice, forKey: .ttsKokoroVoice)
+        try c.encode(ttsSpeed, forKey: .ttsSpeed)
         try c.encode(language, forKey: .language)
         try c.encode(keepScreenOn, forKey: .keepScreenOn)
         try c.encode(memoryEnabled, forKey: .memoryEnabled)

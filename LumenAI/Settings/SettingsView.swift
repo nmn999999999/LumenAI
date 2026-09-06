@@ -386,6 +386,7 @@ struct SettingsView: View {
                 // 朗读引擎
                 Picker(t("朗读引擎"), selection: $storage.settings.ttsEngine) {
                     Text(t("系统 TTS")).tag("system")
+                    Text(t("本地神经 TTS")).tag("kokoro")
                     Text(t("网络 TTS")).tag("network")
                 }
                 .pickerStyle(.segmented)
@@ -402,6 +403,8 @@ struct SettingsView: View {
                     Text("使用当前云端 Provider 的 OpenAI 兼容 /audio/speech 接口；不可用时自动回退系统 TTS。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                } else if storage.settings.ttsEngine == "kokoro" {
+                    kokoroTTSCard
                 } else {
                     HStack {
                         Text(t("系统语音")).font(.subheadline)
@@ -466,6 +469,113 @@ struct SettingsView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(.quaternary, in: .capsule)
+    }
+
+    // MARK: - Kokoro 本地神经 TTS
+
+    @ObservedObject private var kokoroManager = KokoroTTSManager.shared
+
+    private var kokoroTTSCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // 模型状态 / 下载
+            switch kokoroManager.state {
+            case .ready:
+                HStack {
+                    Label("本地语音模型已就绪", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(.green)
+                    Spacer()
+                    Button(role: .destructive) {
+                        kokoroManager.deleteModel()
+                    } label: {
+                        Text(t("删除模型")).font(.caption)
+                    }
+                }
+            case .downloading:
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("正在下载语音模型（约 175 MB）…").font(.subheadline)
+                        Spacer()
+                        Button {
+                            kokoroManager.cancelDownload()
+                        } label: {
+                            Text(t("取消")).font(.caption)
+                        }
+                    }
+                    ProgressView(value: kokoroManager.progress)
+                        .tint(.blue)
+                    Text(String(
+                        format: "%@ · %.0f%%",
+                        kokoroManager.currentFile.isEmpty ? "Kokoro int8" : kokoroManager.currentFile,
+                        kokoroManager.progress * 100
+                    ))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            case .failed(let message):
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(message, systemImage: "exclamationmark.triangle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                    Button {
+                        kokoroManager.startDownload()
+                    } label: {
+                        Text(t("重试下载")).font(.caption.bold())
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.mini)
+                }
+            case .idle:
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        kokoroManager.startDownload()
+                    } label: {
+                        Label("下载本地语音模型（约 175 MB）", systemImage: "arrow.down.circle")
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    Text("Kokoro 神经网络语音：离线、自然、支持中英混合朗读；首次使用需下载模型（支持断点续传），删除后可重新下载。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+
+            // 音色选择（按语言分组）
+            HStack {
+                Text(t("音色")).font(.subheadline)
+                Spacer()
+                Picker(t("音色"), selection: $storage.settings.ttsKokoroVoice) {
+                    ForEach(KokoroVoices.grouped) { group in
+                        Section(group.name) {
+                            ForEach(group.items) { v in
+                                Text(v.label).tag(v.id)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: 260)
+            }
+
+            // 语速
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(t("语速")).font(.subheadline)
+                    Spacer()
+                    Text(String(format: "%.1f×", storage.settings.ttsSpeed))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: $storage.settings.ttsSpeed, in: 0.5...2.0, step: 0.1) {
+                    Text(t("语速"))
+                }
+            }
+            Text("53 个音色（中文 8 个 + 英/日/西/法等），支持中英文混读；合成在设备本地完成，无需联网。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
     }
 
     // MARK: - 云存储 / 屏幕常亮 / 人格记忆

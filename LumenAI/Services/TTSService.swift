@@ -26,14 +26,19 @@ final class TTSService: NSObject, ObservableObject {
         stop()
         let settings = SettingsStorage.shared.settings
 
-        if settings.ttsEngine == "network" {
+        switch settings.ttsEngine {
+        case "network":
             Task { await speakNetwork(text, settings: settings) }
-        } else {
+        case "kokoro":
+            Task { await speakKokoro(text, settings: settings) }
+        default:
             speakSystem(text, settings: settings)
         }
     }
 
     func stop() {
+        kokoroTask?.cancel()
+        kokoroTask = nil
         synthesizer.stopSpeaking(at: .immediate)
         audioPlayer?.stop()
         isSpeaking = false
@@ -62,6 +67,59 @@ final class TTSService: NSObject, ObservableObject {
         utterance.pitchMultiplier = 1.0
         isSpeaking = true
         synthesizer.speak(utterance)
+    }
+
+    // MARK: 本地神经 TTS（Kokoro，离线）
+
+    private var kokoroTask: Task<Void, Never>?
+
+    private func speakKokoro(_ text: String, settings: ModelSettings) async {
+        guard !text.isEmpty else { return }
+
+        // 模型未就绪：回退系统 TTS 并提示
+        guard KokoroModelManifest.isComplete(in: KokoroTTSManager.modelDirectory) else {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            speakSystem(text, settings: settings)
+            return
+        }
+
+        isSpeaking = true
+        let voiceID = settings.ttsKokoroVoice
+        let speed = Float(settings.ttsSpeed > 0 ? settings.ttsSpeed : 1.0)
+        kokoroTask = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let engine = try KokoroTTSManager.engine()
+                let (samples, rate) = try engine.generate(text: text, voiceID: voiceID, speed: speed)
+                let wav = WAVWriter.wavData(samples: samples, sampleRate: rate)
+                await MainActor.run {
+                    guard !Task.isCancelled else { return }
+                    self.playWAVData(wav)
+                }
+            } catch is CancellationError {
+                await MainActor.run { self.isSpeaking = false }
+            } catch {
+                // 引擎失败（内存不足等）回退系统 TTS
+                await MainActor.run {
+                    self.isSpeaking = false
+                    self.speakSystem(text, settings: settings)
+                }
+            }
+        }
+    }
+
+    private func playWAVData(_ data: Data) {
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playback, mode: .default)
+        try? audioSession.setActive(true)
+        if let player = try? AVAudioPlayer(data: data) {
+            audioPlayer = player
+            player.delegate = self
+            isSpeaking = true
+            player.play()
+        } else {
+            isSpeaking = false
+        }
     }
 
     // MARK: 网络 TTS（OpenAI 兼容 /audio/speech）

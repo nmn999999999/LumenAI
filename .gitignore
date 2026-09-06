@@ -32,6 +32,10 @@ llama.xcframework/
 # SSH 桥接静态库（libssh2 + mbedTLS 交叉编译，由 ssh/ 脚本重建）
 ssh.xcframework/
 
+# sherpa-onnx (Kokoro TTS) 推理框架 —— 从 GitHub release 下载,勿入库
+SherpaOnnxC.xcframework/
+sherpa-onnx-*.zip
+
 # 其他项目克隆（勿提交）
 kelivo_repo/
 icon_gen*/

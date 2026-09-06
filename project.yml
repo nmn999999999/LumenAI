@@ -23,6 +23,8 @@ targets:
         embed: false
       - framework: ssh.xcframework
         embed: false
+      - framework: SherpaOnnxC.xcframework
+        embed: false
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
@@ -31,8 +33,8 @@ targets:
         # iOS 26 App 图标：Icon Composer 工程（appicon.icon）作为官方 AppIcon 源，
         # 由 actool 用 Icon Composer 渲染管线生成含液态玻璃效果的全部变体
         ASSETCATALOG_COMPILER_APPICON_NAME: appicon
-        MARKETING_VERSION: 0.3.48
-        CURRENT_PROJECT_VERSION: 49
+        MARKETING_VERSION: 0.3.49
+        CURRENT_PROJECT_VERSION: 50
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
@@ -46,7 +48,7 @@ targets:
         # 暴露 C 桥接头文件给 Swift
         SWIFT_OBJC_BRIDGING_HEADER: LumenAI/LumenAI-Bridging-Header.h
         # llama.cpp / mtmd 头文件（来自 llama.xcframework 的 Headers）
-        HEADER_SEARCH_PATHS: $(SRCROOT)/llama.xcframework/ios-arm64/Headers $(SRCROOT)/ssh.xcframework/ios-arm64/Headers $(SRCROOT)/LumenAI/LlamaCore
+        HEADER_SEARCH_PATHS: $(SRCROOT)/llama.xcframework/ios-arm64/Headers $(SRCROOT)/ssh.xcframework/ios-arm64/Headers $(SRCROOT)/SherpaOnnxC.xcframework/ios-arm64/SherpaOnnxC.framework/Headers $(SRCROOT)/LumenAI/LlamaCore
         # C++20 + 多模态开关
         CLANG_CXX_LANGUAGE_STANDARD: c++20
         OTHER_CPLUSPLUSFLAGS: -DBRIDGE_ENABLE_MTMD -std=c++20
