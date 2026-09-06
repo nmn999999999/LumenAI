@@ -23,8 +23,9 @@ targets:
         embed: false
       - framework: ssh.xcframework
         embed: false
+      # SherpaOnnxC 是动态框架（主二进制 @rpath 引用），必须 embed 进 app/Frameworks
       - framework: SherpaOnnxC.xcframework
-        embed: false
+        embed: true
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
