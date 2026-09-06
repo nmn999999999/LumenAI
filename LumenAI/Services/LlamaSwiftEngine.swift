@@ -9,6 +9,8 @@ import UIKit
 
 final class LlamaSwiftEngine: LLMEngine, @unchecked Sendable {
     let modelURL: URL
+    /// 是否加载了多模态投影器(mmproj) → 支持图片理解。
+    let supportsVision: Bool
     private var bridge: OpaquePointer?          // llama_bridge *
     private var lastError: String?
 
@@ -40,6 +42,7 @@ final class LlamaSwiftEngine: LLMEngine, @unchecked Sendable {
         }
 
         let mmproj = LlamaSwiftEngine.detectMMProj(nextTo: modelURL)
+        self.supportsVision = (mmproj != nil)
         let ok = llama_bridge_load_model(
             handle,
             modelURL.path,

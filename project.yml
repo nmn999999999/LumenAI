@@ -31,14 +31,16 @@ targets:
         # iOS 26 App 图标：Icon Composer 工程（appicon.icon）作为官方 AppIcon 源，
         # 由 actool 用 Icon Composer 渲染管线生成含液态玻璃效果的全部变体
         ASSETCATALOG_COMPILER_APPICON_NAME: appicon
-        MARKETING_VERSION: 0.3.47
-        CURRENT_PROJECT_VERSION: 48
+        MARKETING_VERSION: 0.3.48
+        CURRENT_PROJECT_VERSION: 49
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         # 语音输入（ASR）：SFSpeechRecognizer + 麦克风
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: 用于将您的语音转换为文字（语音输入）。
         INFOPLIST_KEY_NSMicrophoneUsageDescription: 用于采集您的声音以进行语音识别。
+        # 云端生图：把生成的图片保存到相册（仅添加）
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: 用于把 AI 生成的图片保存到您的相册。
         # llama.cpp 为 C++ 源码，宿主 App 必须开启 Swift/C++ 互操作
         SWIFT_OBJC_INTEROP_MODE: objcxx
         # 暴露 C 桥接头文件给 Swift

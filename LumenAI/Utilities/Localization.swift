@@ -144,6 +144,16 @@ enum L10n {
         "已提炼": ["zh": "已提炼", "en": "Extracted"],
         "条记忆": ["zh": "条记忆", "en": "memories"],
         "没有新的记忆可提炼": ["zh": "没有新的记忆可提炼", "en": "No new memories to extract"],
+
+        // 云端生图（/draw）
+        "生图模型（可选）": ["zh": "生图模型（可选）", "en": "Image model (optional)"],
+        "仅 OpenAI/兼容 端点支持文生图。填写后聊天输入框可用 /draw <描述> 生成图片。": [
+            "zh": "仅 OpenAI/兼容 端点支持文生图。填写后聊天输入框可用 /draw <描述> 生成图片。",
+            "en": "Only OpenAI/Compatible endpoints support image generation. Fill it in to enable /draw <prompt> in chat."
+        ],
+        "保存到相册": ["zh": "保存到相册", "en": "Save to Photos"],
+        "已保存到相册": ["zh": "已保存到相册", "en": "Saved to Photos"],
+        "跟随 App 语言": ["zh": "跟随 App 语言", "en": "Follow App language"],
     ]
 }
 

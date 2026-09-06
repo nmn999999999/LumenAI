@@ -13,6 +13,7 @@ struct ProviderEditSheet: View {
     @State private var headersText: String
     @State private var extraBodyText: String
     @State private var modelsText: String
+    @State private var imageModel: String
     @State private var enabled: Bool
     @State private var errorMessage: String?
 
@@ -27,6 +28,7 @@ struct ProviderEditSheet: View {
         _extraBodyText = State(initialValue: existing?.extraBody ?? "")
         // 新建 Provider 时预填类型对应的默认模型 ID,让用户选好类型就有可用模型列表可改
         _modelsText = State(initialValue: existing?.models.joined(separator: ", ") ?? initialType.defaultModels.joined(separator: ", "))
+        _imageModel = State(initialValue: existing?.imageModel ?? "")
         _enabled = State(initialValue: existing?.enabled ?? true)
     }
 
@@ -78,6 +80,17 @@ struct ProviderEditSheet: View {
                         .autocorrectionDisabled()
                 } header: {
                     Text(t("模型列表"))
+                }
+
+                Section {
+                    TextField("gpt-image-1 / FLUX.1-schnell…", text: $imageModel)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Text(t("仅 OpenAI/兼容 端点支持文生图。填写后聊天输入框可用 /draw <描述> 生成图片。"))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text(t("生图模型（可选）"))
                 }
 
                 Section {
@@ -150,7 +163,8 @@ struct ProviderEditSheet: View {
             isBuiltIn: existing?.isBuiltIn ?? false,
             enabled: enabled,
             createdAt: existing?.createdAt ?? Date(),
-            lastUsedAt: existing?.lastUsedAt
+            lastUsedAt: existing?.lastUsedAt,
+            imageModel: imageModel.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         store.upsert(provider)
         dismiss()

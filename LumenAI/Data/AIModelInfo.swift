@@ -111,7 +111,7 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
             repo: "RichardErkhov/apple_-_OpenELM-1_1B-Instruct-gguf",
             fileName: "OpenELM-1_1B-Instruct.Q4_K_M.gguf",
             sizeDescription: "~0.63 GB",
-            description: "Apple 官方开源高效语言模型，体量极小，任意 iPhone 都能离线跑；适合低内存设备的轻量备用（非默认）",
+            description: "Apple 官方开源高效语言模型，体量极小，任意 iPhone 都能离线跑；作为内置默认模型，适合低内存设备轻量使用（纯文本，不支持图片/工具）",
             templateType: .chatML,
             supportsMultimodal: false,
             supportsToolCalling: false
@@ -122,7 +122,7 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
             repo: "unsloth/Phi-4-mini-instruct-GGUF",
             fileName: "Phi-4-mini-instruct-Q4_K_M.gguf",
             sizeDescription: "~2.0 GB",
-            description: "微软「小钢炮」：非 Qwen 里工具调用/指令遵循最稳，适合长期跑 Agent；中文一般但可用（首启默认自动下载并加载）",
+            description: "微软「小钢炮」：非 Qwen 里工具调用/指令遵循最稳，适合长期跑 Agent；中文一般但可用，需手动下载",
             templateType: .llama3,
             supportsMultimodal: false,
             supportsToolCalling: true
@@ -175,9 +175,11 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
         ),
     ]
 
-    /// 首启时优先下载并自动加载的默认模型（Qwen3-4B-2507：中文最强端侧 + 工具调用强 + 非推理输出干净）
+    /// 内置默认模型（Apple OpenELM 1.1B：体量极小、任意 iPhone 都能离线跑）。
+    /// 注意：App 不再在启动时自动下载默认模型（用户嫌每次进 App 都触发下载）。
+    /// 此字段仅作为模型页/引导中"推荐默认"的引用；是否装载完全由用户手动选择。
     static var defaultModel: AIModelInfo {
-        catalog.first { $0.id == "qwen3-4b-2507-q4km" } ?? catalog[0]
+        catalog.first { $0.id == "openelm-1.1b-q4km" } ?? catalog[0]
     }
 }
 

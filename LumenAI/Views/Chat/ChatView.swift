@@ -632,6 +632,21 @@ struct ChatView: View {
         let rawText = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSend else { return }
 
+        // 文生图命令：/draw <描述>（云端 OpenAI 兼容 images/generations）
+        if rawText.hasPrefix("/draw ") || rawText.hasPrefix("/draw\n") || rawText == "/draw" {
+            let prompt = rawText.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines)
+            runDraw(prompt: prompt.isEmpty ? "一只坐在月球上的宇航员猫，超现实风格" : prompt)
+            return
+        }
+
+        // 多模态护栏：用户附了图片，但当前引擎不支持图片理解（本地纯文本模型如 OpenELM/
+        // Qwen3，或本地模型没配 mmproj 投影器）。不要静默丢图，明确引导到支持视觉的模型。
+        if !attachments.isEmpty && !llmService.supportsVision {
+            let guide = multimodalGuideText()
+            errorMessage = guide
+            return
+        }
+
         let settings = SettingsStorage.shared.settings
         let images = attachments
         inputText = ""
@@ -937,6 +952,16 @@ struct ChatView: View {
         return String(firstLine.trimmingCharacters(in: .whitespacesAndNewlines).prefix(20))
     }
 
+    /// 多模态引导文案：用户发图但当前引擎不支持视觉时提示如何切换到支持图片的模型。
+    private func multimodalGuideText() -> String {
+        var s = "当前模型不支持图片理解，图片不会发送。请切换到支持视觉的模型：\n"
+        // 本地多模态模型：Gemma 3 4B / Qwen2.5 VL（带 mmproj 才能看图）
+        s += "· 本地：在「模型」页下载并加载 Gemma 3 4B 或 Qwen2.5 VL 3B（多模态）。\n"
+        s += "· 云端：在顶部模型菜单选择一个视觉模型（如 OpenAI gpt-4o / Gemini）。\n"
+        s += "若已用多模态本地模型仍不行，请确认其 gguf 同目录放入了对应的 mmproj 投影器文件。"
+        return s
+    }
+
     /// 解析生效引擎：助手绑定优先，其次当前云端选择；否则本地
     private func resolveEngine() -> (provider: ChatProvider?, model: String, temp: Double?) {
         let assistant = assistantStore.current
@@ -1147,5 +1172,79 @@ struct ChatView: View {
         #else
         return ChatMessage.ImageData(data: data, mimeType: "image/png")
         #endif
+    }
+
+    // MARK: - 云端文生图（/draw 命令）
+
+    /// 处理 `/draw <描述>`：用当前已配置生图模型的云端 Provider 生成图片，
+    /// 生成的图片作为 assistant 消息插入对话并展示。
+    private func runDraw(prompt: String) {
+        let drawProvider: ChatProvider? = {
+            // 优先当前选中的 Provider；若无则回退到第一个「已配生图模型」的 OpenAI/兼容 Provider
+            if let cur = providerStore.currentProvider, CloudImageClient.canGenerate(on: cur) {
+                return cur
+            }
+            return providerStore.providers.first { $0.enabled && CloudImageClient.canGenerate(on: $0) }
+        }()
+        guard let provider = drawProvider else {
+            errorMessage = "还没有可用的文生图服务。请到「服务」页选择或编辑一个 OpenAI/兼容 Provider，并在「生图模型」中填写模型名（如 gpt-image-1 / black-forest-labs/FLUX.1-schnell）。然后发送 /draw 描述 生成图片。"
+            return
+        }
+
+        inputText = ""
+        attachments = []
+        selectedItems = []
+        inputFocused = false
+
+        var conv = chatStore.currentOrNew
+        conv.messages.append(ChatMessage(role: .user, content: "/draw \(prompt)"))
+        conv.updateTitle()
+        conv.modelName = "\(provider.name) · 生图"
+        chatStore.upsert(conv)
+
+        isGenerating = true
+        generationTask = Task {
+            defer {
+                isGenerating = false
+                generationTask = nil
+            }
+            let placeholder = ChatMessage(role: .assistant, content: "🎨 正在生成图片…", isStreaming: true)
+            var c = chatStore.currentOrNew
+            c.messages.append(placeholder)
+            chatStore.upsert(c)
+
+            do {
+                let imageData = try await CloudImageClient.generate(provider: provider, prompt: prompt)
+                try Task.checkCancellation()
+                // 把返回图片压成 JPEG 存进气泡（避免 PNG 过大占用存档空间）
+                let stored = Self.imageDataAsJPEG(imageData)
+                var m = chatStore.currentOrNew
+                if let idx = m.messages.firstIndex(where: { $0.id == placeholder.id }) {
+                    m.messages[idx].content = "🖼️ \(prompt)"
+                    m.messages[idx].images = [stored]
+                    m.messages[idx].isStreaming = false
+                    chatStore.upsert(m)
+                }
+            } catch {
+                var m = chatStore.currentOrNew
+                if let idx = m.messages.firstIndex(where: { $0.id == placeholder.id }) {
+                    m.messages[idx].content = "⚠️ \(error.localizedDescription)"
+                    m.messages[idx].isStreaming = false
+                    chatStore.upsert(m)
+                }
+                if !Task.isCancelled {
+                    errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private static func imageDataAsJPEG(_ data: Data) -> ChatMessage.ImageData {
+        #if canImport(UIKit)
+        if let ui = UIImage(data: data), let jpeg = ui.jpegData(compressionQuality: 0.9) {
+            return ChatMessage.ImageData(data: jpeg, mimeType: "image/jpeg")
+        }
+        #endif
+        return ChatMessage.ImageData(data: data, mimeType: "image/png")
     }
 }

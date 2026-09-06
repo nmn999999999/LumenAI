@@ -1,4 +1,5 @@
 import SwiftUI
+import Photos
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -89,11 +90,15 @@ struct MessageBubble: View {
                 if settings.settings.showThinking, let think = message.thinkContent, !think.isEmpty {
                     ThinkSection(think: think, isThinking: message.isThinking)
                 }
+                // 生成/多模态图片（assistant）：/draw 云端生图的结果气泡
+                if !message.images.isEmpty {
+                    generatedImageBlock
+                }
                 let displayText = message.isAgentRound ? AgentService.cleanDisplayText(message.visibleContent) : message.visibleContent
                 if !displayText.isEmpty {
                     MarkdownView(markdown: displayText)
                         .textSelection(.enabled)
-                } else if message.isStreaming && message.thinkContent == nil {
+                } else if message.isStreaming && message.thinkContent == nil && message.images.isEmpty {
                     HStack(spacing: 6) {
                         ProgressView()
                             .controlSize(.mini)
@@ -160,6 +165,49 @@ struct MessageBubble: View {
         }
         .padding(6)
         .background(.ultraThinMaterial, in: .rect(cornerRadius: 18))
+    }
+
+    /// assistant 上的生成图（/draw 结果）：大图预览 + 保存到相册
+    @ViewBuilder
+    private var generatedImageBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            #if canImport(UIKit)
+            if let img = cachedImage(at: 0) {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(.rect(cornerRadius: 14))
+                    .frame(maxWidth: 260)
+            }
+            #endif
+            Button {
+                saveFirstImageToAlbum()
+            } label: {
+                Label(savedToAlbum ? t("已保存到相册") : t("保存到相册"), systemImage: savedToAlbum ? "checkmark.circle.fill" : "square.and.arrow.down")
+                    .font(.footnote)
+                    .foregroundStyle(.tint)
+            }
+            .buttonStyle(.plain)
+            .disabled(savedToAlbum)
+        }
+    }
+
+    @State private var savedToAlbum = false
+
+    /// 把本消息第一张图写入系统相册（请求 addOnly 授权）。
+    private func saveFirstImageToAlbum() {
+        #if canImport(UIKit)
+        guard let data = message.images.first?.data,
+              let ui = UIImage(data: data) else { return }
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else { return }
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: ui)
+            }) { success, _ in
+                DispatchQueue.main.async { self.savedToAlbum = success }
+            }
+        }
+        #endif
     }
 
     @ViewBuilder

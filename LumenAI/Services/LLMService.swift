@@ -27,6 +27,8 @@ enum LLMError: LocalizedError, Sendable {
 
 protocol LLMEngine: AnyObject, Sendable {
     var modelURL: URL { get }
+    /// 该引擎是否具备图片理解能力（本地=加载了 mmproj 多模态投影器）。
+    var supportsVision: Bool { get }
     /// 流式生成。messages 为渲染好的对话；images 可为空（多模态时使用）。
     func stream(
         messages: [EngineMessage],
@@ -93,6 +95,14 @@ final class LLMService: ObservableObject {
         if case .loading(let name) = state { return name }
         if case .apiMode(let name) = state { return name }
         return nil
+    }
+
+    /// 当前生效引擎是否支持图片理解。
+    /// - 云端：OpenAI/Gemini/Claude 协议均带 image 走 base64，假设所选模型支持视觉（多数旗舰支持）。
+    /// - 本地：取决于加载的引擎是否附带 mmproj 多模态投影器（纯文本模型如 OpenELM/Qwen3 无）。
+    var supportsVision: Bool {
+        if hasCloudSelection { return true }
+        return engine?.supportsVision ?? false
     }
 
     // MARK: 加载 / 卸载
@@ -393,6 +403,7 @@ final class LLMService: ObservableObject {
 
 final class EchoEngine: LLMEngine, @unchecked Sendable {
     let modelURL = URL(fileURLWithPath: "/dev/null")
+    let supportsVision = false
 
     func stream(
         messages: [EngineMessage],

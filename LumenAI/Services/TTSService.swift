@@ -41,10 +41,21 @@ final class TTSService: NSObject, ObservableObject {
 
     // MARK: 系统 TTS
 
+    /// 解析系统语音。返回值优先解释为 AVSpeechSynthesisVoice 的 identifier；
+    /// 若不匹配则当作语言代码回退（兼容旧存档存的是 "zh-CN" 这类语言代码）。
+    static func resolveSystemVoice(_ voiceSetting: String, defaultLanguage: String) -> AVSpeechSynthesisVoice? {
+        let v = voiceSetting.trimmingCharacters(in: .whitespaces)
+        if !v.isEmpty {
+            if let voice = AVSpeechSynthesisVoice(identifier: v) { return voice }
+            if let voice = AVSpeechSynthesisVoice(language: v) { return voice }
+        }
+        return AVSpeechSynthesisVoice(language: defaultLanguage)
+    }
+
     private func speakSystem(_ text: String, settings: ModelSettings) {
         let utterance = AVSpeechUtterance(string: text)
         let lang = settings.language == "en" ? "en-US" : "zh-CN"
-        if let voice = AVSpeechSynthesisVoice(language: settings.ttsVoice.isEmpty ? lang : settings.ttsVoice) {
+        if let voice = Self.resolveSystemVoice(settings.ttsVoice, defaultLanguage: lang) {
             utterance.voice = voice
         }
         utterance.rate = 0.48

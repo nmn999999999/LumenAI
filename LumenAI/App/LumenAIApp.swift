@@ -1,5 +1,4 @@
 import SwiftUI
-import Combine
 
 @main
 struct LumenAIApp: App {
@@ -10,8 +9,6 @@ struct LumenAIApp: App {
     @StateObject private var theme = ThemeObserver()
     /// 数据安全：切后台/退出时立即落盘（见 body 里的 onChange）
     @Environment(\.scenePhase) private var scenePhase
-    /// 监听「默认模型下载完成」信号的订阅（下载是异步的，完成后据此自动加载）。
-    @State private var defaultDownloadCancellable: AnyCancellable?
 
     var body: some Scene {
         WindowGroup {
@@ -50,31 +47,15 @@ struct LumenAIApp: App {
         }
     }
 
-    /// 启动时自动加载上一次使用的模型；若本地没有任何模型，则优先下载内置默认模型
-    ///（Apple OpenELM）并在下载完成后自动加载，做到「进入 App 即用」。
+    /// 启动时自动加载上一次使用的模型（若仍在本地）。
+    /// 注意：不再在「本地没有任何模型」时自动下载默认模型 —— 用户明确不要每次进 App 都触发下载。
+    /// 是否下载/加载哪个本地模型完全由用户在「模型」页手动选择。
     private func autoLoadLastModel() async {
-        // 1) 上次用过的模型仍在本地 → 直接加载
-        if case .idle = llmService.state,
-           let stored = modelManager.lastUsedModel {
-            let url = modelManager.localFileURL(for: stored)
-            if FileManager.default.fileExists(atPath: url.path) {
-                await llmService.load(url: url, displayName: stored.name)
-                return
-            }
+        guard case .idle = llmService.state,
+              let stored = modelManager.lastUsedModel else { return }
+        let url = modelManager.localFileURL(for: stored)
+        if FileManager.default.fileExists(atPath: url.path) {
+            await llmService.load(url: url, displayName: stored.name)
         }
-        // 2) 本地没有任何模型 → 优先下载默认模型（Apple OpenELM），下载完成后自动加载
-        guard modelManager.downloadedModels.isEmpty else { return }
-        let def = AIModelInfo.defaultModel
-        modelManager.download(def)
-        defaultDownloadCancellable = modelManager.$lastCompletedDownloadID
-            .compactMap { $0 }
-            .sink { [modelManager, llmService] id in
-                guard id == def.id else { return }
-                guard llmService.loadedModelName == nil else { return }
-                if let stored = ModelManager.shared.downloadedModels.first(where: { $0.id == id }),
-                   FileManager.default.fileExists(atPath: ModelManager.shared.localFileURL(for: stored).path) {
-                    Task { await llmService.load(url: ModelManager.shared.localFileURL(for: stored), displayName: stored.name) }
-                }
-            }
     }
 }

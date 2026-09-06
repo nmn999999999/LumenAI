@@ -87,6 +87,9 @@ struct ChatProvider: Identifiable, Codable, Sendable {
     var enabled: Bool
     var createdAt: Date
     var lastUsedAt: Date?
+    /// 云端文生图模型名（如 "gpt-image-1" / "black-forest-labs/FLUX.1-schnell"）。
+    /// 为空 = 未启用该 Provider 的生图能力；填充后聊天输入框可用 `/draw <prompt>` 生成图片。
+    var imageModel: String
 
     init(
         id: UUID = UUID(),
@@ -100,7 +103,8 @@ struct ChatProvider: Identifiable, Codable, Sendable {
         isBuiltIn: Bool = false,
         enabled: Bool = true,
         createdAt: Date = Date(),
-        lastUsedAt: Date? = nil
+        lastUsedAt: Date? = nil,
+        imageModel: String = ""
     ) {
         self.id = id
         self.name = name
@@ -114,6 +118,7 @@ struct ChatProvider: Identifiable, Codable, Sendable {
         self.enabled = enabled
         self.createdAt = createdAt
         self.lastUsedAt = lastUsedAt
+        self.imageModel = imageModel
     }
 
     var primaryKey: String { apiKeys.first(where: { !$0.isEmpty }) ?? "" }
@@ -122,5 +127,45 @@ struct ChatProvider: Identifiable, Codable, Sendable {
     /// 展示用 baseURL（无尾斜杠）
     var cleanBaseURL: String {
         baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    // MARK: Codable（手动：imageModel 是后加字段，旧存档缺失时用默认值，避免整表解码失败）
+    private enum CodingKeys: String, CodingKey {
+        case id, name, type, baseURL, apiKeys, headers, extraBody, models,
+             isBuiltIn, enabled, createdAt, lastUsedAt, imageModel
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        type = try c.decode(ProviderType.self, forKey: .type)
+        baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL) ?? ""
+        apiKeys = try c.decodeIfPresent([String].self, forKey: .apiKeys) ?? []
+        headers = try c.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
+        extraBody = try c.decodeIfPresent(String.self, forKey: .extraBody) ?? ""
+        models = try c.decodeIfPresent([String].self, forKey: .models) ?? []
+        isBuiltIn = try c.decodeIfPresent(Bool.self, forKey: .isBuiltIn) ?? false
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        lastUsedAt = try c.decodeIfPresent(Date.self, forKey: .lastUsedAt)
+        imageModel = try c.decodeIfPresent(String.self, forKey: .imageModel) ?? ""
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(type, forKey: .type)
+        try c.encode(baseURL, forKey: .baseURL)
+        try c.encode(apiKeys, forKey: .apiKeys)
+        try c.encode(headers, forKey: .headers)
+        try c.encode(extraBody, forKey: .extraBody)
+        try c.encode(models, forKey: .models)
+        try c.encode(isBuiltIn, forKey: .isBuiltIn)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encodeIfPresent(lastUsedAt, forKey: .lastUsedAt)
+        try c.encode(imageModel, forKey: .imageModel)
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 struct SettingsView: View {
     @EnvironmentObject private var llmService: LLMService
@@ -12,6 +13,41 @@ struct SettingsView: View {
     
     private enum Field: Hashable {
         case apiEndpoint, apiKey, apiModel, systemPrompt
+    }
+
+    // MARK: - 系统语音选项（动态列出设备已安装的语音，取每种语言质量最高者）
+
+    private struct VoiceOption: Identifiable {
+        let id: String   // AVSpeechSynthesisVoice.identifier 或语言代码
+        let label: String
+    }
+
+    /// 设备上可用的系统语音。每种语言保留质量最高的一档（premium > enhanced > default），
+    /// 归并成精简但够用的列表。前缀命中才展示，避免把几十种冷门语言全铺出来。
+    private static var systemVoiceOptions: [VoiceOption] {
+        let preferredPrefixes = ["zh-", "yue-", "cmn-", "en-", "ja-", "ko-", "fr-", "de-", "es-", "it-", "pt-", "ru-"]
+        let installed = AVSpeechSynthesisVoice.speechVoices()
+        // language → best(identifier, name, quality)
+        var bestByLang: [String: (id: String, name: String, quality: Int)] = [:]
+        for v in installed {
+            guard preferredPrefixes.contains(where: { v.language.lowercased().hasPrefix($0) }) else { continue }
+            let q: Int = v.quality == .premium ? 3 : (v.quality == .enhanced ? 2 : 1)
+            if let cur = bestByLang[v.language], cur.quality >= q { continue }
+            bestByLang[v.language] = (v.identifier, v.name, q)
+        }
+        let langPriority = ["zh-CN", "zh-TW", "zh-HK", "cmn-CN", "en-US", "en-GB", "en-AU", "en-IN",
+                            "ja-JP", "ko-KR", "fr-FR", "de-DE", "es-ES", "it-IT", "pt-BR", "ru-RU"]
+        let sortedLangs = bestByLang.keys.sorted { a, b in
+            let ai = langPriority.firstIndex(of: a) ?? 99
+            let bi = langPriority.firstIndex(of: b) ?? 99
+            return ai == bi ? a < b : ai < bi
+        }
+        return sortedLangs.compactMap { lang -> VoiceOption? in
+            guard let v = bestByLang[lang] else { return nil }
+            let quality = v.quality >= 3 ? " · 高级" : (v.quality == 2 ? " · 增强" : "")
+            let displayLang = lang == "cmn-CN" ? "zh-CN" : lang
+            return VoiceOption(id: v.id, label: "\(v.name) (\(displayLang))\(quality)")
+        }
     }
 
     var body: some View {
@@ -371,14 +407,16 @@ struct SettingsView: View {
                         Text(t("系统语音")).font(.subheadline)
                         Spacer()
                         Picker(t("系统语音"), selection: $storage.settings.ttsVoice) {
-                            Text("自动 (zh-CN)").tag("")
-                            Text("普通话 zh-CN").tag("zh-CN")
-                            Text("粤语 zh-HK").tag("zh-HK")
-                            Text("English US").tag("en-US")
-                            Text("English UK").tag("en-GB")
+                            Text(t("跟随 App 语言")).tag("")
+                            ForEach(Self.systemVoiceOptions) { opt in
+                                Text(opt.label).tag(opt.id)
+                            }
                         }
-                        .frame(maxWidth: 200)
+                        .frame(maxWidth: 220)
                     }
+                    Text("会自动列出设备已安装的系统语音（含增强/高级音色）；空选项表示用 App 当前语言的默认音色。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
 
                 Divider()
