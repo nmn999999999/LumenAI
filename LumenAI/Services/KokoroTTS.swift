@@ -469,41 +469,27 @@ enum KokoroModelManifest {
 
     static var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
 
+    /// 校验单个文件是否存在且大小一致（isComplete / corruptEntries / existingBytes 复用）
+    static func fileSizeMatches(_ entry: FileEntry, in directory: URL) -> Bool {
+        let url = directory.appendingPathComponent(entry.path)
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else {
+            return false
+        }
+        return size.int64Value == entry.size
+    }
+
     /// 判定模型是否完整（逐文件校验大小）
     static func isComplete(in directory: URL) -> Bool {
-        let fm = FileManager.default
-        return files.allSatisfy { entry in
-            let url = directory.appendingPathComponent(entry.path)
-            guard let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else {
-                return false
-            }
-            return size.int64Value == entry.size
-        }
+        files.allSatisfy { fileSizeMatches($0, in: directory) }
     }
 
     /// 已存在但校验不过（下载损坏）的文件路径，重新下载前先删掉
     static func corruptEntries(in directory: URL) -> [FileEntry] {
-        let fm = FileManager.default
-        return files.filter { entry in
-            let url = directory.appendingPathComponent(entry.path)
-            guard let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else {
-                return false
-            }
-            return size.int64Value != entry.size
-        }
+        files.filter { !fileSizeMatches($0, in: directory) }
     }
 
     static func existingBytes(in directory: URL) -> Int64 {
-        let fm = FileManager.default
-        var total: Int64 = 0
-        for entry in files {
-            let url = directory.appendingPathComponent(entry.path)
-            if let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber,
-               size.int64Value == entry.size {
-                total += entry.size
-            }
-        }
-        return total
+        files.filter { fileSizeMatches($0, in: directory) }.reduce(0) { $0 + $1.size }
     }
 }
 
@@ -738,7 +724,7 @@ final class KokoroTTSManager: ObservableObject {
             for entry in bigFiles {
                 try Task.checkCancellation()
                 let dest = directory.appendingPathComponent(entry.path)
-                if fileSizeOK(entry, at: dest) { continue }
+                if KokoroModelManifest.fileSizeMatches(entry, in: directory) { continue }
                 report(.file(entry.path), 0)
                 let base = done
                 try await downloadEntry(entry, to: directory, progress: { written in
@@ -759,7 +745,7 @@ final class KokoroTTSManager: ObservableObject {
                         inflight += 1
                         group.addTask {
                             let dest = directory.appendingPathComponent(entry.path)
-                            if fileSizeOK(entry, at: dest) { return entry.size }
+                            if KokoroModelManifest.fileSizeMatches(entry, in: directory) { return entry.size }
                             try await downloadEntry(entry, to: directory, progress: nil)
                             return entry.size
                         }
@@ -791,13 +777,6 @@ final class KokoroTTSManager: ObservableObject {
         } catch {
             report(.failed("下载失败: \(error.localizedDescription)"), 0)
         }
-    }
-
-    private nonisolated static func fileSizeOK(_ entry: KokoroModelManifest.FileEntry, at url: URL) -> Bool {
-        guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else {
-            return false
-        }
-        return size.int64Value == entry.size
     }
 
     /// 单文件下载：URLSessionDownloadTask（真进度回调），失败自动切换镜像源重试

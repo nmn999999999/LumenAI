@@ -72,13 +72,24 @@ final class TTSService: NSObject, ObservableObject {
     // MARK: 本地神经 TTS（Kokoro，离线）
 
     private var kokoroTask: Task<Void, Never>?
+    /// 供 UI 读取的最新错误（模型未下载 / 引擎失败等）
+    @Published var lastTTSError: String?
 
     private func speakKokoro(_ text: String, settings: ModelSettings) async {
         guard !text.isEmpty else { return }
 
-        // 模型未就绪：回退系统 TTS 并提示
-        guard KokoroModelManifest.isComplete(in: KokoroTTSManager.modelDirectory) else {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+        // 模型未就绪：最多重试 3 次（每次等待 500ms），仍失败则提示并回退
+        let maxRetries = 3
+        for attempt in 1...maxRetries {
+            if KokoroModelManifest.isComplete(in: KokoroTTSManager.modelDirectory) { break }
+            if attempt < maxRetries {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                continue
+            }
+            await MainActor.run {
+                self.lastTTSError = "Kokoro 模型未下载，请前往设置下载本地语音模型"
+                self.isSpeaking = false
+            }
             speakSystem(text, settings: settings)
             return
         }
@@ -94,6 +105,8 @@ final class TTSService: NSObject, ObservableObject {
                 let wav = WAVWriter.wavData(samples: samples, sampleRate: rate)
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
+                    self.lastTTSError = nil
+                    self.configurePlaybackSession()
                     self.playWAVData(wav)
                 }
             } catch is CancellationError {
@@ -101,6 +114,7 @@ final class TTSService: NSObject, ObservableObject {
             } catch {
                 // 引擎失败（内存不足等）回退系统 TTS
                 await MainActor.run {
+                    self.lastTTSError = "Kokoro 引擎错误: \(error.localizedDescription)"
                     self.isSpeaking = false
                     self.speakSystem(text, settings: settings)
                 }
@@ -108,10 +122,15 @@ final class TTSService: NSObject, ObservableObject {
         }
     }
 
+    /// 配置音频会话为 Playback 类别（播放 TTS 时需要，静音开关下也有声音）
+    private func configurePlaybackSession() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default)
+        try? session.setActive(true)
+    }
+
     private func playWAVData(_ data: Data) {
-        let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setCategory(.playback, mode: .default)
-        try? audioSession.setActive(true)
+        configurePlaybackSession()
         if let player = try? AVAudioPlayer(data: data) {
             audioPlayer = player
             player.delegate = self
@@ -142,11 +161,14 @@ final class TTSService: NSObject, ObservableObject {
         request.setValue("Bearer \(provider.primaryKey)", forHTTPHeaderField: "Authorization")
         for (k, v) in provider.headers { request.setValue(v, forHTTPHeaderField: k) }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": settings.ttsModel.isEmpty ? "tts-1" : settings.ttsModel,
             "input": text,
             "voice": settings.ttsVoiceName.isEmpty ? "alloy" : settings.ttsVoiceName,
         ]
+        if settings.ttsSpeed > 0 && settings.ttsSpeed != 1.0 {
+            body["speed"] = settings.ttsSpeed
+        }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
@@ -155,10 +177,7 @@ final class TTSService: NSObject, ObservableObject {
                 speakSystem(text, settings: settings)
                 return
             }
-            // 播放音频需 playback 会话类别，否则静音开关下无声
-            let audioSession = AVAudioSession.sharedInstance()
-            try? audioSession.setCategory(.playback, mode: .default)
-            try? audioSession.setActive(true)
+            configurePlaybackSession()
             audioPlayer = try AVAudioPlayer(data: data)
             audioPlayer?.delegate = self
             isSpeaking = true
