@@ -72,14 +72,21 @@ final class ProviderStore: ObservableObject {
     // MARK: - 修改
 
     func upsert(_ provider: ChatProvider) {
+        let isNew = !providers.contains { $0.id == provider.id }
         if let idx = providers.firstIndex(where: { $0.id == provider.id }) {
             providers[idx] = provider
         } else {
             providers.append(provider)
         }
-        // 自动选中刚添加/编辑且可用的 Provider
-        if provider.enabled && provider.hasKey {
-            currentProviderID = provider.id
+        // 只在**新增**时自动选中。
+        // 原来对「编辑」也生效，于是用户只是给一个没在用的 Provider 改个名字或补上 Key
+        // 并保存，聊天就被静默切过去；更糟的是只改了 currentProviderID、没同步
+        // currentModel —— 顶部显示「新 Provider · 上一家的模型名」，下一条消息直接报
+        // 模型不存在。自动选中必须把两个字段一起改。
+        guard isNew, provider.enabled, provider.hasKey else { return }
+        currentProviderID = provider.id
+        if !provider.models.contains(currentModel) {
+            currentModel = provider.models.first ?? ""
         }
     }
 
@@ -106,6 +113,11 @@ final class ProviderStore: ObservableObject {
         var builtins = Self.builtInProviders()
         builtins.append(contentsOf: custom)
         providers = builtins
+        // 内置项每次都是全新的 UUID，所以重置前指向内置项的 currentProviderID 会变成
+        // 悬空指针 —— currentProvider 查不到，hasCloudSelection 变 false，聊天静默回退
+        // 本地模型，用户完全不知道原因。这里必须重新校验一次选中状态。
+        refreshSelectionAfterRestore()
+        persist()
     }
 
     /// 恢复/导入后校验选中状态：当前选中 Provider 不存在时回退到第一个可用项

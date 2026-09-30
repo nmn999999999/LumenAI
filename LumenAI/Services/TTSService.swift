@@ -22,13 +22,17 @@ final class TTSService: NSObject, ObservableObject {
 
     // MARK: - 朗读
 
+    /// 进行中的网络 TTS 请求。`stop()` 必须能取消它 —— 否则已经发出的请求
+    /// 回来之后还会接着把音频播出来（停不掉）。
+    private var networkTask: Task<Void, Never>?
+
     func speak(_ text: String) {
         stop()
         let settings = SettingsStorage.shared.settings
 
         switch settings.ttsEngine {
         case "network":
-            Task { await speakNetwork(text, settings: settings) }
+            networkTask = Task { await speakNetwork(text, settings: settings) }
         case "kokoro":
             Task { await speakKokoro(text, settings: settings) }
         default:
@@ -39,6 +43,8 @@ final class TTSService: NSObject, ObservableObject {
     func stop() {
         kokoroTask?.cancel()
         kokoroTask = nil
+        networkTask?.cancel()
+        networkTask = nil
         synthesizer.stopSpeaking(at: .immediate)
         audioPlayer?.stop()
         isSpeaking = false
@@ -153,6 +159,13 @@ final class TTSService: NSObject, ObservableObject {
             speakSystem(text, settings: settings)
             return
         }
+
+        // 「正在朗读」必须**一发起请求就为真**，不能等 HTTP 返回。
+        // 调用方（ChatView.speakMessage）用 isSpeaking 判断该"停止"还是该"开始"，
+        // 而网络请求可能要几百毫秒 —— 这段窗口里 isSpeaking 还是 false，于是再点一次
+        // 不会停，反而又发一个请求、播第二路音频，两段朗读重叠。
+        // Kokoro 那条路径本来就是这么做的（先置 true 再干活），网络这条漏了。
+        isSpeaking = true
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

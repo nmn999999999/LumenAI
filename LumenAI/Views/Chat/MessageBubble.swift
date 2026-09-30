@@ -97,8 +97,7 @@ struct MessageBubble: View {
                 let displayText = message.isAgentRound ? AgentService.cleanDisplayText(message.visibleContent) : message.visibleContent
                 if !displayText.isEmpty {
                     MarkdownView(markdown: displayText)
-                        .textSelection(.enabled)
-                } else if message.isStreaming && message.thinkContent == nil && message.images.isEmpty {
+                        .textSelection(.enabled)                } else if message.isStreaming && message.thinkContent == nil && message.images.isEmpty {
                     HStack(spacing: 6) {
                         ProgressView()
                             .controlSize(.mini)
@@ -227,10 +226,21 @@ struct MessageBubble: View {
 
     // MARK: - 操作菜单（复制 / 重新生成 / 编辑 / 删除 / 朗读）
 
+    /// 「复制」要复制的文本 = **屏幕上显示的那一份**。
+    ///
+    /// 原来复制的是 `message.content`（原始串），而气泡显示的是 `visibleContent`
+    /// 再经 `cleanDisplayText` 清洗后的结果 —— 于是粘贴出来带着 `<think>…</think>`
+    /// 和工具调用残留，跟用户看到的完全不是同一段文字。复制行为必须与所见一致。
+    private var copyableText: String {
+        message.isAgentRound
+            ? AgentService.cleanDisplayText(message.visibleContent)
+            : message.visibleContent
+    }
+
     @ViewBuilder
     private var contextMenuItems: some View {
         Button {
-            UIPasteboard.general.string = message.content
+            UIPasteboard.general.string = copyableText
             copied = true
         } label: {
             Label(copied ? t("已复制") : t("复制"), systemImage: "doc.on.doc")

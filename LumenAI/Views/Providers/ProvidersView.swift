@@ -25,6 +25,14 @@ struct ProvidersView: View {
     @State private var importPhotoItems: [PhotosPickerItem] = []
     @State private var toastMessage: String?
     @State private var testingProviderID: UUID?
+    /// 删除/重置的二次确认。
+    /// 加这些的原因：删除 Provider 会连多 Key + 自定义请求头一起丢掉、无法撤销，
+    /// 「重置内置」会清掉内置项上填的密钥 —— 而同一个文件里「恢复备份」早就有确认框了。
+    /// 危险程度不一致比没有确认更容易误导：用户会以为这个 App 的删除都是安全的。
+    @State private var pendingDeleteProvider: ChatProvider?
+    @State private var pendingDeleteAssistant: AIAssistant?
+    @State private var pendingDeleteMCPServer: MCPServer?
+    @State private var showResetBuiltInsConfirm = false
     /// MCP
     @ObservedObject private var mcpService = MCPService.shared
     @State private var editingMCPServer: MCPServer?
@@ -52,9 +60,11 @@ struct ProvidersView: View {
                     }
                     Menu {
                         Button(t("重置内置"), systemImage: "arrow.counterclockwise") {
-                            providerStore.resetBuiltIns()
+                            showResetBuiltInsConfirm = true
                         }
-                        Button(t("扫码导入"), systemImage: "qrcode.viewfinder") {
+                        // 原名「扫码导入」名不符实：全项目没有相机，只有相册选图，
+                        // 用户以为能对着屏幕扫，实际得先截图存相册。
+                        Button(t("从相册导入二维码"), systemImage: "photo.on.rectangle") {
                             showImportPhotoPicker = true
                         }
                     } label: {
@@ -102,6 +112,73 @@ struct ProvidersView: View {
                 }
                 Button(t("取消"), role: .cancel) {}
             }
+            .confirmationDialog(
+                t("重置内置 Provider？"),
+                isPresented: $showResetBuiltInsConfirm,
+                titleVisibility: .visible
+            ) {
+                Button(t("重置内置"), role: .destructive) {
+                    providerStore.resetBuiltIns()
+                    toast(t("已重置内置 Provider"))
+                }
+                Button(t("取消"), role: .cancel) {}
+            } message: {
+                Text(t("内置项上填写的 API Key 与自定义请求头会被清空，无法撤销。你自己添加的 Provider 不受影响。"))
+            }
+            .confirmationDialog(
+                t("删除 Provider？"),
+                isPresented: Binding(
+                    get: { pendingDeleteProvider != nil },
+                    set: { if !$0 { pendingDeleteProvider = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingDeleteProvider
+            ) { p in
+                Button(t("删除"), role: .destructive) {
+                    providerStore.delete(p)
+                    pendingDeleteProvider = nil
+                    toast(t("已删除"))
+                }
+                Button(t("取消"), role: .cancel) { pendingDeleteProvider = nil }
+            } message: { p in
+                Text("「\(p.name)」的 API Key、自定义请求头与模型列表会一起删除，无法撤销。")
+            }
+            .confirmationDialog(
+                t("删除助手？"),
+                isPresented: Binding(
+                    get: { pendingDeleteAssistant != nil },
+                    set: { if !$0 { pendingDeleteAssistant = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingDeleteAssistant
+            ) { a in
+                Button(t("删除"), role: .destructive) {
+                    assistantStore.delete(a)
+                    pendingDeleteAssistant = nil
+                    toast(t("已删除"))
+                }
+                Button(t("取消"), role: .cancel) { pendingDeleteAssistant = nil }
+            } message: { a in
+                Text("助手「\(a.name)」及其自定义提示词会被删除，无法撤销。")
+            }
+            .confirmationDialog(
+                t("删除 MCP 服务器？"),
+                isPresented: Binding(
+                    get: { pendingDeleteMCPServer != nil },
+                    set: { if !$0 { pendingDeleteMCPServer = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingDeleteMCPServer
+            ) { s in
+                Button(t("删除"), role: .destructive) {
+                    mcpService.delete(s)
+                    pendingDeleteMCPServer = nil
+                    toast(t("已删除"))
+                }
+                Button(t("取消"), role: .cancel) { pendingDeleteMCPServer = nil }
+            } message: { s in
+                Text("「\(s.name)」的地址与请求头会被删除，其工具将从 Agent 工具目录中移除。")
+            }
             .overlay(alignment: .bottom) {
                 if let toastMessage {
                     Text(toastMessage)
@@ -127,6 +204,13 @@ struct ProvidersView: View {
                     isSelected: providerStore.currentProviderID == provider.id,
                     isTesting: testingProviderID == provider.id,
                     onSelect: {
+                        // 停用的 Provider 不能被选成「当前」：否则行上同时出现 OFF 徽标和勾选，
+                        // 而 currentProvider 要求 enabled，实际生效的是本地模型 ——
+                        // 界面说切过去了，行为说没切。
+                        guard provider.enabled else {
+                            toast(t("该 Provider 已停用，请先启用"))
+                            return
+                        }
                         let model = providerStore.currentModel
                         let keepModel = provider.models.contains(model) ? model : (provider.models.first ?? "")
                         providerStore.select(providerID: provider.id, model: keepModel)
@@ -134,7 +218,7 @@ struct ProvidersView: View {
                     onEdit: { editingProvider = provider },
                     onShare: { sharingProvider = provider },
                     onTest: { testProvider(provider) },
-                    onDelete: { providerStore.delete(provider) }
+                    onDelete: { pendingDeleteProvider = provider }
                 )
             }
         } header: {
@@ -175,7 +259,7 @@ struct ProvidersView: View {
                 .buttonStyle(.plain)
                 .swipeActions(edge: .trailing) {
                     Button(t("删除"), role: .destructive) {
-                        assistantStore.delete(assistant)
+                        pendingDeleteAssistant = assistant
                     }
                     Button(t("编辑")) {
                         editingAssistant = assistant
@@ -213,7 +297,7 @@ struct ProvidersView: View {
                         Task { await mcpService.connect(server) }
                     },
                     onDisconnect: { mcpService.disconnect(server) },
-                    onDelete: { mcpService.delete(server) },
+                    onDelete: { pendingDeleteMCPServer = server },
                     onCallTool: { tool in
                         callingTool = (server, tool)
                     }

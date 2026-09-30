@@ -4,6 +4,11 @@ struct ConversationListView: View {
     @EnvironmentObject private var chatStore: ChatStore
     @Environment(\.dismiss) private var dismiss
 
+    /// 待确认删除的对话。滑动删除原来是一碰就删掉整段历史（可能几十条消息）、
+    /// 没有确认也没有撤销 —— 而同一 App 里删「全部」对话反倒是有确认框的，
+    /// 危险程度不一致会让用户误以为这里的删除都是安全的。
+    @State private var pendingDelete: Conversation?
+
     var body: some View {
         NavigationStack {
             List {
@@ -33,12 +38,10 @@ struct ConversationListView: View {
                     }
                 }
                 .onDelete { indexSet in
-                    let ids = indexSet.map { chatStore.conversations[$0].id }
-                    for id in ids {
-                        if let conv = chatStore.conversation(id: id) {
-                            chatStore.delete(conv)
-                        }
-                    }
+                    // 一次滑动只可能是连续的一段；只对第一项弹确认，
+                    // 避免多选删除时连弹多个对话框。
+                    guard let first = indexSet.map({ chatStore.conversations[$0] }).first else { return }
+                    pendingDelete = first
                 }
             }
             .overlay {
@@ -52,6 +55,23 @@ struct ConversationListView: View {
             }
             .navigationTitle("历史对话")
             .navigationBarTitleDisplayMode(.inline)
+            .confirmationDialog(
+                "删除这段对话？",
+                isPresented: Binding(
+                    get: { pendingDelete != nil },
+                    set: { if !$0 { pendingDelete = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingDelete
+            ) { conv in
+                Button("删除", role: .destructive) {
+                    chatStore.delete(conv)
+                    pendingDelete = nil
+                }
+                Button("取消", role: .cancel) { pendingDelete = nil }
+            } message: { conv in
+                Text("「\(conv.title)」的 \(conv.messages.count) 条消息将被永久删除，无法撤销。")
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {

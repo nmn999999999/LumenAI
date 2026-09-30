@@ -14,6 +14,8 @@ struct ChatView: View {
     @ObservedObject private var ttsService = TTSService.shared
     @ObservedObject private var asrService = ASRService.shared
     @ObservedObject private var personaStore = PersonaStore.shared
+    /// 聊天页要直接读写设置里的「联网搜索」开关（与设置页共用同一份值）。
+    @ObservedObject private var chatSettings = SettingsStorage.shared
     @EnvironmentObject private var theme: LumenAIApp.ThemeObserver
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
@@ -51,8 +53,13 @@ struct ChatView: View {
     /// 视觉上不会"分裂"。run() 完成后清空。
     @State private var currentAgentMessageID: UUID?
 
-    /// 联网搜索开关 / 消息编辑 / 朗读状态 / 语音输入
-    @State private var webSearchOn = false
+    /// 消息编辑 / 朗读状态 / 语音输入
+    ///
+    /// 注意「联网搜索」**不在这里**：它曾经是这个文件里的一份 `@State webSearchOn`，
+    /// 与设置页的 `cloudWebSearch` 各存一份、互不知情 —— 聊天页点亮了球，设置页却显示关闭，
+    /// 在设置页关掉也关不掉聊天页那份。而且这份内存态在切到本地模型后按钮被隐藏
+    /// （原来只在 hasCloudSelection 时显示）却仍然生效，成了「看不见也关不掉的静默联网」。
+    /// 现在只有设置里那一份持久化状态，按钮直接读写它。
     @State private var editingMessage: ChatMessage?
     @State private var editingContent = ""
     @State private var showEditSheet = false
@@ -342,6 +349,26 @@ struct ChatView: View {
     // MARK: - 输入栏（液态玻璃 + iOS 26 苹果相机风格可展开工具岛）
     @State private var showTools = false
 
+    /// 联网搜索按钮。单独抽出来是因为内联进 `inputBar` 时，那个大表达式里
+    /// 三元运算符太多，编译器直接放弃：「unable to type-check this expression
+    /// in reasonable time」。拆开之后每个表达式都很小，类型检查立刻通过。
+    /// （功能上它就是一个读写设置里 cloudWebSearch 的开关。）
+    private var webSearchToolButton: some View {
+        let on = chatSettings.settings.cloudWebSearch
+        return Button {
+            withAnimation(.bouncy) { chatSettings.settings.cloudWebSearch.toggle() }
+        } label: {
+            Image(systemName: on ? "globe.asia.australia.fill" : "globe.asia.australia")
+                .font(.system(size: 17, weight: .semibold))
+                .symbolEffect(.bounce, value: on)
+                .foregroundStyle(on ? Color.white : Color.green)
+                .frame(width: 44, height: 44)
+                .background(on ? Color.green : Color.green.opacity(0.15), in: Circle())
+                .accessibilityLabel(t("联网搜索"))
+        }
+        .buttonStyle(.plain)
+    }
+
     private var inputBar: some View {
         VStack(spacing: 6) {
             // 可展开的工具岛（默认折叠，展开后位于主输入栏上方，GlassEffect 同一容器保持视觉连贯）
@@ -365,6 +392,8 @@ struct ChatView: View {
                             .accessibilityLabel(t("添加图片"))
                     }
                     .buttonStyle(.plain)
+                    // 只写了 opacity 会让按钮看起来置灰、实际仍可点（旁边 Agent 按钮两个都写了）。
+                    .disabled(!canChat)
                     .opacity(canChat ? 1 : 0.35)
 
                     Button {
@@ -388,20 +417,10 @@ struct ChatView: View {
                     .disabled(!canChat)
                     .opacity(canChat ? 1 : 0.35)
 
-                    if providerStore.hasCloudSelection {
-                        Button {
-                            withAnimation(.bouncy) { webSearchOn.toggle() }
-                        } label: {
-                            Image(systemName: webSearchOn ? "globe.asia.australia.fill" : "globe.asia.australia")
-                                .font(.system(size: 17, weight: .semibold))
-                                .symbolEffect(.bounce, value: webSearchOn)
-                                .foregroundStyle(webSearchOn ? Color.white : Color.green)
-                                .frame(width: 44, height: 44)
-                                .background(webSearchOn ? Color.green : Color.green.opacity(0.15), in: Circle())
-                                .accessibilityLabel(t("联网搜索"))
-                        }
-                        .buttonStyle(.plain)
-                    }
+                    // 联网搜索：直接绑定设置里那一份持久化开关，不再另存一份内存态。
+                    // 按钮也不再依赖 hasCloudSelection —— 否则切到本地模型后按钮消失，
+                    // 用户既看不到它开着、也没法关掉。
+                    webSearchToolButton
 
                     Button {
                         toggleVoiceInput()
@@ -601,6 +620,11 @@ struct ChatView: View {
                 Image(systemName: "square.and.pencil")
                     .accessibilityLabel(t("新建对话"))
             }
+            // 生成期间不能切走对话：流式回写是按「当前对话」定位气泡的
+            // （`chatStore.currentOrNew` + firstIndex(where: id)），一旦切了当前对话，
+            // 正在生成的 token 就再也写不回原来那条气泡 —— 那条气泡会永远停在「思考中…」，
+            // 而且没有任何报错提示。禁掉比静默丢内容好。
+            .disabled(isGenerating)
         }
     }
 
@@ -995,7 +1019,7 @@ struct ChatView: View {
 
     /// 联网搜索上下文注入（Web Search 工具）
     private func webSearchContext(query: String, settings: ModelSettings) async -> String? {
-        guard !query.isEmpty, settings.cloudWebSearch || webSearchOn else { return nil }
+        guard !query.isEmpty, settings.cloudWebSearch else { return nil }
         let result = await SearchService.search(query: query, settings: settings)
         return "以下是针对「\(query)」的联网搜索结果，请基于这些信息回答：\n\n\(result)"
     }
@@ -1070,10 +1094,17 @@ struct ChatView: View {
     }
 
     private func speakMessage(_ message: ChatMessage) {
+        // 分支必须按「点的是不是正在朗读的那一条」判断，而不是「有没有任何一条在朗读」。
+        // 原来是后者，而气泡菜单的文字是按前者显示的（MessageBubble: `isSpeaking ? "停止朗读" : "朗读"`），
+        // 于是 A 正在读时对 B 点「朗读」，实际发生的事情是「把 A 停掉、B 一个字都不读」——
+        // 按钮说它会读 B，它却只是停了 A。
+        let isThisOne = speakingMessageID == message.id
         if ttsService.isSpeaking {
             ttsService.stop()
             speakingMessageID = nil
-            return
+            // 点的就是正在读的那条 → 这次点击的语义就是"停止"，到此结束。
+            if isThisOne { return }
+            // 点的是别的条 → 停掉旧的，继续往下把这一条读出来。
         }
         let text = message.visibleContent
         guard !text.isEmpty else { return }

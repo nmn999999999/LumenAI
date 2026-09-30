@@ -64,16 +64,24 @@ struct ModelListView: View {
             .alert("从 URL 下载 GGUF", isPresented: $showCustomURL) {
                 TextField("模型名称", text: $customName)
                 TextField("https://…/model.gguf", text: $customURLText)
+                // 原来这里直接 `if let url = URL(string:)` —— URL 留空时返回 nil，
+                // 整个 if 被跳过，但弹窗照样关闭、输入框被清空、没有任何提示，
+                // 用户视角就是「点了没反应」。改成不合法就禁用按钮 + 说明原因。
                 Button("下载") {
-                    if let url = URL(string: customURLText.trimmingCharacters(in: .whitespaces)) {
+                    if let url = parsedCustomURL {
                         modelManager.downloadCustom(name: customName, remoteURL: url)
+                        customName = ""
+                        customURLText = ""
                     }
-                    customName = ""
-                    customURLText = ""
                 }
+                .disabled(parsedCustomURL == nil)
                 Button("取消", role: .cancel) {}
             } message: {
-                Text("粘贴指向 .gguf 文件的直链")
+                if let reason = customURLProblem {
+                    Text(reason)
+                } else {
+                    Text("粘贴指向 .gguf 文件的直链")
+                }
             }
             .alert("出错了", isPresented: .init(
                 get: { modelManager.lastError != nil },
@@ -84,6 +92,29 @@ struct ModelListView: View {
                 Text(modelManager.lastError ?? "")
             }
         }
+    }
+
+    /// 解析用户输入的下载地址；不合法时返回 nil（「下载」按钮会被禁用）。
+    private var parsedCustomURL: URL? {
+        guard customURLProblem == nil else { return nil }
+        return URL(string: customURLText.trimmingCharacters(in: .whitespaces))
+    }
+
+    /// 地址不合法的**具体原因**，直接显示给用户。
+    /// 之前这里什么都不提示：URL 为空时 `URL(string:)` 返回 nil，if 被跳过，
+    /// 但弹窗照关、输入框被清空 —— 用户只能反复点，不知道哪里不对。
+    private var customURLProblem: String? {
+        let text = customURLText.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return "请先填写 .gguf 文件的直链地址" }
+        guard let url = URL(string: text), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return "地址需要以 http:// 或 https:// 开头"
+        }
+        let path = url.path.lowercased()
+        guard path.hasSuffix(".gguf") else {
+            return "这个地址看起来不是 .gguf 文件，请确认链接指向模型本体"
+        }
+        return nil
     }
 
     private var ggufTypes: [UTType] {
@@ -118,7 +149,11 @@ struct ModelListView: View {
                     statusRow(msg, icon: "exclamationmark.triangle.fill", color: .red)
                 }
 
-                if llmService.isModelReady {
+                // 这个按钮原来用 `llmService.isModelReady` 判断，而 API 模式也算「就绪」
+                // （LLMService: `if case .apiMode = state { return true }`）—— 于是内存里
+                // 根本没有模型时，按钮却写着「卸载模型（释放内存）」；点下去 state 变 idle，
+                // API 模式静默失效，对话直接变成演示引擎的回复。按钮文字必须与真实后果一致。
+                if case .ready = llmService.state {
                     Button(role: .destructive) {
                         llmService.unload()
                     } label: {
@@ -177,6 +212,8 @@ struct StoredModelRow: View {
     @EnvironmentObject private var llmService: LLMService
     let stored: ModelManager.StoredModel
     @State private var loadingNow = false
+    /// 待确认删除的模型。几 GB 的文件删掉就得重新下载，必须让用户先看清楚。
+    @State private var pendingDelete: ModelManager.StoredModel?
 
     var body: some View {
         GlassCard(cornerRadius: 18) {
@@ -204,10 +241,23 @@ struct StoredModelRow: View {
                             loadingNow = true
                             Task {
                                 let url = modelManager.localFileURL(for: stored)
+                                // 选中本地模型 = 明确切到本地引擎：必须**先清掉云端选择**。
+                                // 聊天页早就为这个 bug 打过补丁（ChatView 里那段带注释的
+                                // `providerStore.select(providerID: nil, model: "")`），
+                                // 而模型页漏了 —— 于是已有云端选中时在这里点「加载」，
+                                // 徽标变成「使用中」、引擎显示「已就绪」，但真正回答的仍是
+                                // 云端模型（LLMService 里云端优先级高于本地）。
+                                ProviderStore.shared.select(providerID: nil, model: "")
                                 await llmService.load(url: url, displayName: stored.name)
                                 loadingNow = false
                                 if case .failed(let msg) = llmService.state {
                                     modelManager.lastError = msg
+                                } else {
+                                    // 同一个「加载模型」动作有两个入口（这里和聊天页），
+                                    // 而 rememberLastUsed 原先只有聊天页调 —— 从模型页加载
+                                    // 的模型不会被记住，下次启动自动加载的还是旧的那个。
+                                    // 两个入口必须做同一件事。
+                                    modelManager.rememberLastUsed(stored)
                                 }
                             }
                         } label: {
@@ -217,8 +267,11 @@ struct StoredModelRow: View {
                         }
                         .buttonStyle(.glassProminent)
 
+                        // 原来是只有垃圾桶图标的按钮，一点就 `modelManager.delete` ——
+                        // 几 GB 的 gguf 文件瞬间消失、没有确认也没有撤销，
+                        // 而且正在「使用中」的模型也能直接删掉（文件没了，引擎却还显示「已就绪」）。
                         Button(role: .destructive) {
-                            modelManager.delete(stored)
+                            pendingDelete = stored
                         } label: {
                             Image(systemName: "trash")
                         }
@@ -226,6 +279,33 @@ struct StoredModelRow: View {
                     }
                 }
             }
+        }
+        .confirmationDialog(
+            "删除这个模型？",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDelete
+        ) { target in
+            Button("删除", role: .destructive) {
+                // 正在使用的模型要先卸载：否则文件删了、列表项没了，
+                // 而「当前引擎」还显示「已就绪」，再发消息就会莫名失败。
+                if llmService.loadedModelName == target.name {
+                    llmService.unload()
+                }
+                modelManager.delete(target)
+                pendingDelete = nil
+            }
+            Button("取消", role: .cancel) { pendingDelete = nil }
+        } message: { target in
+            let gb = Double(target.sizeBytes) / 1_073_741_824
+            let size = gb >= 1
+                ? String(format: "%.1f GB", gb)
+                : String(format: "%.0f MB", Double(target.sizeBytes) / 1_048_576)
+            Text("将删除本地文件「\(target.fileName)」（约 \(size)），删除后需要重新下载。"
+                 + (llmService.loadedModelName == target.name ? "该模型正在使用中，会先被卸载。" : ""))
         }
     }
 }

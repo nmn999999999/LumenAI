@@ -11,6 +11,8 @@ struct SettingsView: View {
     @ObservedObject private var assistantStore = AssistantStore.shared
 
     @State private var showDeleteConfirm = false
+    /// Kokoro 语音模型删除确认（约 175 MB，删了要重下）
+    @State private var showKokoroDeleteConfirm = false
     @FocusState private var focusedField: Field?
     
     private enum Field: Hashable {
@@ -60,6 +62,7 @@ struct SettingsView: View {
                     generationCard
                     displayCard
                     memoryCard
+                    longTermMemoryCard
                     systemPromptCard
                     toolsCard
                     FeaturesCard
@@ -80,6 +83,9 @@ struct SettingsView: View {
             .onTapGesture {
                 focusedField = nil
             }
+            // 记忆可能在聊天过程中被 AI 改过（note 工具），每次进设置页都重新扫一次磁盘，
+            // 否则这里显示的是上次进页面时的旧列表。
+            .onAppear { noteStore.refresh() }
         }
     }
 
@@ -147,7 +153,7 @@ struct SettingsView: View {
                         // 原来是「温度」，与「生成参数」里的本地温度同名不同义，
                         // 用户不知道哪个生效。改成带作用域的名字。
                         sliderRow("API 温度", value: $storage.settings.apiTemperature, in: 0...2)
-                        stepperRow("最大 Token", value: $storage.settings.apiMaxTokens, in: 256...16384, step: 256)
+                        stepperRow("API 最大 Token", value: $storage.settings.apiMaxTokens, in: 256...16384, step: 256)
                         
                         Text("支持所有 OpenAI 兼容 API（OpenAI、Anthropic、DeepSeek、本地 Ollama 等）。密钥仅存储在本地，不会上传。")
                             .font(.caption2)
@@ -172,8 +178,17 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 sliderRow("Top-P", value: $storage.settings.topP, in: 0.1...1)
                 stepperRow("Top-K", value: $storage.settings.topK, in: 1...100, step: 5)
-                stepperRow("最大生成 Token", value: $storage.settings.maxTokens, in: 256...8192, step: 256)
+                // 与上面的「API 最大 Token」同名会让人不知道哪个生效，两处都带上作用域。
+                stepperRow("本地最大生成 Token", value: $storage.settings.maxTokens, in: 256...8192, step: 256)
                 stepperRow("上下文长度", value: $storage.settings.contextLength, in: 1024...8192, step: 1024)
+                // 生成上限可以设得比上下文还大 —— 那不是更长的回答，而是无效设置。
+                // 这里直接说清楚，省得用户以为调大就「回答更长」。
+                if storage.settings.maxTokens >= storage.settings.contextLength {
+                    Label("本地最大生成 Token 已不小于上下文长度：实际可用长度受上下文限制，建议调小生成上限或调大上下文。",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
 
                 Divider()
 
@@ -312,8 +327,102 @@ struct SettingsView: View {
         }
     }
 
-    private func sliderRow(_ title: String, value: Binding<Double>, in range: ClosedRange<Double>) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    // MARK: - 长期记忆（note 工具）
+
+    @ObservedObject private var noteStore = NoteStore.shared
+    @State private var showClearMemoryConfirm = false
+    @State private var expandedNote: String?
+
+    /// 跨对话记忆的查看 / 删除界面。
+    ///
+    /// 补这一块的原因：`note` 是这个 App 的核心能力，但在此之前它**只有写、没有界面** ——
+    /// 笔记被直接写成 `Documents/agent_notes/*.txt`，界面上没有任何地方能看到 AI 记住了什么，
+    /// 也没有任何办法删掉。两个具体后果：
+    ///   1. 用户在「设置 → 工具」里关掉 note 之后，已有记忆就彻底失管；
+    ///   2. 「删除全部对话记录」走的是 chatStore.deleteAll()，**碰不到**这些笔记 ——
+    ///      用户以为清干净了，AI 其实还记得全部。这是隐私问题，不只是体验问题。
+    private var longTermMemoryCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    SectionHeader(title: "长期记忆", systemImage: "brain.head.profile")
+                    Spacer()
+                    if !noteStore.notes.isEmpty {
+                        Text("\(noteStore.notes.count) 条 · \(noteStore.totalCharacters) 字")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if noteStore.notes.isEmpty {
+                    Text("还没有记忆。在对话里让 AI「记住…」时会写到这里（note 工具）。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("AI 跨对话记住的内容。这里可以逐条查看、删除，也可以全部清空 —— 注意「删除全部对话记录」不会动这里。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    ForEach(noteStore.notes) { note in
+                        noteRow(note)
+                    }
+
+                    Button(role: .destructive) {
+                        showClearMemoryConfirm = true
+                    } label: {
+                        Label("清空全部记忆", systemImage: "trash")
+                            .font(.caption)
+                    }
+                }
+            }
+        }
+        .confirmationDialog(
+            "清空全部长期记忆？",
+            isPresented: $showClearMemoryConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("全部清空", role: .destructive) {
+                noteStore.deleteAll()
+            }
+            Button(t("取消"), role: .cancel) {}
+        } message: {
+            Text("AI 将不再记得这些内容，且无法恢复。对话记录不受影响。")
+        }
+    }
+
+    private func noteRow(_ note: NoteStore.Note) -> some View {
+        DisclosureGroup(isExpanded: Binding(
+            get: { expandedNote == note.name },
+            set: { expandedNote = $0 ? note.name : nil }
+        )) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(note.content)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(role: .destructive) {
+                    noteStore.delete(name: note.name)
+                    if expandedNote == note.name { expandedNote = nil }
+                } label: {
+                    Label("删除这条记忆", systemImage: "trash")
+                        .font(.caption)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack {
+                Text(note.name).font(.subheadline)
+                Spacer()
+                Text("\(note.characters) 字")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func sliderRow(_ title: String, value: Binding<Double>, in range: ClosedRange<Double>) -> some View {        VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title).font(.subheadline)
                 Spacer()
@@ -578,7 +687,7 @@ struct SettingsView: View {
                         .foregroundStyle(.green)
                     Spacer()
                     Button(role: .destructive) {
-                        kokoroManager.deleteModel()
+                        showKokoroDeleteConfirm = true
                     } label: {
                         Text(t("删除模型")).font(.caption)
                     }
@@ -667,6 +776,19 @@ struct SettingsView: View {
             Text("53 个音色（中文 8 个 + 英/日/西/法等），支持中英文混读；合成在设备本地完成，无需联网。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+        }
+        // 删除约 175 MB 的模型后要重新下载几分钟，和「删除全部对话」一样属于该确认的操作。
+        .confirmationDialog(
+            "删除本地语音模型？",
+            isPresented: $showKokoroDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button(t("删除模型"), role: .destructive) {
+                kokoroManager.deleteModel()
+            }
+            Button(t("取消"), role: .cancel) {}
+        } message: {
+            Text("将删除已下载的约 175 MB 模型文件；再次使用需要重新下载（支持断点续传）。")
         }
     }
 
@@ -1009,9 +1131,12 @@ struct SettingsView: View {
                 // 却分在两处、卡片名都带「搜索」，用户不知道去哪找。归到一处。
                 Toggle(isOn: $storage.settings.cloudWebSearch) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(t("云端联网搜索"))
+                        Text(t("联网搜索"))
                             .font(.subheadline)
-                        Text(t("发送消息时自动搜索互联网并注入上下文（与上面的搜索引擎无关：这个是对话自动注入）"))
+                        // 原来说明写的是「与上面的搜索引擎无关」—— 那是错的：
+                        // 自动注入走的就是 SearchService，而它读的正是上面这个 searchEngine，
+                        // 所以选了「维基百科」之后自动注入也只会查维基。说明必须与行为一致。
+                        Text(t("发送消息时自动搜索并注入上下文；使用上面选择的同一个搜索引擎，这里只控制是否自动注入"))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -1179,6 +1304,11 @@ struct SettingsView: View {
                     Button("全部删除", role: .destructive) {
                         chatStore.deleteAll()
                     }
+                    Button(t("取消"), role: .cancel) {}
+                } message: {
+                    // 这句必须写：长期记忆不在这里，用户按下确认时以为"全清了"，
+                    // 而 AI 仍然记得所有笔记 —— 那是最容易被当成 bug 的行为。
+                    Text("只删除对话记录。AI 的长期记忆（笔记）不会受影响，需要的话请到上方「长期记忆」卡片里清空。")
                 }
             }
         }

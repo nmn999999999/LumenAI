@@ -472,7 +472,7 @@ enum BuiltInTools {
         case "hash_text":       return executeHashText(arguments: arguments)
         case "json_format":     return executeJsonFormat(arguments: arguments)
         case "url_codec":       return executeUrlCodec(arguments: arguments)
-        case "note":            return executeNote(arguments: arguments)
+        case "note":            return await executeNote(arguments: arguments)
         case "clipboard":       return executeClipboard(arguments: arguments)
         case "web_search":      return await executeWebSearch(arguments: arguments)
         case "regex_extract":   return executeRegexExtract(arguments: arguments)
@@ -665,43 +665,21 @@ enum BuiltInTools {
         return dir
     }()
 
-    private static func executeNote(arguments: [String: Any]) -> String {
+    /// 笔记的读写**全部**交给 `NoteStore` —— 它同时也是「设置 → 长期记忆」界面的数据源。
+    /// 两边各写一份 file I/O 的话，模型写完笔记后界面列表不会刷新，用户看到的还是旧列表。
+    /// 目录定义也随之收敛成一处（`NoteStore.directory`），不再有两个「同一个目录」的字面量。
+    ///
+    /// 注意：返回的字符串必须与训练数据逐字一致 —— lumen3 / lumen4 就是照这些字符串
+    /// 练出来的记忆行为（真源在 `build_lumen_train.py`），改文案会让模型在真实 App 里对不上。
+    private static func executeNote(arguments: [String: Any]) async -> String {
         let op = arguments["op"] as? String ?? "list"
         let rawName = (arguments["name"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let name = rawName.replacingOccurrences(of: "/", with: "-")
-
-        switch op {
-        case "save":
-            guard !name.isEmpty else { return "错误: 保存笔记需要 name 参数" }
-            let content = arguments["content"] as? String ?? ""
-            let url = notesDirectory.appendingPathComponent(name + ".txt")
-            do {
-                try content.write(to: url, atomically: true, encoding: .utf8)
-                return "已保存笔记「\(rawName)」（\(content.count) 字）"
-            } catch {
-                return "保存失败: \(error.localizedDescription)"
-            }
-        case "read":
-            guard !name.isEmpty else { return "错误: 读取笔记需要 name 参数" }
-            let url = notesDirectory.appendingPathComponent(name + ".txt")
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-                return "未找到笔记「\(rawName)」"
-            }
-            return "「\(rawName)」: \(text)"
-        case "delete":
-            guard !name.isEmpty else { return "错误: 删除笔记需要 name 参数" }
-            let url = notesDirectory.appendingPathComponent(name + ".txt")
-            do {
-                try FileManager.default.removeItem(at: url)
-                return "已删除笔记「\(rawName)」"
-            } catch {
-                return "删除失败或不存在: \(error.localizedDescription)"
-            }
-        default: // list
-            let files = (try? FileManager.default.contentsOfDirectory(atPath: notesDirectory.path)) ?? []
-            let names = files.filter { $0.hasSuffix(".txt") }.map { String($0.dropLast(4)) }
-            return names.isEmpty ? "暂无笔记" : "现有笔记: \(names.joined(separator: ", "))"
+        let content = arguments["content"] as? String ?? ""
+        // 工具跑在非隔离的 static async 上下文里，而 NoteStore 是 @MainActor（要给 SwiftUI 用），
+        // 所以显式跳一次主线程。笔记都是小文本文件，这点 I/O 放主线程没有影响。
+        return await MainActor.run {
+            NoteStore.shared.perform(op: op, name: rawName, content: content)
         }
     }
 

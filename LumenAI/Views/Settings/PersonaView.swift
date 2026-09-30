@@ -44,11 +44,21 @@ struct PersonaView: View {
                             }
                         ))
                         .labelsHidden()
+                        // 总开关关掉时条目开关拨了也不会生效：PersonaStore 里是
+                        // `if settings.worldBookEnabled { ... }` 直接跳过，条目的 enabled 根本不参与计算。
+                        // 让它看起来还能用，用户就会以为设置生效了。这里只禁开关本身，
+                        // 点击条目编辑内容仍然可用（改内容不会误导任何人）。
+                        .disabled(!settings.settings.worldBookEnabled)
                     }
                     .contentShape(Rectangle())
                     .onTapGesture { editingWorld = entry }
                 }
                 .onDelete { idx in store.worldBook.remove(atOffsets: idx) }
+                if !settings.settings.worldBookEnabled && !store.worldBook.isEmpty {
+                    Text("总开关已关闭，上面的条目开关暂不生效。")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             } header: {
                 HStack {
                     Text("世界观设定")
@@ -97,11 +107,18 @@ struct PersonaView: View {
                             }
                         ))
                         .labelsHidden()
+                        // 同世界观那条：总开关关闭时条目不参与注入计算，开关就别装成能用。
+                        .disabled(!settings.settings.memoryEnabled)
                     }
                     .contentShape(Rectangle())
                     .onTapGesture { editingMemory = entry }
                 }
                 .onDelete { idx in store.memory.remove(atOffsets: idx) }
+                if !settings.settings.memoryEnabled && !store.memory.isEmpty {
+                    Text("「注入长期记忆」总开关已关闭，上面的条目开关暂不生效。")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             } header: {
                 HStack {
                     Text("长期记忆")
@@ -141,11 +158,18 @@ struct PersonaView: View {
                             }
                         ))
                         .labelsHidden()
+                        // 同 worldview / memory：总开关关闭时条目不参与注入计算。
+                        .disabled(!settings.settings.instructionEnabled)
                     }
                     .contentShape(Rectangle())
                     .onTapGesture { editingInstruction = group }
                 }
                 .onDelete { idx in store.instructions.remove(atOffsets: idx) }
+                if !settings.settings.instructionEnabled && !store.instructions.isEmpty {
+                    Text("「注入指令」总开关已关闭，上面的条目开关暂不生效。")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             } header: {
                 HStack {
                     Text("指令")
