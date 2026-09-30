@@ -7,6 +7,8 @@ struct SettingsView: View {
     @EnvironmentObject private var theme: LumenAIApp.ThemeObserver
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var storage = SettingsStorage.shared
+    @ObservedObject private var toolStore = ToolSettingsStore.shared
+    @ObservedObject private var assistantStore = AssistantStore.shared
 
     @State private var showDeleteConfirm = false
     @FocusState private var focusedField: Field?
@@ -59,6 +61,7 @@ struct SettingsView: View {
                     displayCard
                     memoryCard
                     systemPromptCard
+                    toolsCard
                     FeaturesCard
                     cloudStorageCard
                     updateCard
@@ -141,7 +144,9 @@ struct SettingsView: View {
                         }
                         
                         // API 参数
-                        sliderRow("温度", value: $storage.settings.apiTemperature, in: 0...2)
+                        // 原来是「温度」，与「生成参数」里的本地温度同名不同义，
+                        // 用户不知道哪个生效。改成带作用域的名字。
+                        sliderRow("API 温度", value: $storage.settings.apiTemperature, in: 0...2)
                         stepperRow("最大 Token", value: $storage.settings.apiMaxTokens, in: 256...16384, step: 256)
                         
                         Text("支持所有 OpenAI 兼容 API（OpenAI、Anthropic、DeepSeek、本地 Ollama 等）。密钥仅存储在本地，不会上传。")
@@ -161,7 +166,10 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 14) {
                 SectionHeader(title: "生成参数", systemImage: "slider.horizontal.3")
 
-                sliderRow("温度 (temperature)", value: $storage.settings.temperature, in: 0...1.5)
+                sliderRow("本地温度 (temperature)", value: $storage.settings.temperature, in: 0...1.5)
+                Text(t("仅本地模型生效；API 模式用「API 模式」卡片里的 API 温度。"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                 sliderRow("Top-P", value: $storage.settings.topP, in: 0.1...1)
                 stepperRow("Top-K", value: $storage.settings.topK, in: 1...100, step: 5)
                 stepperRow("最大生成 Token", value: $storage.settings.maxTokens, in: 256...8192, step: 256)
@@ -287,7 +295,8 @@ struct SettingsView: View {
     private var memoryCard: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 14) {
-                SectionHeader(title: "内存优化", systemImage: "memorychip")
+                // 明确是 RAM（内存），与「工具」卡片里的跨对话「记忆」不是一回事
+                SectionHeader(title: "内存优化（RAM）", systemImage: "memorychip")
 
                 Toggle(isOn: $storage.settings.useMmap) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -331,6 +340,83 @@ struct SettingsView: View {
 
     // MARK: - 系统提示词
 
+    // MARK: - 工具（可开关，总数上限不变）
+
+    /// 内置工具的选择界面。
+    ///
+    /// 存在的原因：`allTools` 有 33 个，而本地模型按 `prefix(12)` 取**声明顺序**的前 12 个，
+    /// 于是 `note`（跨对话记忆的唯一接口，排第 19）和 `web_search`（第 21）都被截掉 ——
+    /// 本地模型根本看不到记忆工具。这里保持上限 12 不变，把选择权交给用户。
+    private var toolsCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    SectionHeader(title: "工具", systemImage: "wrench.and.screwdriver")
+                    Spacer()
+                    Text("已启用 \(toolStore.count)/\(toolStore.limit)")
+                        .font(.caption)
+                        .foregroundStyle(toolStore.isFull ? .orange : .secondary)
+                }
+
+                Text("本地模型只喂前 \(toolStore.limit) 个工具 —— 再多会占满上下文、导致指令漂移。note 是跨对话记忆的唯一接口，默认已开启。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(toolStore.enabledNames, id: \.self) { name in
+                    toolToggleRow(name)
+                }
+
+                if !toolStore.disabledNames.isEmpty {
+                    DisclosureGroup("更多工具（\(toolStore.disabledNames.count)）") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(toolStore.disabledNames, id: \.self) { name in
+                                toolToggleRow(name)
+                            }
+                        }
+                        .padding(.top, 6)
+                    }
+                    .font(.subheadline)
+                }
+
+                HStack {
+                    Button("恢复默认清单") { toolStore.resetToDefault() }
+                        .font(.caption)
+                    Spacer()
+                    if toolStore.isFull {
+                        Text("已达上限，先关掉一个才能再开")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+        }
+    }
+
+    private func toolToggleRow(_ name: String) -> some View {
+        let def = BuiltInTools.allTools.first { $0.name == name }
+        let enabled = toolStore.isEnabled(name)
+        return Toggle(isOn: Binding(
+            // get 里现读 store，别捕获快照 —— 达上限被拒绝时开关必须保持在原位
+            get: { toolStore.isEnabled(name) },
+            set: { _ = toolStore.setEnabled(name, $0) }
+        )) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name)
+                    .font(.system(.subheadline, design: .monospaced))
+                if let d = def?.description, !d.isEmpty {
+                    Text(d)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .tint(.green)
+        // 未启用且已达上限时置灰：直接拒绝比静默顶掉别的工具更容易理解
+        .disabled(!enabled && toolStore.isFull)
+    }
+
     private var systemPromptCard: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 10) {
@@ -344,6 +430,21 @@ struct SettingsView: View {
                 .padding(10)
                 .background(.quaternary, in: .rect(cornerRadius: 12))
                 .focused($focusedField, equals: .systemPrompt)
+
+                // 让用户看得见「当前实际生效的是哪一个」——
+                // 否则改完这里的提示词没反应时，用户完全无从判断原因。
+                if let a = assistantStore.current,
+                   !a.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   a.systemPrompt != AIAssistant.default.systemPrompt {
+                    Label("当前由助手「\(a.name)」的提示词覆盖，此处不会生效",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("当前生效：以上全局提示词。若某个助手自定义了提示词，则以该助手的为准。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -353,7 +454,9 @@ struct SettingsView: View {
     private var FeaturesCard: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 14) {
-                SectionHeader(title: "语言 / 朗读 / 搜索", systemImage: "globe")
+                // 去掉「搜索」：搜索相关的开关已归到「搜索服务」卡片，避免两张卡片
+                // 都叫搜索却各放一半设置。
+                SectionHeader(title: "语言 / 朗读", systemImage: "globe")
 
                 // 语言
                 HStack {
@@ -366,20 +469,6 @@ struct SettingsView: View {
                     .pickerStyle(.segmented)
                     .frame(maxWidth: 200)
                 }
-
-                Divider()
-
-                // 云端联网搜索
-                Toggle(isOn: $storage.settings.cloudWebSearch) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(t("云端联网搜索"))
-                            .font(.subheadline)
-                        Text(t("发送消息时自动搜索互联网并注入上下文"))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .tint(.blue)
 
                 Divider()
 
@@ -477,6 +566,9 @@ struct SettingsView: View {
 
     private var kokoroTTSCard: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // 这个卡片原本没有标题，只有一个状态 Label，用户看不出它与上面
+            // 「语言 / 朗读」里的「朗读引擎 → 本地神经 TTS」是同一套功能。
+            SectionHeader(title: "Kokoro 本地语音", systemImage: "waveform")
             // 模型状态 / 下载
             switch kokoroManager.state {
             case .ready:
@@ -910,6 +1002,21 @@ struct SettingsView: View {
                 """)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+
+                Divider()
+
+                // 原本在「语言 / 朗读 / 搜索」卡片里，与这里的「搜索引擎」是同一主题
+                // 却分在两处、卡片名都带「搜索」，用户不知道去哪找。归到一处。
+                Toggle(isOn: $storage.settings.cloudWebSearch) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(t("云端联网搜索"))
+                            .font(.subheadline)
+                        Text(t("发送消息时自动搜索互联网并注入上下文（与上面的搜索引擎无关：这个是对话自动注入）"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .tint(.blue)
             }
         }
     }

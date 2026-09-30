@@ -724,7 +724,12 @@ struct ChatView: View {
                 let result = await agentService.run(
                     history: history,
                     settings: effectiveSettings,
-                    toolsEnabledTools: BuiltInTools.allTools + MCPService.shared.toolDefinitions + PluginManager.shared.installedToolDefinitions(),
+                    // 内置工具按「设置里勾选的清单」给（上限仍是 12，见 ToolSettingsStore）。
+                    // 不能再用 allTools：它按声明顺序取前 12 个，而 note 排第 19
+                    // 会被截掉 —— 本地模型于是看不到记忆工具。
+                    toolsEnabledTools: ToolSettingsStore.shared.enabledTools()
+                        + MCPService.shared.toolDefinitions
+                        + PluginManager.shared.installedToolDefinitions(),
                     llm: llmService,
                     bridge: bridge
                 )
@@ -765,7 +770,18 @@ struct ChatView: View {
     private func effectiveSettings(from settings: ModelSettings, modelName: String, providerName: String) -> ModelSettings {
         var effective = settings
         let assistant = assistantStore.current
-        let prompt = (assistant?.systemPrompt.isEmpty == false ? assistant!.systemPrompt : settings.systemPrompt)
+        // 助手的提示词**只在用户真的改过时**才覆盖全局设置。
+        //
+        // 原来的写法是「助手提示词非空就用它」，而 AssistantStore 保证一定存在一个
+        // 默认助手（AIAssistant.default 的 systemPrompt 非空），于是
+        // 「设置 → 系统提示词」这个控件**永远不生效** —— 用户改完没有任何反应，
+        // 属于典型的不符合用户逻辑。现在与内置默认值相同即视为「未改过」，
+        // 回落到全局设置；设置页也会提示当前实际生效的是哪一个。
+        let assistantPrompt = (assistant?.systemPrompt ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isCustomized = !assistantPrompt.isEmpty
+            && assistantPrompt != AIAssistant.default.systemPrompt
+        let prompt = isCustomized ? assistantPrompt : settings.systemPrompt
         effective.systemPrompt = PromptVariableResolver.resolve(
             prompt,
             model: modelName,

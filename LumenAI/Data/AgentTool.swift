@@ -1761,3 +1761,50 @@ enum BuiltInTools {
         return out
     }
 }
+
+// MARK: - 默认启用清单（可开关，总数不变）
+
+extension BuiltInTools {
+
+    /// 工具目录的硬上限。与 `AgentService.withToolInstructions` 里的 `maxTools` 一致：
+    /// 本地模型只喂 12 个，防止 4B 级模型的上下文被工具说明占满（解码失败/指令漂移）。
+    static let catalogLimit = 12
+
+    /// 默认启用的内置工具名（**有序**，顺序即模型工具目录里的出现顺序）。
+    ///
+    /// 为什么需要这份清单：`allTools` 有 33 个，而本地模型走 `prefix(12)` 取**声明顺序**
+    /// 的前 12 个。实测 `note`（持久化笔记 = 跨对话记忆的唯一接口）排在第 19 位、
+    /// `web_search` 第 21 位，**都被截掉了** —— 也就是说本地模型的工具目录里
+    /// 根本不存在记忆工具。对一款以「长期记忆」为立身之本的本地 App，这等于核心功能不可用。
+    ///
+    /// 所以这里显式给出默认 12 个，把 `note` 提到最前（核心诉求）、`web_search` 也纳入，
+    /// 代价是把两个较专用的 `csv_table` / `jwt_decode` 移出默认集 —— 它们仍可在
+    /// 设置里手动开启，总数上限保持 12 不变。
+    static let defaultEnabledNames: [String] = [
+        "http_get",
+        "note",
+        "web_search",
+        "device_info",
+        "json_query",
+        "calculator",
+        "current_time",
+        "timestamp",
+        "extract_urls",
+        "random_number",
+        "word_count",
+        "generate_uuid",
+    ]
+
+    /// 按名字取工具（保持传入顺序；未知名字直接忽略）。
+    static func tools(named names: [String]) -> [AgentToolDefinition] {
+        let by = allTools.reduce(into: [String: AgentToolDefinition]()) { acc, t in
+            acc[t.name] = t
+        }
+        return names.compactMap { by[$0] }
+    }
+
+    /// 默认启用的工具定义（给 `AgentService.run` 的默认参数用）。
+    static var defaultEnabledTools: [AgentToolDefinition] {
+        tools(named: defaultEnabledNames)
+    }
+}

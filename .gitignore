@@ -52,3 +52,6 @@ tests/
 .local/
 .workbuddy/
 ipa_final/
+
+# 本次会话的构建目录
+build-lumen3/

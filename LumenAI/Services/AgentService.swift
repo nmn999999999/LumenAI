@@ -158,7 +158,7 @@ final class AgentService: ObservableObject {
     func run(
         history: [ChatMessage],
         settings: ModelSettings,
-        toolsEnabledTools: [AgentToolDefinition] = BuiltInTools.allTools,
+        toolsEnabledTools: [AgentToolDefinition] = BuiltInTools.defaultEnabledTools,
         llm: LLMService,
         bridge: AgentDisplayBridge? = nil
     ) async -> (content: String, toolCalls: [ChatMessage.ToolCall]) {
