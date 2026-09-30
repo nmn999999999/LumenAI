@@ -375,7 +375,22 @@ final class AgentService: ObservableObject {
     ) -> [ChatMessage] {
         let maxTools = useCloud ? tools.count : 12
         let maxDesc = useCloud ? Int.max : 150
-        let catalog = tools.prefix(maxTools).map { tool -> String in
+
+        // 本地模型：内置工具按「设置 → 工具」的勾选过滤（顺序也按用户选择，
+        // 因为 note 被默认放在第 2 位，训练数据也是这个顺序）。
+        // 云端：用全部内置工具 —— 过滤必须放在这里而不是调用方，
+        // 否则云端也会被砍到 12 个（用户反馈过这个 bug）。
+        // MCP / 插件工具不属于内置，不受勾选影响，照常附带。
+        let selected: [AgentToolDefinition]
+        if useCloud {
+            selected = tools
+        } else {
+            let builtinNames = Set(BuiltInTools.allTools.map { $0.name })
+            let external = tools.filter { !builtinNames.contains($0.name) }
+            selected = ToolSettingsStore.shared.enabledTools() + external
+        }
+
+        let catalog = selected.prefix(maxTools).map { tool -> String in
             var desc = tool.description
             if desc.count > maxDesc { desc = String(desc.prefix(maxDesc)) + "…" }
             var lines = "- \(tool.name): \(desc)"

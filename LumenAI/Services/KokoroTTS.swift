@@ -697,10 +697,52 @@ final class KokoroTTSManager: ObservableObject {
     }
 
     /// 顺序下载大文件，随后并发下载 espeak 小文件
+    /// 单轮下载的结果（供外层自动重试判定）
+    enum DownloadOutcome {
+        case done
+        case cancelled
+        case failed(String)
+    }
+
+    /// 下载整包，**失败自动重试整轮**。
+    ///
+    /// 为什么要自动重试（用户反馈「TTS 语音下载会经常失败」）：
+    ///   实测 `hf-mirror.com` 对**所有文件**（含 model.onnx 这种大文件）都是 308
+    ///   跳回 `huggingface.co` —— 它并不托管字节。也就是说这条线路的稳定性完全
+    ///   取决于 huggingface.co。单轮里任一环节失败，以前就直接报错、要用户手动点重试。
+    ///   现在内部自动再试：每轮都会跳过已下好的文件（fileSizeMatches），所以是收敛的，
+    ///   只在全部轮次都失败时才报错。
     nonisolated private static func downloadAll(
         to directory: URL,
         report: @escaping @Sendable (ProgressPhase, Double) -> Void
     ) async {
+        let maxRounds = 3
+        var lastMessage = "下载失败"
+        for round in 1...maxRounds {
+            let r = await downloadOnce(to: directory, round: round, of: maxRounds, report: report)
+            switch r {
+            case .done:
+                return
+            case .cancelled:
+                report(.failed("已取消"), 0)
+                return
+            case .failed(let msg):
+                lastMessage = msg
+            }
+            if round < maxRounds {
+                report(.file("第 \(round)/\(maxRounds) 轮未完成，3 秒后自动继续…"), 0)
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+        report(.failed("\(lastMessage)（已自动重试 \(maxRounds) 轮）"), 0)
+    }
+
+    nonisolated private static func downloadOnce(
+        to directory: URL,
+        round: Int,
+        of maxRounds: Int,
+        report: @escaping @Sendable (ProgressPhase, Double) -> Void
+    ) async -> DownloadOutcome {
         let fm = FileManager.default
         do {
             try fm.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -735,47 +777,62 @@ final class KokoroTTSManager: ObservableObject {
                 updateProgress()
             }
 
-            // espeak 小文件 4 路并发
-            try await withThrowingTaskGroup(of: Int64.self) { group in
+            // espeak 小文件 4 路并发：**容忍个别失败**。
+            //
+            // 原来是 withThrowingTaskGroup —— 任何一个文件抛错就向外抛，
+            // 把整个 ~175MB 的下载全部作废。而这里有一百多个小文件、镜像又不稳，
+            // 「至少有一个失败」几乎必然发生 —— 用户反馈的「TTS 语音下载会经常失败」
+            // 主要就是它。现在改成收集失败、继续下完其余的；判定交给下面的完整性校验，
+            // 而重试时 fileSizeMatches 会自动跳过已下好的文件，于是每次重试都在收敛。
+            var failedFiles: [String] = []
+            await withTaskGroup(of: (path: String, size: Int64, failed: Bool).self) { group in
                 var iterator = espeakFiles.makeIterator()
                 var inflight = 0
-                func addNext() throws {
+                func addNext() {
                     guard Task.isCancelled == false else { return }
                     if let entry = iterator.next() {
                         inflight += 1
                         group.addTask {
                             let dest = directory.appendingPathComponent(entry.path)
-                            if KokoroModelManifest.fileSizeMatches(entry, in: directory) { return entry.size }
-                            try await downloadEntry(entry, to: directory, progress: nil)
-                            return entry.size
+                            if KokoroModelManifest.fileSizeMatches(entry, in: directory) {
+                                return (entry.path, entry.size, false)
+                            }
+                            do {
+                                try await downloadEntry(entry, to: directory, progress: nil)
+                                return (entry.path, entry.size, false)
+                            } catch is CancellationError {
+                                return (entry.path, 0, true)
+                            } catch {
+                                return (entry.path, 0, true)
+                            }
                         }
                     }
                 }
-                for _ in 0..<4 { try addNext() }
+                for _ in 0..<4 { addNext() }
                 while inflight > 0 {
-                    do {
-                        done += try await group.next()!
-                        inflight -= 1
-                    } catch is CancellationError {
-                        group.cancelAll()
-                        throw CancellationError()
-                    }
+                    guard let r = await group.next() else { break }
+                    inflight -= 1
+                    if r.failed { failedFiles.append(r.path) } else { done += r.size }
                     updateProgress()
-                    try addNext()
+                    addNext()
                 }
             }
 
-            // 校验完整性
+            // 校验完整性。缺文件时不报「失败」而是给出还差几个，
+            // 用户点重试即可 —— 已下好的部分会被跳过。
             guard KokoroModelManifest.isComplete(in: directory) else {
-                report(.failed("文件校验失败，请重试"), 0)
-                return
+                let missing = KokoroModelManifest.files.filter {
+                    !KokoroModelManifest.fileSizeMatches($0, in: directory)
+                }.count
+                return .failed("还差 \(missing) 个文件未下载完成")
             }
             KokoroEngineCache.invalidate()
             report(.done, 1)
+            return .done
         } catch is CancellationError {
-            report(.failed("已取消"), 0)
+            return .cancelled
         } catch {
-            report(.failed("下载失败: \(error.localizedDescription)"), 0)
+            return .failed("下载失败: \(error.localizedDescription)")
         }
     }
 
@@ -790,16 +847,24 @@ final class KokoroTTSManager: ObservableObject {
             at: dest.deletingLastPathComponent(), withIntermediateDirectories: true
         )
         var lastError: Error = URLError(.badURL)
-        for base in KokoroModelManifest.baseURLs {
-            do {
-                let url = URL(string: "\(base)/\(KokoroModelManifest.repoID)/resolve/main/\(entry.path)")!
-                try await downloadFile(from: url, to: dest, expected: entry.size, progress: progress)
-                return
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                lastError = error
-                try? FileManager.default.removeItem(at: dest)
+        // 镜像整体轮 2 遍：覆盖「A 整体不可用 → 走 B → B 也断 → 回 A 继续」的情况。
+        // 单镜像内部的重试与续传在 downloadFile 里。
+        for round in 0..<2 {
+            for base in KokoroModelManifest.baseURLs {
+                do {
+                    let url = URL(string: "\(base)/\(KokoroModelManifest.repoID)/resolve/main/\(entry.path)")!
+                    try await downloadFile(from: url, to: dest, expected: entry.size, progress: progress)
+                    return
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    lastError = error
+                    try? FileManager.default.removeItem(at: dest)
+                }
+            }
+            if round == 0 {
+                // 两个镜像都刚失败，稍等一下再整体重来，避免撞上瞬时限流
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
         throw lastError
@@ -870,48 +935,84 @@ final class KokoroTTSManager: ObservableObject {
             onProgress(totalBytesWritten, totalBytesExpectedToWrite)
         }
 
+        /// 失败时系统给的续传数据 —— 用它做**同镜像断点续传**。
+        /// 没有它就只能把 ~175MB 从头再下一遍，这是「经常下载失败」的主因。
+        private(set) var resumeData: Data?
+
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
             if let error {
                 let ns = error as NSError
                 if ns.code == NSURLErrorCancelled {
                     finish(.failure(CancellationError()))
                 } else {
+                    if let d = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+                        stateLock.lock(); resumeData = d; stateLock.unlock()
+                    }
                     finish(.failure(error))
                 }
             }
         }
     }
 
+    /// 单文件下载：**同镜像内最多试 `attempts` 次，每次失败都断点续传**。
+    ///
+    /// 为什么必须这么改（用户反馈「TTS 语音下载会经常失败」）：
+    ///   * 模型约 175MB，而国内访问镜像经常中途掉线（本项目实测 hf-mirror 会 TLS 中断）；
+    ///   * 原实现是「一次失败 → 删掉文件 → 换下一个镜像从 0 开始」，大文件几乎必挂；
+    ///   * 原超时是 120s，慢镜像「长时间无数据」就会被判超时，大文件很吃亏。
+    /// 现在：失败先拿系统的 resumeData 从断点续；实在续不下去才交给上层换镜像。
     nonisolated private static func downloadFile(
         from url: URL,
         to dest: URL,
         expected: Int64,
-        progress: (@Sendable (Int64) -> Void)?
+        progress: (@Sendable (Int64) -> Void)?,
+        attempts: Int = 3
     ) async throws {
-        let delegate = DownloadDelegate(destination: dest) { written, _ in
-            progress?(written)
-        }
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 60 * 60 * 6
-        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
-
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                delegate.attach(continuation, session: session)
-                session.downloadTask(with: url).resume()
+        var lastError: Error = URLError(.unknown)
+        var resume: Data?
+        for _ in 0..<max(1, attempts) {
+            let delegate = DownloadDelegate(destination: dest) { written, _ in
+                progress?(written)
             }
-        } onCancel: {
-            delegate.cancelAll()
-        }
-
-        // 大小校验（不符视为坏下载，交由镜像重试逻辑）
-        let size = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber
-        guard size?.int64Value == expected else {
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 300
+            config.timeoutIntervalForResource = 60 * 60 * 6
+            let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+            do {
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        delegate.attach(continuation, session: session)
+                        if let r = resume {
+                            session.downloadTask(withResumeData: r).resume()
+                        } else {
+                            session.downloadTask(with: url).resume()
+                        }
+                    }
+                } onCancel: {
+                    delegate.cancelAll()
+                }
+            } catch is CancellationError {
+                session.finishTasksAndInvalidate()
+                throw CancellationError()
+            } catch {
+                lastError = error
+                resume = delegate.resumeData
+                if resume == nil {
+                    // 没拿到续传数据，只能从零重来
+                    try? FileManager.default.removeItem(at: dest)
+                }
+                session.finishTasksAndInvalidate()
+                continue
+            }
+            session.finishTasksAndInvalidate()
+            // 大小校验：字节数不对说明下坏了，删掉重下（此时不续传）
+            let size = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber
+            if size?.int64Value == expected { return }
             try? FileManager.default.removeItem(at: dest)
-            throw URLError(.zeroByteResource)
+            resume = nil
+            lastError = URLError(.zeroByteResource)
         }
+        throw lastError
     }
 }
 

@@ -724,10 +724,10 @@ struct ChatView: View {
                 let result = await agentService.run(
                     history: history,
                     settings: effectiveSettings,
-                    // 内置工具按「设置里勾选的清单」给（上限仍是 12，见 ToolSettingsStore）。
-                    // 不能再用 allTools：它按声明顺序取前 12 个，而 note 排第 19
-                    // 会被截掉 —— 本地模型于是看不到记忆工具。
-                    toolsEnabledTools: ToolSettingsStore.shared.enabledTools()
+                    // 这里传**全部**内置工具（+ MCP / 插件）。
+                    // 按「设置 → 工具」勾选过滤的动作在 AgentService 里做，且只对本地模型生效 ——
+                    // 过滤放这里会让云端也只拿到 12 个（用户已反馈此 bug）。
+                    toolsEnabledTools: BuiltInTools.allTools
                         + MCPService.shared.toolDefinitions
                         + PluginManager.shared.installedToolDefinitions(),
                     llm: llmService,
