@@ -17,12 +17,17 @@
 
 name: Build IPA
 
+# 触发方式：**仅手动**。
+#
+# 原来还有 push 触发，但它必然失败 —— 三个 xcframework（llama / ssh / SherpaOnnxC）
+# 都不在 git 里（.gitignore 掉了，由本地脚本重建），CI checkout 后一个框架都没有；
+# 加上 workflow 里的工程名还是过期的 `LocalAI.xcodeproj`（实际是 LumenAI）。
+# 实测：9-6、9-12 与本日的推送全部 30 秒内失败。本项目走**本地构建**。
+# 若要恢复 push 触发，把下面两行加回来即可：
+#   push:
+#     branches: [main]
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
 
 jobs:
   build:
