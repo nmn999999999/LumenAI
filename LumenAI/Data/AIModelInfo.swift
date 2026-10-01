@@ -39,6 +39,28 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
     }
 
     static let catalog: [AIModelInfo] = [
+        // ⚠️ 这一条是**我们自己训出来的**模型，不是通用底座，所以放在最前面。
+        //
+        // 为什么它直到现在才出现：整条链路缺的是最后一段 —— App 的 llama.cpp 桥接
+        // （LlamaCore/LlamaBridge.mm）**没有** LoRA 加载能力（没有 llama_adapter_lora_init），
+        // 模型页拿到的全是 unsloth 的原版 GGUF。也就是说 lumen3~lumen9 这九代适配器
+        // 从来没有进过手机，用户跑的一直是纯底座 —— 而 `note`（跨对话记忆）这个能力
+        // 恰恰只存在于微调后的权重里，所以"记忆"在真机上一直是 0%。
+        //
+        // 现在补上了：适配器在 Kaggle 上合并进底座 → 转 GGUF → 量化 Q4_K_M →
+        // 传到 HuggingFace（公开仓库，App 走 hf-mirror 镜像可以直接下，不需要鉴权）。
+        // 所以这里给的是**合并后的完整权重**，不能改成"底座 + 适配器"那种形式。
+        AIModelInfo(
+            id: "lumen-1.7b-companion-q4km",
+            name: "LumenAI 1.7B（陪伴 · 记忆）",
+            repo: "luozx16/lumen-local",
+            fileName: "LumenAI-s200-Q4_K_M.gguf",
+            sizeDescription: "~1.1 GB",
+            description: "本项目的自训模型（Qwen3-1.7B + 陪伴/记忆 LoRA 合并后量化）。相比原版底座，它会主动把值得记住的事写进长期记忆、需要时再读回来，说话也更短、更少说教。工具调用与代码能力与底座同级。",
+            templateType: .chatML,
+            supportsMultimodal: false,
+            supportsToolCalling: true
+        ),
         AIModelInfo(
             id: "qwen3-0.6b-q4km",
             name: "Qwen3 0.6B",
