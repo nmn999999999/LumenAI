@@ -5,13 +5,15 @@ import UIKit
 #endif
 
 struct MessageBubble: View {
-    let message: ChatMessage
+    /// `nonisolated`：只为了让它能被 `nonisolated` 的 `==` 读到（见文件末尾的
+    /// Equatable 扩展）。`ChatMessage` 是 Sendable 值类型，跨隔离读取没有数据竞争。
+    nonisolated let message: ChatMessage
     /// 操作回调（由 ChatView 注入）
     var onRegenerate: (() -> Void)? = nil
     var onEdit: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
     var onSpeak: (() -> Void)? = nil
-    var isSpeaking: Bool = false
+    nonisolated var isSpeaking: Bool = false
 
     @State private var copied = false
     @ObservedObject private var settings = SettingsStorage.shared
@@ -433,5 +435,32 @@ struct ThinkSection: View {
             RoundedRectangle(cornerRadius: 14)
                 .strokeBorder(.quaternary, lineWidth: 1)
         )
+    }
+}
+
+// MARK: - 相等性（性能用，不是语义用）
+
+/// 关于 `nonisolated`：Swift 6 下 `View` 的协议要求是 main-actor 隔离的，
+/// 于是整个类型也被拉进主 actor；而 `Equatable` 要求的 `==` 必须是 nonisolated，
+/// 两者冲突时会报 "conformance ... crosses into main actor-isolated code"。
+/// 解法是显式把 `==` 标 nonisolated，并让它只读 `nonisolated` 的存储属性
+/// （被读的两个字段都是值类型 / Sendable，所以这样是安全的，不是"绕过检查"）。
+extension MessageBubble: Equatable {
+    /// 只比"决定这条气泡长什么样"的东西：消息内容本身 + 是否正在被朗读。
+    ///
+    /// 为什么**闭包不参与比较**：`onRegenerate` / `onEdit` / `onDelete` / `onSpeak`
+    /// 都是 ChatView 在 ForEach 里就地创建的、只捕获 `message` 本身，所以
+    /// `message` 相等就蕴含"点下去会发生同样的事"。反过来，如果把它们放进比较，
+    /// 每次渲染都是新闭包 → 永远不相等 → `.equatable()` 完全失效（等于白加）。
+    ///
+    /// 为什么 **`settings` 也不参与**：它是 `@ObservedObject`，设置变化时 SwiftUI 会
+    /// 直接让这个视图自己失效并重算，不依赖父视图传下来的比较结果。
+    ///
+    /// 这条比较的用途只有一个：让流式期间那些**内容不会变的历史气泡**跳过重算。
+    /// 所以宁可少比（只比 message），也不要比多 —— 比多了就退化回"全都重算"，
+    /// 而比少了（漏掉某个真正影响显示的因素）只会表现为偶发的显示不刷新，
+    /// 相比之下后者更该由"把状态放进 message 里"来解决，而不是往这里堆字段。
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message && lhs.isSpeaking == rhs.isSpeaking
     }
 }

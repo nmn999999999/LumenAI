@@ -37,9 +37,25 @@ struct ChatView: View {
     @State private var searchText = ""
     @State private var searchResults: [ChatStore.SearchResult] = []
     @State private var searchTask: Task<Void, Never>?
-    /// Agent 流式 token 缓冲区（按气泡 id），配合时间节流减少重渲染
-    @State private var agentTokenBuffers: [UUID: String] = [:]
-    @State private var agentLastFlush = Date.distantPast
+    /// Agent 流式 token 缓冲区（按气泡 id），配合时间节流减少重渲染。
+    ///
+    /// **故意是普通引用类型，不是 `@State [UUID: String]`** —— 这是修「agent 跑任务时卡到划不动」的关键。
+    ///
+    /// 原来这里写的是 `@State private var agentTokenBuffers: [UUID: String] = [:]`，
+    /// 而 `appendAssistantToken` 里**每一个 token** 都做一次
+    /// `agentTokenBuffers[id, default: ""] += token`。`@State` 的任何写入都会让
+    /// **整个 ChatView 重新求值**，所以真实行为是「每生成一个 token 就重建整个聊天页」：
+    /// 消息列表（含可见气泡的 Markdown 重排）+ 步骤条 + 计划面板 + 输入栏全部重算，
+    /// 而 ChatView 上挂着 12 个观察对象。本地模型 20~40 tok/s，就是每秒重建几十次。
+    ///
+    /// 下面那句「按时间节流（~80ms）批量刷入气泡」的注释其实**只对了一半**：
+    /// 80ms 节流挡住的是"写入 chatStore"那一步（那个确实挡住了），
+    /// 而每个 token 对 `@State` 的写入根本没被挡 —— 节流形同虚设。
+    ///
+    /// 换成引用类型后，SwiftUI 只在**盒子身份**变化时重建，而这个盒子从头到尾是同一个对象，
+    /// 改它的属性不触发任何重建。真正的上屏仍由 80ms 的 flush 驱动（12.5 次/秒，
+    /// 而不是每个 token 一次）。
+    @State private var tokenBuffer = AgentTokenBuffer()
     @FocusState private var inputFocused: Bool
 
     /// 工具授权弹窗：当 AgentService 解析到 requiresApproval=true 的工具时挂起等用户决策。
@@ -246,6 +262,14 @@ struct ChatView: View {
                             onSpeak: message.role == .assistant ? { speakMessage(message) } : nil,
                             isSpeaking: speakingMessageID == message.id
                         )
+                        // `.equatable()` 让"内容没变的气泡"整棵子树跳过重算。
+                        // 为什么值得加：流式期间这个 LazyVStack 每 80ms 重建一次，
+                        // 而里面**所有可见气泡**都会被重新求值 body ——
+                        // 包括已完成的、内容根本不会变的历史消息（它们要做 Markdown
+                        // 重排、工具 chip 展开态、时间戳格式化）。加了它之后只有真正
+                        // 变化的那一条（正在流式的那条）会重算。
+                        // 依据是 MessageBubble 的 `==` 只比 message / isSpeaking。
+                        .equatable()
                         .id(message.id.uuidString)
                     }
                 }
@@ -1189,17 +1213,22 @@ struct ChatView: View {
 
     /// 给指定 assistant 气泡追加一个原始 token（含 <think> 标签，气泡自动解析思考/正文）。
     /// token 先入缓冲区，按时间节流（~80ms）批量刷入气泡，减少流式期间的全量重渲染。
+    ///
+    /// ⚠️ 缓冲区**必须**是引用类型（见 `tokenBuffer` 的注释）：换成 `@State` 字典的话，
+    /// 这一行 `+= token` 每个 token 都会让整个 ChatView 重建一次，节流就白做了。
     private func appendAssistantToken(id: UUID, token: String) {
-        agentTokenBuffers[id, default: ""] += token
+        tokenBuffer.text[id, default: ""] += token
         let now = Date()
-        guard now.timeIntervalSince(agentLastFlush) >= 0.08 else { return }
-        agentLastFlush = now
+        guard now.timeIntervalSince(tokenBuffer.lastFlush) >= 0.08 else { return }
+        // 时间戳也放在盒子里而不是 @State：它同样每次 flush 都被写，
+        // 写在 @State 上等于每秒又白白触发 12.5 次全页重建。
+        tokenBuffer.lastFlush = now
         flushAgentTokenBuffer(id: id)
     }
 
     /// 把指定气泡缓冲区里的 token 一次性追加到消息内容。
     private func flushAgentTokenBuffer(id: UUID) {
-        guard let buffered = agentTokenBuffers.removeValue(forKey: id), !buffered.isEmpty else { return }
+        guard let buffered = tokenBuffer.text.removeValue(forKey: id), !buffered.isEmpty else { return }
         var conv = chatStore.currentOrNew
         guard let idx = conv.messages.firstIndex(where: { $0.id == id }) else { return }
         conv.messages[idx].content += buffered
@@ -1342,4 +1371,24 @@ struct ChatView: View {
         #endif
         return ChatMessage.ImageData(data: data, mimeType: "image/png")
     }
+}
+
+// MARK: - 流式 token 缓冲区
+
+/// Agent 流式输出的 token 暂存盒。
+///
+/// 为什么必须是**引用类型**：它被放在 `ChatView` 的 `@State` 里，而 `@State` 只关心
+/// 盒子的**身份**。改盒子内部的属性不会让 SwiftUI 重建任何视图 —— 这正是我们要的：
+/// 每个 token 都往 `text` 里追加，但**只有 80ms 一次的 flush 写入 chatStore 时才上屏**。
+///
+/// 反面教材（这就是它存在的原因）：原先直接在 `@State` 上放 `[UUID: String]` 字典，
+/// 每个 token 写一次 → 整个 ChatView 重建一次 → agent 跑任务时界面卡到划不动。
+///
+/// 不标 `@MainActor`：它只被 ChatView 的 main-actor 方法访问，
+/// 加隔离反而会让 `@State` 的初始化语法变复杂，收益为零。
+final class AgentTokenBuffer {
+    /// 每个气泡累积的、还没上屏的原始 token。
+    var text: [UUID: String] = [:]
+    /// 上次真正刷入气泡的时刻（时间节流用）。同样不能放 `@State`，理由同上。
+    var lastFlush: Date = .distantPast
 }

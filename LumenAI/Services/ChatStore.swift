@@ -73,7 +73,12 @@ final class ChatStore: ObservableObject {
         } else {
             conversations.insert(conversation, at: 0)
         }
-        currentConversationID = conversation.id
+        // 只在**真的变了**的时候写。流式期间 upsert 每 80ms 被调一次，而
+        // `currentConversationID` 绝大多数时候本来就等于这个 id —— 无条件赋值会让这个
+        // @Published 也发一次通知，等于每次上屏都白白多触发一轮全页重建。
+        if currentConversationID != conversation.id {
+            currentConversationID = conversation.id
+        }
     }
 
     func createNew() -> Conversation {

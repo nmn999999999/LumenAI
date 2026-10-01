@@ -11,7 +11,12 @@ enum MessageRole: String, Codable, Sendable {
     case tool
 }
 
-struct ChatMessage: Identifiable, Codable, Sendable {
+/// `Equatable` 不是可有可无的装饰：聊天页的 `MessageBubble` 会在父视图重建时
+/// 重新求值 body，而流式期间父视图每 80ms 就重建一次。没有 Equatable，SwiftUI 只能
+/// 老老实实把**可见的每一条**气泡都重算一遍（含 Markdown 重排）；有了它才能用
+/// `.equatable()` 让"内容没变的那些"整棵子树跳过。字段全是值类型/字符串/数组，
+/// 合成实现即可 —— 不要去手写，手写迟早会漏掉新加的字段。
+struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     let id: UUID
     var role: MessageRole
     var content: String
@@ -23,7 +28,7 @@ struct ChatMessage: Identifiable, Codable, Sendable {
     /// 生成速度提示（如 "⚡ 14.3 tok/s"）；nil 不显示。可选字段，旧存档解码兼容。
     var speedText: String?
 
-    struct ImageData: Codable, Sendable {
+    struct ImageData: Codable, Sendable, Equatable {
         let data: Data
         let mimeType: String
 
@@ -39,8 +44,8 @@ struct ChatMessage: Identifiable, Codable, Sendable {
     /// `.complete` — 执行成功（含结果字符串）
     /// `.error` — 执行失败（result 字段含错误信息）
     /// `.awaitingApproval` — 工具需要用户授权（requiresApproval=true，进入前弹窗）
-    struct ToolCall: Codable, Sendable, Identifiable {
-        enum Status: String, Codable, Sendable {
+    struct ToolCall: Codable, Sendable, Identifiable, Equatable {
+        enum Status: String, Codable, Sendable, Equatable {
             case pending, running, awaitingApproval
             case complete, error
         }

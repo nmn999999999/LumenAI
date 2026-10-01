@@ -1258,7 +1258,31 @@ final class AgentService: ObservableObject {
     }
 
     private func appendStep(_ kind: Step.Kind, _ detail: String) {
-        steps.append(Step(kind: kind, detail: detail))
+        // 步骤条是**横向胶囊条**，每一条都会渲染成一个 glassEffect 胶囊。
+        // 这里原来塞的是 `"\(name) → \(limited)"`，而 limitResult 的上限是 2000 字 ——
+        // 于是每调一次工具就往界面上挂一个 2000 字的胶囊（lineLimit(1) 并不省掉
+        // 字符串布局：SwiftUI 仍要对整段做截断计算），而且它们全部在
+        // 每次重渲染时重新布局。工具多轮之后，光这一条横条就足以让界面掉帧。
+        // 步骤条是"让我看见它在干什么"，不是"让我读完整输出" —— 完整结果在气泡的
+        // 工具 chip 里可以展开看。所以这里统一截到 brief 的长度。
+        // 注意 thinking 本来就走了 brief，所以这条改动只是把 result 拉齐到同一口径。
+        steps.append(Step(kind: kind, detail: Self.briefStep(detail)))
+        // 上限兜底：一个长任务可以产生几十条步骤，而横条不是懒加载的
+        // （`ForEach` 直接在 HStack 里，全部实例化）。只保留最近的一段。
+        if steps.count > Self.maxSteps {
+            steps.removeFirst(steps.count - Self.maxSteps)
+        }
+    }
+
+    /// 步骤条保留的最大条数。取 24：够看清"最近做了什么"，又不至于让横条本身成为开销。
+    private static let maxSteps = 24
+
+    /// 步骤条文案的截断（与 `brief` 同口径，但刻意更短）。
+    ///
+    /// 比 thinking 的 300 字更短，是因为步骤条是**一览**用途：每条只占一个胶囊，
+    /// 长了也读不到（lineLimit(1)）。真正要看细节，气泡里的工具 chip 能展开。
+    private static func briefStep(_ text: String, maxLength: Int = 120) -> String {
+        brief(text, maxLength: maxLength)
     }
 }
 
