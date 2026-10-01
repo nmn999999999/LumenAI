@@ -863,20 +863,33 @@ struct ChatView: View {
                 // run() 退出后清空共享气泡 id,下次发送/agent 时重新创建
                 currentAgentMessageID = nil
 
-                // 模型兜底：AgentService 可能在「think 块内回答」场景下,用 stripThinkTagsKeepThink
-                // 把 final answer 从 raw 里抠出来当 return content。如果 bubble 内的
-                // visibleContent(剥离 think 后)为空,把最终答案回填到 message.content 末尾
-                // —— 否则用户看到的 assistant 只有 thinking 块而没有最终答案。
+                // 保证 run() 返回的最终答案**一定能被用户看到**。
+                //
+                // 这里原来的判据是「剥离 think 之后 bubble 里还有没有可见文本」，为空才回填。
+                // 那个判据是错的，而且错得正好落在最常见的收尾形态上：
+                // **最后一轮是工具调用**时，bubble 里留着那一轮的原始 JSON 文本
+                //（`{"name":"todo","arguments":{...}}`）—— 它当然不是空的，于是回填被跳过；
+                // 可那段 JSON 在气泡里会被 `cleanDisplayText` 清掉，用户在界面上什么也看不到。
+                // 结果就是：模型这一轮**确实**产出了收尾文字（或 AgentService 明确给出了
+                // "达到轮数上限"的说明），而它被这段判据静默丢掉了，用户只看到气泡停在那里。
+                // 这和"宣布任务完成、实际没有产物"是同一个病。
+                //
+                // 现在的判据：拿**用户真正看得见的那段文本**（agent 轮次要走 cleanDisplayText，
+                // 因为工具 JSON / 结束暗号都会在那一步被去掉）去比对，并额外用 contains 兜一层，
+                // 避免正常流式路径（答案已经上屏）被重复追加一遍。
                 if !result.content.isEmpty, let bubbleId {
                     var conv = chatStore.currentOrNew
                     if let idx = conv.messages.firstIndex(where: { $0.id == bubbleId }) {
-                        let visible = AgentService.stripThinkTags(conv.messages[idx].content)
+                        let raw = conv.messages[idx].content
+                        let stripped = AgentService.stripThinkTags(raw)
                             .trimmingCharacters(in: .whitespacesAndNewlines)
-                        if visible.isEmpty {
-                            // 当前 bubble 内容只含 think 块 + tool call chip,没有 user-facing answer。
-                            // 把 AgentService 兜底提取的最终答案回填到 message.content 末尾,
-                            // 这样 MessageBubble 的 visibleContent(剥离 think 之后)就显示最终答案。
-                            conv.messages[idx].content = conv.messages[idx].content + "\n\n" + result.content
+                        let visible = conv.messages[idx].isAgentRound
+                            ? AgentService.cleanDisplayText(stripped)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            : stripped
+                        let answer = result.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if visible.isEmpty || !visible.contains(answer) {
+                            conv.messages[idx].content = raw + "\n\n" + result.content
                             chatStore.upsert(conv)
                         }
                     }

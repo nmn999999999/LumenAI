@@ -190,6 +190,15 @@ final class AgentService: ObservableObject {
         var workingHistory = history
         var allToolCalls: [ChatMessage.ToolCall] = []
         var lastThinking: String?
+        /// `lastThinking` 是在**第几轮**写下的。
+        ///
+        /// 为什么必须记这个：循环退出后有一段兜底「返回最后一轮思考内容，保证不吞回答」，
+        /// 但 `lastThinking` 只在「既没有结束暗号、也没有有效工具调用」那条分支里更新 ——
+        /// 如果最后几轮都是工具调用，它保存的就是**几十轮之前的**旧文本。
+        /// 拿它当"最终答案"返回，等于把一段早已过期的中间思考冒充成结论：
+        /// 用户看到一段像模像样的话，而它根本不是这一轮的产物。
+        /// 这比"什么都不返回"更糟 —— 什么都不返回至少看起来是失败的。
+        var lastThinkingIteration = 0
         var iteration = 0
         // 重复调用检测：本地小模型很容易陷入"同一个工具、同一组参数"来回调。
         // 原来只有 softIterationLimit 这一个兜底（50 轮），等它触发已经浪费了几十次生成。
@@ -276,6 +285,7 @@ final class AgentService: ObservableObject {
                 // 让模型下一轮能直接改对。原来这里会落进模糊提示，白费一轮。
                 let names = toolsEnabledTools.map(\.name).joined(separator: ", ")
                 lastThinking = content
+                lastThinkingIteration = iteration
                 appendStep(.thinking, "未知工具「\(badName)」")
                 if let id = iterationID { bridge?.endIteration(id) }
                 workingHistory.append(ChatMessage(role: .assistant, content: content))
@@ -659,6 +669,7 @@ final class AgentService: ObservableObject {
                 // 3) 无暗号、无有效工具调用：视为模型的中间思考，
                 //    自动触发下一轮思考（思考内容展示在步骤里，不被吞掉）。
                 lastThinking = content
+                lastThinkingIteration = iteration
                 appendStep(.thinking, "思考：\(Self.brief(content))")
                 if let id = iterationID { bridge?.endIteration(id) }
 
@@ -685,13 +696,32 @@ final class AgentService: ObservableObject {
             }
         }
 
-        // 循环仅在「取消」或「软上限耗尽」时到达这里：返回最后一轮思考内容（保证不吞回答）
-        if let last = lastThinking, !last.isEmpty {
+        // 循环只在「取消」或「软上限耗尽」时到达这里。
+        //
+        // 兜底的第一条判据是「最后一次思考**就是上一轮**写的」。只判 `lastThinking` 非空
+        // 是不够的：它可能来自几十轮之前（见上面 lastThinkingIteration 的注释），
+        // 那样返回的是过期的中间思考，被当成结论呈现给用户 —— 属于"宣布有产物、
+        // 其实没有"，比明确说失败更糟。
+        if let last = lastThinking, !last.isEmpty, lastThinkingIteration >= iteration - 1 {
             appendStep(.finalAnswer, "已停止（未输出结束暗号），返回最后一轮内容")
             return (last, allToolCalls)
         }
 
-        let fallback = "已停止思考（达到轮数上限或被取消）。以上为当前结果。"
+        // 走到这里说明：这一轮**确实没有产出任何可以当结论的东西**（最后一轮通常是
+        // 一次工具调用，正文只有那段会被界面清掉的 JSON）。所以必须把这件事如实说出来，
+        // 并且告诉用户下一步能做什么 —— 原来那句「以上为当前结果」在没有任何结果时
+        // 是误导性的：它暗示上面有东西可看。
+        //
+        // 反复出现的具体形态（实测）：模型把任务拆成清单、把最后一项标成 completed，
+        // 然后就停了 —— 它认为"清单全绿"就等于交付完成，而报告一个字都没写。
+        // 提示词里已经要求它先输出结束暗号再写正文，但模型不一定遵守；
+        // 运行时这一侧至少不能把这种失败伪装成成功。
+        let reason = Task.isCancelled ? "任务被取消" : "已达到 \(Self.softIterationLimit) 轮上限"
+        let fallback = """
+        ⚠️ 这次没有产出最终答案（\(reason)）。
+        模型在最后一轮只调用了工具、没有写出结论正文 —— 这通常意味着它把"步骤跑完"当成了"任务完成"。
+        建议：直接回一句「把结果汇总给我」，或把任务拆小一点重发一次。
+        """
         appendStep(.finalAnswer, fallback)
         return (fallback, allToolCalls)
     }

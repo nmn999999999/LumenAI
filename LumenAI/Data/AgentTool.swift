@@ -293,7 +293,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "date_diff",
             name: "date_diff",
-            description: "计算两个日期相差的天数",
+            description: "计算两个日期相差的天数（带方向：date2 早于 date1 时为负数）",
             parameters: [
                 "date1": .init(type: "string", description: "起始日期 yyyy-MM-dd", enumValues: nil),
                 "date2": .init(type: "string", description: "结束日期 yyyy-MM-dd", enumValues: nil)
@@ -832,8 +832,19 @@ enum BuiltInTools {
         guard let expression = arguments["expression"] as? String else {
             return "错误: 缺少 expression 参数"
         }
-        guard let value = evaluateMath(expression) else {
+        let value: Double
+        switch evaluateMathDetailed(expression) {
+        case .ok(let v):
+            value = v
+        case .badSyntax:
             return "错误: 无法解析表达式「\(expression)」，请检查运算符与括号是否完整"
+        case .outOfDomain(let detail):
+            // 定义域错误**不能**复用上面那句"请检查运算符与括号"。
+            // 实测：`sqrt(-1)`、`ln(0)`、`1/0`、`asin(2)` 全都走的是 nil 分支，
+            // 于是模型收到"括号可能不完整"，转头去改一个本来完全正确的表达式 ——
+            // 白费一轮，而且下一轮还是同样的错。语法问题与取值问题必须分开说，
+            // 并且要把"哪个函数的哪个参数越界"直接讲出来，模型才知道该换什么。
+            return "错误: 表达式「\(expression)」语法没问题，但 \(detail)"
         }
         // 整数结果不显示小数
         let text: String
@@ -957,7 +968,16 @@ enum BuiltInTools {
             return "错误: 无法解析日期 \"\(d2)\"（date2），请用 yyyy-MM-dd 格式"
         }
         let days = Calendar.current.dateComponents([.day], from: a, to: b).day ?? 0
-        return "\(d1) 到 \(d2) 相差 \(Swift.abs(days)) 天"
+        // 不再取绝对值。原写法 `Swift.abs(days)` 把方向整个丢掉了：
+        // date1=2026-01-01、date2=2025-01-01 会答"相差 365 天"，与顺序无关 ——
+        // 而参数名是"起始日期/结束日期"，问"还有几天到期"而日期已过时，
+        // 用户需要的是负数（已过期），拿到一个正数会直接得出相反结论。
+        // 现在保留符号，并在文字里点明方向，避免模型把负号理解成错误。
+        let magnitude = Swift.abs(days)
+        if days == 0 { return "\(d1) 与 \(d2) 是同一天" }
+        return days > 0
+            ? "\(d1) 到 \(d2) 相差 \(magnitude) 天（date2 在 date1 之后）"
+            : "\(d1) 到 \(d2) 相差 -\(magnitude) 天（date2 在 date1 之前，即 date1 起算已过去 \(magnitude) 天）"
     }
 
     private static func executeHashText(arguments: [String: Any]) -> String {
@@ -1276,13 +1296,23 @@ enum BuiltInTools {
         }
     }
 
-    private static func evaluateMath(_ input: String) -> Double? {
+    /// 求值结果。区分"写错了"（语法）与"取不到值"（定义域）—— 这两种错的修法完全不同，
+    /// 而上层原来只能看到一个 `nil`，于是把 `sqrt(-1)` 也报成"检查括号是否完整"。
+    /// 报错的粒度决定了模型下一轮能不能一次改对：说"括号可能不完整"它会去改括号，
+    /// 说"sqrt 的参数不能是负数"它才知道要换算式。
+    enum MathEvalResult {
+        case ok(Double)
+        case badSyntax
+        case outOfDomain(String)
+    }
+
+    private static func evaluateMathDetailed(_ input: String) -> MathEvalResult {
         let cleaned = input
             .lowercased()
             .replacingOccurrences(of: "×", with: "*")
             .replacingOccurrences(of: "÷", with: "/")
             .replacingOccurrences(of: "π", with: "pi")
-        guard let tokens = tokenizeMath(cleaned), !tokens.isEmpty else { return nil }
+        guard let tokens = tokenizeMath(cleaned), !tokens.isEmpty else { return .badSyntax }
 
         // Shunting-yard → RPN
         var output: [MathToken] = []
@@ -1320,14 +1350,14 @@ enum BuiltInTools {
                     }
                     output.append(stack.removeLast())
                 }
-                if !found { return nil } // 括号不匹配
+                if !found { return .badSyntax } // 括号不匹配
                 if case .op(let fn)? = stack.last, isFunction(fn) {
                     output.append(stack.removeLast())
                 }
             }
         }
         while let top = stack.popLast() {
-            if top == .lparen { return nil } // 括号不匹配
+            if top == .lparen { return .badSyntax } // 括号不匹配
             output.append(top)
         }
 
@@ -1341,47 +1371,79 @@ enum BuiltInTools {
                 values.append(name == "pi" ? .pi : M_E)
             case .op(let name):
                 let n = binaryOps.contains(name) ? 2 : 1
-                guard values.count >= n else { return nil }
+                guard values.count >= n else { return .badSyntax }
                 let args = Array(values.suffix(n))
                 values.removeLast(n)
                 let a = args[0]
                 let b = n == 2 ? args[1] : 0
-                let result: Double?
+                // 每个函数/运算符在**这里**就把越界情况说清楚，而不是先算出 nil
+                // 再让上层去猜原因。措辞里必须带上具体的函数名与它的定义域。
                 switch name {
-                case "+": result = a + b
-                case "-": result = a - b
-                case "u+": result = a
-                case "u-": result = -a
-                case "*": result = a * b
-                case "/": result = b == 0 ? nil : a / b
-                case "%": result = b == 0 ? nil : a.truncatingRemainder(dividingBy: b)
-                case "^": result = pow(a, b)
-                case "sqrt": result = a >= 0 ? sqrt(a) : nil
-                case "abs": result = Swift.abs(a)
-                case "round": result = a.rounded()
-                case "floor": result = floor(a)
-                case "ceil": result = ceil(a)
-                case "sin": result = sin(a)
-                case "cos": result = cos(a)
-                case "tan": result = cos(a) == 0 ? nil : tan(a)
-                case "asin": result = (-1...1).contains(a) ? asin(a) : nil
-                case "acos": result = (-1...1).contains(a) ? acos(a) : nil
-                case "atan": result = atan(a)
-                case "log", "log10": result = a > 0 ? log10(a) : nil
-                case "ln": result = a > 0 ? log(a) : nil
-                case "exp": result = exp(a)
-                case "min": result = min(a, b)
-                case "max": result = max(a, b)
-                case "pow": result = pow(a, b)
-                default: result = nil
+                case "+": values.append(a + b)
+                case "-": values.append(a - b)
+                case "u+": values.append(a)
+                case "u-": values.append(-a)
+                case "*": values.append(a * b)
+                case "/":
+                    if b == 0 { return .outOfDomain("除数不能为 0（除以零没有定义）") }
+                    values.append(a / b)
+                case "%":
+                    if b == 0 { return .outOfDomain("取余的除数不能为 0") }
+                    values.append(a.truncatingRemainder(dividingBy: b))
+                case "^", "pow":
+                    let r = pow(a, b)
+                    if !r.isFinite {
+                        return .outOfDomain("pow(\(fmtNum(a)), \(fmtNum(b))) 的结果超出双精度浮点能表示的范围"
+                                            + "（本次计算用 Double，不是任意精度整数）")
+                    }
+                    values.append(r)
+                case "sqrt":
+                    if a < 0 { return .outOfDomain("sqrt 的参数不能是负数（sqrt(\(fmtNum(a))) 在实数范围内没有定义）") }
+                    values.append(sqrt(a))
+                case "abs": values.append(Swift.abs(a))
+                case "round": values.append(a.rounded())
+                case "floor": values.append(floor(a))
+                case "ceil": values.append(ceil(a))
+                case "sin": values.append(sin(a))
+                case "cos": values.append(cos(a))
+                case "tan":
+                    if cos(a) == 0 { return .outOfDomain("tan 在该点没有定义（cos = 0）") }
+                    values.append(tan(a))
+                case "asin":
+                    if !(-1...1).contains(a) { return .outOfDomain("asin 的参数必须在 -1 到 1 之间（收到 \(fmtNum(a))）") }
+                    values.append(asin(a))
+                case "acos":
+                    if !(-1...1).contains(a) { return .outOfDomain("acos 的参数必须在 -1 到 1 之间（收到 \(fmtNum(a))）") }
+                    values.append(acos(a))
+                case "atan": values.append(atan(a))
+                case "log", "log10":
+                    if a <= 0 { return .outOfDomain("log10 的参数必须大于 0（收到 \(fmtNum(a))）") }
+                    values.append(log10(a))
+                case "ln":
+                    if a <= 0 { return .outOfDomain("ln 的参数必须大于 0（收到 \(fmtNum(a))）") }
+                    values.append(log(a))
+                case "exp": values.append(exp(a))
+                case "min": values.append(min(a, b))
+                case "max": values.append(max(a, b))
+                default:
+                    // 到这里说明 tokenizer 认出了一个求值器不认识的函数名 —— 属于实现内部的
+                    // 不一致（不是用户输入的问题），所以如实说"不支持"，不要伪装成语法错。
+                    return .outOfDomain("不支持函数 \(name)")
                 }
-                guard let result else { return nil }
-                values.append(result)
             case .lparen, .rparen, .comma:
-                return nil
+                return .badSyntax
             }
         }
-        return values.count == 1 ? values[0] : nil
+        // 结果不是有限数（如 exp(1000) 溢出）同样属于"取不到值"，不是语法问题。
+        guard values.count == 1 else { return .badSyntax }
+        guard values[0].isFinite else { return .outOfDomain("结果超出双精度浮点能表示的范围") }
+        return .ok(values[0])
+    }
+
+    /// 报错文案里回显数值用（整数不带小数点，便于模型直接读懂）
+    private static func fmtNum(_ v: Double) -> String {
+        if v == v.rounded() && Swift.abs(v) < 1e15 { return String(Int64(v)) }
+        return String(format: "%g", v)
     }
 
     // MARK: - 正则表达式提取工具
