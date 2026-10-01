@@ -111,6 +111,11 @@ enum BackupService {
     @MainActor
     static func restore(_ pkg: BackupPackage, chatStore: ChatStore) {
         chatStore.restoreFromBackup(pkg.conversations)
+        // 会话是整批替换的：恢复前那些对话连同 id 一起消失，而任务清单按 id 分槽存在
+        // Documents/agent_todos.json —— 不一起收拢，旧槽位就成了界面上永远看不到、
+        // 也永远删不掉的孤儿（内容还是用户自己写的任务）。用恢复后的 id 做白名单即可，
+        // 备份里自带的 id 会被保留，所以"同一批对话"恢复时清单跟着回来。
+        TodoStore.shared.retainOnly(conversationIDs: Set(pkg.conversations.map(\.id)))
         ProviderStore.shared.providers = pkg.providers
         ProviderStore.shared.refreshSelectionAfterRestore()
         AssistantStore.shared.assistants = pkg.assistants

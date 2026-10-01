@@ -36,6 +36,22 @@ final class PluginManager: ObservableObject {
     @Published private(set) var remoteIndex: [ModuleIndexEntry] = []
     @Published private(set) var isChecking = false
     @Published var lastCheckError: String?
+
+    /// 上一次安装/更新留下的**非致命提示**（安装成功了，但有话要说）。
+    ///
+    /// 为什么必须是独立的通道，而不是塞进 `installOrUpdate` 的返回值：
+    /// 那个返回值的语义已经被调用方定死为「非 nil = 失败」（`PluginsView` 拿它去弹
+    /// 「导入失败」alert）。把"这次装的东西没经过校验"这种**成功但有保留**的信息塞进去，
+    /// 用户会看到一条红字报错说安装失败，转头却发现模块已经装好了 —— 比不提示更糟。
+    ///
+    /// 这个字段存在的直接原因是一个被编译器优化掉的 bug：`unverifiedWarning` 原来只是个
+    /// 局部变量，赋值后再没被读过（函数结尾 `return conflictWarning(...)`），
+    /// 于是 -O 下那整段字符串被当作死代码消除。二进制里连
+    /// 「该模块未提供 sha256 校验值…」这句都不存在 —— 也就是说"兼容优先"这个决定
+    /// 在**用户可见层面从未生效过**：无摘要的模块确实放行了（这点生效了），
+    /// 但"未经完整性校验"这句提醒一次都没出现过。赋值即丢弃的变量骗过了代码审查，
+    /// 只有去二进制里找那句字符串才看得出来。
+    @Published private(set) var installNotice: String?
     /// 可更新模块数量（服务页角标）
     var updatableCount: Int {
         updateStates().filter(\.hasUpdate).count
@@ -296,6 +312,9 @@ final class PluginManager: ObservableObject {
         guard let manifestURL = URL(string: entry.files.manifest),
               let toolsURL = URL(string: entry.files.tools)
         else { return "无效的模块地址" }
+        // 每次重新安装都先清空上一条提示：不清的话，上一次"未经验证"的警告会挂到
+        // 下一次（这次校验通过了）的安装上，用户会以为刚装的这个也有问题。
+        installNotice = nil
         do {
             let (manifestData, mResp) = try await URLSession.shared.data(from: manifestURL)
             guard (mResp as? HTTPURLResponse)?.statusCode == 200 else { return "清单下载失败" }
@@ -366,7 +385,14 @@ final class PluginManager: ObservableObject {
             }
 
             try install(entry: entry, manifest: manifest, jsSource: jsSource)
-            return conflictWarning(for: manifest.id)
+            // 安装成功（返回 nil = 无错误），但可能带着两条"有保留"的信息：
+            //   ① 没有 sha256 → 这次装的是未经验证的代码；
+            //   ② 工具名与内置/MCP 冲突 → 插件里同名的那个不会被调用。
+            // 两条都走 installNotice（提示），不走返回值（错误）—— 理由见该字段的注释。
+            let warning = conflictWarning(for: manifest.id)
+            let notices = [unverifiedWarning, warning].compactMap { $0 }
+            installNotice = notices.isEmpty ? nil : notices.joined(separator: "\n")
+            return nil
         } catch {
             return "安装失败: \(error.localizedDescription.prefix(60))"
         }

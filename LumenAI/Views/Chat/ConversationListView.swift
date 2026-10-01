@@ -65,12 +65,20 @@ struct ConversationListView: View {
                 presenting: pendingDelete
             ) { conv in
                 Button("删除", role: .destructive) {
+                    // 先按 id 清掉这段对话的任务清单，再删对话本身。
+                    // 顺序不能反：`chatStore.delete` 之后这条对话就不在任何列表里了，
+                    // 只剩 `conv.id` 这个值还握在手里；一旦在这中间崩掉，
+                    // 「对话没了、清单还在」的状态就被持久化了，那份清单再也没人认领 ——
+                    // 用户在界面上既看不到也删不掉。
+                    TodoStore.shared.delete(conversationID: conv.id)
                     chatStore.delete(conv)
                     pendingDelete = nil
                 }
                 Button("取消", role: .cancel) { pendingDelete = nil }
             } message: { conv in
-                Text("「\(conv.title)」的 \(conv.messages.count) 条消息将被永久删除，无法撤销。")
+                // 把「任务清单也会一起删」写出来：用户看不到清单文件，确认框是他唯一
+                // 能得知这件事的地方；不写就变成"悄悄多删了一样东西"。
+                Text("「\(conv.title)」的 \(conv.messages.count) 条消息及其任务清单将被永久删除，无法撤销。")
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {

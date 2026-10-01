@@ -295,12 +295,31 @@ struct ToolCallChip: View {
         case .awaitingApproval:
             return ("exclamationmark.shield.fill", .orange, "需要授权")
         case .complete:
+            // 退出码非 0 时把状态如实降级成"有异常"。
+            // 为什么值得单独说一句：文本层面的成败由「错误: 」前缀判定（见 ToolResultFormat），
+            // 但 `grep` 没匹配到、`false`、`cat` 空输入这些都会返回非 0 退出码而**不是**错误
+            // —— 所以既不能在文本上加错误前缀（会把正确命令说成坏的，让模型去乱改），
+            // 也不能当没发生（用户会以为命令干净跑完了）。折中就是：正文照原样给模型，
+            // 退出码在这里给用户看。
+            if let code = call.exitCode, code != 0 {
+                return ("exclamationmark.circle.fill", .orange, "完成 · 退出码 \(code)")
+            }
             return call.truncated
                 ? ("checkmark.circle", .secondary, "完成（结果已截断）")
                 : ("checkmark.circle.fill", .green, "完成")
         case .error:
-            return ("xmark.octagon.fill", .red, "失败")
+            // 区分"用户自己点的拒绝"与"工具真的失败"：两者都是红色失败，
+            // 但用户看到"用户已拒绝"才知道那不是程序出了问题。
+            return call.errorCode == "denied"
+                ? ("hand.raised.fill", .orange, "已拒绝")
+                : ("xmark.octagon.fill", .red, "失败")
         }
+    }
+
+    /// 耗时标签（例 "· 1.2s"）。拿不到耗时就不显示，而不是显示 "0ms"。
+    private var durationSuffix: String {
+        guard let d = call.durationDescription else { return "" }
+        return " · \(d)"
     }
 
     var body: some View {
@@ -314,7 +333,7 @@ struct ToolCallChip: View {
                         .foregroundStyle(statusBadge.tint)
                     Text("工具调用: \(call.title ?? call.name)")
                         .font(.caption.weight(.semibold))
-                    Text("· \(statusBadge.label)")
+                    Text("· \(statusBadge.label)\(durationSuffix)")
                         .font(.caption2)
                         .foregroundStyle(statusBadge.tint)
                     Spacer()
@@ -322,6 +341,12 @@ struct ToolCallChip: View {
                         .font(.caption2)
                 }
                 .foregroundStyle(.primary)
+                // 状态图标 + 文案 + 耗时合成一句读出来，而不是拆成
+                // 「工具调用：shell」「· 完成 · 1.2s」两段 —— VoiceOver 用户
+                // 听不出这两段是同一件事的两半。
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(
+                    "工具调用 \(call.title ?? call.name)，\(statusBadge.label)\(durationSuffix)")
             }
             .buttonStyle(.plain)
 

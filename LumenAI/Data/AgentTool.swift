@@ -136,6 +136,28 @@ enum ToolResultFormat {
     static func isError(_ text: String) -> Bool { text.hasPrefix(errorPrefix) }
 }
 
+// MARK: - 工具执行结果
+
+/// 一次工具执行的返回值：给模型看的文本 + 给用户/日志看的可观测性信息。
+///
+/// 为什么不直接用 String：`ChatMessage.ToolCall` 里那几个可观测性字段
+/// （exitCode / durationMs / errorCode）必须有人填。耗时和成败可以从外围量出来，
+/// 唯独**退出码只能由真正执行命令的那一层带出来** —— 外面拿不到，事后也推不出来。
+/// 所以执行接口必须能表达"文本之外还有一件事要交代"，否则那几个字段就永远是 nil，
+/// 界面上做了也白做。
+struct ToolExecutionOutcome: Sendable {
+    /// 与模型对话的正文（成败约定见 `ToolResultFormat`）。逐字未变。
+    let text: String
+    /// 进程退出码。**只有真的跑了外部命令的工具才有**（目前是 `shell`）。
+    /// 纯计算 / 纯网络 / MCP / 插件工具一律 nil —— 它们没有"退出码"这个概念。
+    var exitCode: Int?
+
+    init(text: String, exitCode: Int? = nil) {
+        self.text = text
+        self.exitCode = exitCode
+    }
+}
+
 enum BuiltInTools {
 
     static let allTools: [AgentToolDefinition] = [
@@ -328,6 +350,45 @@ enum BuiltInTools {
             // 如果将来审批能细到 (工具, op)，save/delete 应该改成 true。
             requiresApproval: false,
         ),
+        // ⚠️ `todo` **刻意不进** `BuiltInTools.defaultEnabledNames`（见本文件末尾那份清单）。
+        //
+        // 那份 12 个工具的有序清单是**本地 Qwen3-1.7B 的训练契约**：训练数据
+        // （`kaggle_pretrain/build_lumen_train.py` 的 `DEFAULT_TOOL_ORDER`）就是照它的顺序和名字
+        // 逐字生成的，模型只见过这 12 个工具。把没训练过的 `todo` 塞进去，等于在它的工具目录里
+        // 放一个陌生的函数名：轻则白占一个配额（挤掉一个它练过的工具），重则诱发格式漂移/幻觉调用，
+        // 已有适配器的行为会实打实地退化。
+        //
+        // 所以 `todo` 属于"更多工具"：用户可以在「设置 → 工具」里手动勾选启用
+        // （那时按 `ToolSettingsStore.setEnabled` 的规则会顶掉一个已启用的内置工具 ——
+        // 这是用户的显式选择，不是我们替他做的决定）。
+        // 云端模型走的是**全量工具**（`AgentService` 里 `useCloud` 时直接给 `tools`），
+        // 不受这 12 个的配额限制，所以云端模型自动就能拿到 `todo`，无需任何额外开关。
+        AgentToolDefinition(
+            id: "todo",
+            name: "todo",
+            description: "维护当前任务的步骤清单（进度对用户可见）。任务超过一步时先用 set 写出计划，每完成一步就用 set 更新状态；只有一条 in_progress。op=list 查看、op=clear 清空。不要用它记录与任务无关的内容。",
+            parameters: [
+                // 「（必填）」三个字是**给云端 schema 用的开关**：CloudChatClient 靠
+                // `description.contains("必填")` 决定哪个参数进 `required`（见该文件 230-233 行）。
+                // 所以这里必须写在 `op` 上 —— 它是唯一每次调用都必需的参数；漏了它，模型可以
+                // 不传 op（我们运行时会报错），却被迫每次都传 todos，接口契约就反了。
+                "op": .init(type: "string", description: "操作（必填）", enumValues: ["set", "list", "clear"]),
+                // 说明里必须写全"整表替换"和字段含义：模型看不到 TodoStore 的源码，
+                // 只能靠这段描述知道 set 要的是**完整清单**而不是"要改的那几条"。
+                // 注意**不要**在这里写"必填"（会被上面那条规则误判成所有 op 都必填）。
+                "todos": .init(
+                    type: "array",
+                    description: "完整清单（只在 op=set 时使用，其它 op 忽略）：每项是一个对象，含 content（祈使句，如「检查 AgentService 的解析分支」）与 status（pending / in_progress / completed，省略按 pending）。set 是整表替换：每次都要给出你认为的完整清单，而不是只给变化的那几条",
+                    enumValues: nil)
+            ],
+            // false。取舍理由与 note 相同但更强：
+            // ① 它只改 App 自己的内存/私有 JSON，不联网、不写用户文件、不碰系统状态，
+            //    不符合"联网/写文件/执行命令"的审批标准；
+            // ② 它是**高频**工具 —— 一次多步任务里模型会调用五到十几次，每次都弹窗必然导致
+            //    用户习惯性点"允许"，把审批训练成无脑确认，反而削弱真正危险工具（shell/ssh）的把关；
+            // ③ 内容在界面上是用户可见、可随手清空的（TodoStore 就是面板的数据源）。
+            requiresApproval: false,
+        ),
         AgentToolDefinition(
             id: "clipboard",
             name: "clipboard",
@@ -510,12 +571,29 @@ enum BuiltInTools {
     private static let unknownToolMarker = "错误: 未知工具: "
 
     /// arguments 以 JSON 字符串传入（String 为 Sendable，可安全跨 actor 传递）。
-    static func execute(toolName: String, argumentsJSON: String) async -> String {
+    static func execute(toolName: String, argumentsJSON: String) async -> ToolExecutionOutcome {
         var arguments: [String: Any] = [:]
         if let data = argumentsJSON.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             arguments = obj
         }
+        // `shell` 单独走一条路：它是唯一真的跑外部命令的工具，退出码是"命令到底成没成功"
+        // 唯一可靠的信号（`cat /nope` 返回的也是一段文字，只看文本分不清那是文件内容
+        // 还是报错；退出码分得清）。其余 30 多个工具根本没有"退出码"这个概念 ——
+        // 给它们编一个 0 出来，事后就没法区分"真跑了命令且成功"和"压根不是命令类工具"。
+        if toolName == "shell" { return executeShell(arguments: arguments) }
+
+        return ToolExecutionOutcome(text: await executeBuiltin(toolName: toolName,
+                                                              arguments: arguments))
+    }
+
+    /// 内置工具的纯文本分派。
+    ///
+    /// 为什么和 `execute` 拆开：只有 `shell` 需要额外带回退出码。为一个工具把三十多个
+    /// `case` 全改成结构体返回值，等于把每一条分支都摸一遍，改动面大且处处可能是新错源；
+    /// 拆出一个"只有 shell 例外"的入口，其余分支逐字不动。
+    private static func executeBuiltin(toolName: String,
+                                       arguments: [String: Any]) async -> String {
         switch toolName {
         case "calculator":      return executeCalculator(arguments: arguments)
         case "current_time":    return executeCurrentTime()
@@ -529,6 +607,7 @@ enum BuiltInTools {
         case "json_format":     return executeJsonFormat(arguments: arguments)
         case "url_codec":       return executeUrlCodec(arguments: arguments)
         case "note":            return await executeNote(arguments: arguments)
+        case "todo":            return await executeTodo(arguments: arguments)
         case "clipboard":       return executeClipboard(arguments: arguments)
         case "web_search":      return await executeWebSearch(arguments: arguments)
         case "regex_extract":   return executeRegexExtract(arguments: arguments)
@@ -542,7 +621,9 @@ enum BuiltInTools {
         case "roman":           return executeRoman(arguments: arguments)
         case "unit_convert":    return executeUnitConvert(arguments: arguments)
         case "ssh":             return executeSSH(arguments: arguments)
-        case "shell":           return executeShell(arguments: arguments)
+        // 注意：`shell` 故意**不在**这里。它由 `execute` 的分支提前接走；
+        // 万一将来有人绕开 `execute` 直接调这个方法，会落到 default 报「未知工具」——
+        // 一声响亮的不识别，远好过静默丢掉退出码。
         case "http_get":        return await executeHTTPGet(arguments: arguments)
         case "device_info":     return executeDeviceInfo()
         case "json_query":      return executeJSONQuery(arguments: arguments)
@@ -559,20 +640,23 @@ enum BuiltInTools {
     /// Agent 循环统一走这里，修复 MCP 工具无法执行的问题并支持插件工具。
     /// @MainActor：访问 MCPService.shared / PluginManager.shared（MainActor 隔离单例）。
     @MainActor
-    static func executeWithFallbacks(toolName: String, argumentsJSON: String) async -> String {
+    static func executeWithFallbacks(toolName: String,
+                                     argumentsJSON: String) async -> ToolExecutionOutcome {
         let builtin = await execute(toolName: toolName, argumentsJSON: argumentsJSON)
         // 用共享常量判哨兵：写成字面量的话，两处早晚会漂移成"不再匹配"，
         // 结果是所有 MCP/插件工具突然全部变成"未知工具"。
-        if !builtin.hasPrefix(unknownToolMarker) { return builtin }
+        if !builtin.text.hasPrefix(unknownToolMarker) { return builtin }
 
         // MCP 工具（由已连接服务器暴露）
         if MCPService.shared.server(forToolName: toolName) != nil {
-            return await MCPService.shared.callTool(name: toolName, argumentsJSON: argumentsJSON)
+            return ToolExecutionOutcome(
+                text: await MCPService.shared.callTool(name: toolName, argumentsJSON: argumentsJSON))
         }
 
         // JS 插件工具
         if PluginManager.shared.hasTool(named: toolName) {
-            return await PluginManager.shared.callTool(name: toolName, argumentsJSON: argumentsJSON)
+            return ToolExecutionOutcome(
+                text: await PluginManager.shared.callTool(name: toolName, argumentsJSON: argumentsJSON))
         }
 
         return builtin
@@ -978,6 +1062,69 @@ enum BuiltInTools {
         // 所以显式跳一次主线程。笔记都是小文本文件，这点 I/O 放主线程没有影响。
         return await MainActor.run {
             NoteStore.shared.perform(op: op, name: rawName, content: content)
+        }
+    }
+
+    /// `todo` 工具：维护当前任务的步骤清单（面板上可见的进度）。
+    ///
+    /// 数据的读写与文案**全部**交给 `TodoStore` —— 它同时是 UI 面板的数据源，两边各写一份
+    /// 状态的话，模型更新完清单界面不会跟着变（和 `NoteStore` 当初的问题一模一样）。
+    /// 这个函数只做三件事：校验 op、把 todos 原样转成 JSON、把结果递进主线程。
+    /// 形状校验与全部容错文案都在 `TodoStore`（谁的数据谁负责，报错文案只留一份）。
+    private static func executeTodo(arguments: [String: Any]) async -> String {
+        // op 必填（default: nil）。这里与 `note`/`clipboard` 刻意不同：那两个工具"漏传 op"的
+        // 默认分支是只读的 list/get，猜错了最多返回一份多余的内容；而 `todo` 没有任何一个
+        // 分支适合当默认值 —— 默认 set 会让模型漏参数时**把用户的清单覆盖成空**，
+        // 默认 list 则会让"写计划"变成"看一眼旧计划"，模型看到有返回就以为记下了。
+        // 又因为模型看不到自己少发了哪个字段，静默兜底比直接报错危险得多，所以必填。
+        let opRead = enumeratedArgument(
+            arguments, "op", label: "操作",
+            allowed: allowedValues(tool: "todo", parameter: "op", fallback: ["set", "list", "clear"]),
+            default: nil)
+        guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
+
+        switch op {
+        case "set":
+            // 参数形态这一步只做"能不能序列化"，**形状校验（缺 todos / 不是数组 / 元素不是对象）
+            // 全部交给 TodoStore.replace(withJSON:)** —— 报错文案只有一份，不会两边漂移。
+            //
+            // 为什么要绕一圈 JSON 字符串：`arguments["todos"]` 从 JSONSerialization 出来是
+            // `[[String: Any]]`，而嵌套字典数组**不是 Sendable**，直接捕获进下面 `MainActor.run`
+            // 的闭包在 Swift 6 严格并发下是编译错误（sending 'items' risks causing data races）。
+            // 转成 String 再跨 actor，与 `execute(toolName:argumentsJSON:)` 收参数的写法同一个道理。
+            // `todos` 可能压根不是数组（字符串数组、对象、null，模型都发得出来）：这里全部走
+            // `else` 分支交给 store 报错，**不做任何 `as!` 强转** —— 一次参数写错不该让整个 App 崩掉。
+            let todosJSON: String
+            if let rawTodos = rawArgument(arguments, "todos"),
+               JSONSerialization.isValidJSONObject(rawTodos),
+               let data = try? JSONSerialization.data(withJSONObject: rawTodos),
+               let text = String(data: data, encoding: .utf8) {
+                todosJSON = text
+            } else {
+                // 键不存在、或者值无法序列化：传 "null" 进去，由 store 统一报
+                // 「错误: set 需要 todos 数组」。这样那句文案在代码里只有一份。
+                todosJSON = "null"
+            }
+            // 工具跑在非隔离的 static async 上下文里，而 TodoStore 是 @MainActor（要给 SwiftUI 用），
+            // 所以显式跳一次主线程 —— 与 executeNote 同样的写法与理由。这里只有内存操作和
+            // 一个很小的 JSON 文件写入，放主线程没有影响。
+            return await MainActor.run {
+                TodoStore.shared.replace(withJSON: todosJSON)
+            }
+        case "list":
+            return await MainActor.run { TodoStore.shared.listText() }
+        case "clear":
+            // 清空当前对话的清单（其它对话不受影响，隔离在 TodoStore 里做）。
+            // 返回文案写死：与 TodoStore 里 set / list 的文案一样，将来要拿去做训练数据。
+            return await MainActor.run {
+                TodoStore.shared.clear()
+                return "已清空任务清单"
+            }
+        default:
+            // 正常走不到这里：上面已经按工具定义里的 enum 校验过 op。
+            // 留着是为了防止将来往 enum 里加了新 op 却忘了在这个 switch 里实现 ——
+            // 那时它会静默落到 clear，把用户的清单清掉。
+            return "错误: 未知操作 \"\(op)\"，可选: set, list, clear"
         }
     }
 
@@ -1817,24 +1964,40 @@ enum BuiltInTools {
     }
 
     /// 沙盒 shell 执行(走 ShellSandbox 的受限命令解释器)
-    private static func executeShell(arguments: [String: Any]) -> String {
+    ///
+    /// 返回 `ToolExecutionOutcome` 而不是 String：退出码只能在这里拿到（`ShellSandbox`
+    /// 就在这一层），带不出去上层就永远填不了 `ToolCall.exitCode`。
+    private static func executeShell(arguments: [String: Any]) -> ToolExecutionOutcome {
         guard let command = arguments["command"] as? String, !command.isEmpty else {
-            return "错误: 缺少 command 参数"
+            return ToolExecutionOutcome(text: "错误: 缺少 command 参数")
         }
         // 输出截断保护:避免一次性 output 巨大撑爆上下文
-        let raw = ShellSandbox.run(command)
-        // ShellSandbox.run 只返回文本、丢掉了退出码（`run` 内部是 (text, exitCode) 的，但没暴露），
-        // 所以这里能做的只有一条最保守的判断：模型自造了沙盒不支持的命令时，
-        // run 会返回 "未知命令: xxx"，加上「错误: 」前缀让上层标成失败。
-        // 更彻底的做法是让 ShellSandbox 暴露退出码，那属于 ShellSandbox.swift 的改动范围
-        //（本文件不允许改它），这里先处理最常见的一类失败，其余保持原样。
+        //
+        // ⚠️ 只能调**一次**。`ShellSandbox.run` 的实现就是 `runWithExitCode(input).text`，
+        // 两个都调等于把用户的命令**执行两遍** —— 而 shell 命令是有副作用的
+        //（`rm`、`mv`、`tee` 会真的改磁盘）。这里取得 (文本, 退出码) 的完整形态，
+        // 文本与原来的 `run` 逐字相同，模型看到的内容一个字都没变，
+        // 变的只是"退出码现在能带出去了"。
+        let (raw, exitCode) = ShellSandbox.runWithExitCode(command)
+
+        // 失败前缀**只加在"沙盒不认识这条命令"这一种情况**上，判据与改之前完全一致。
+        //
+        // 为什么不再顺手把"退出码非 0"也判成失败：退出码非 0 不都是错误。
+        // `grep` 没匹配到任何行会返回 1，而它的输出是空文本 —— 加上前缀就成了
+        // 「错误: 」（一句没有内容的错误），模型会以为命令本身坏了，进而去重写一条
+        // 本来正确的命令。`false`、`cat` 空输入同理。退出码的语义按命令而异，
+        // 只有真正执行命令的那一层才分得清，所以这里做的是**如实带出去**，
+        // 由界面上单独显示，而不是替模型下一个可能下错的结论。
         if raw.hasPrefix("未知命令:") {
-            return "错误: " + raw
+            return ToolExecutionOutcome(text: ToolResultFormat.errorPrefix + raw,
+                                        exitCode: exitCode)
         }
         if raw.count > 4000 {
-            return String(raw.prefix(4000)) + "\n…(输出过长，已截断)"
+            // 截断只动给模型看的文本，退出码照带 —— 截断是"显示不下"，不是"执行结果有变"。
+            return ToolExecutionOutcome(text: String(raw.prefix(4000)) + "\n…(输出过长，已截断)",
+                                        exitCode: exitCode)
         }
-        return raw
+        return ToolExecutionOutcome(text: raw, exitCode: exitCode)
     }
 
     // MARK: - v0.3.18 新增工具
@@ -2284,6 +2447,12 @@ extension BuiltInTools {
     /// 所以这里显式给出默认 12 个，把 `note` 提到最前（核心诉求）、`web_search` 也纳入，
     /// 代价是把两个较专用的 `csv_table` / `jwt_decode` 移出默认集 —— 它们仍可在
     /// 设置里手动开启，总数上限保持 12 不变。
+    ///
+    /// ⚠️ **不要**把 `todo` 加进这份清单。这 12 个名字与顺序是本地模型的训练契约
+    /// （训练数据照它逐字生成，见 `kaggle_pretrain/build_lumen_train.py` 的 `DEFAULT_TOOL_ORDER`
+    /// 与 `ToolSettingsStore`）。给没训练过它的模型塞一个陌生工具名，会白占配额并诱发行为漂移。
+    /// `todo` 归入"更多工具"，由用户在「设置 → 工具」里显式开启；云端模型走全量工具，
+    /// 自动就有它。详细理由写在 `todo` 的工具定义处。
     static let defaultEnabledNames: [String] = [
         "http_get",
         "note",

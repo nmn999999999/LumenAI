@@ -14,6 +14,11 @@ struct ChatView: View {
     @ObservedObject private var ttsService = TTSService.shared
     @ObservedObject private var asrService = ASRService.shared
     @ObservedObject private var personaStore = PersonaStore.shared
+    /// agent 的任务清单（PlanPanel 的数据源）。
+    /// 观察点放在 ChatView、再以参数传给 PlanPanel：数据源只有一份，
+    /// 面板不需要自己再持有一个 shared 引用（两个 @ObservedObject 指同一对象也不会坏事，
+    /// 但会让"谁负责绑定对话"这件事变模糊 —— 绑定的责任在下面 onAppear/onChange 这一处）。
+    @ObservedObject private var todoStore = TodoStore.shared
     /// 聊天页要直接读写设置里的「联网搜索」开关（与设置页共用同一份值）。
     @ObservedObject private var chatSettings = SettingsStorage.shared
     @EnvironmentObject private var theme: LumenAIApp.ThemeObserver
@@ -108,6 +113,12 @@ struct ChatView: View {
                 if canChat {
                     agentStepsBar
                 }
+                // 任务清单面板：夹在消息列表与输入栏之间。
+                // 为什么在消息列表**下方**而不是浮在消息之上：agent 的正文/工具结果仍要能完整读，
+                // 浮层会遮内容。放在输入栏**上方**则是因为它描述的是"接下来要发生什么"，
+                // 与输入框同属"操作区"，跟手指所在的区域一致。
+                // 空清单时 PlanPanel 内部整块不渲染，这里不需要额外 if。
+                PlanPanel(store: todoStore)
                 inputBar
             }
             .background(theme.current.pageBackground(for: colorScheme))
@@ -130,6 +141,18 @@ struct ChatView: View {
                 #if canImport(UIKit)
                 UIApplication.shared.isIdleTimerDisabled = generating
                 #endif
+            }
+            // 任务清单跟对话走：TodoStore 内部按 conversationID 分槽存放，
+            // 切对话必须重新绑定，否则上一个对话的清单会留在面板上（"串味"）。
+            .onChange(of: chatStore.currentConversationID) { _, id in
+                todoStore.bind(conversationID: id)
+            }
+            // 首次进入页面也要绑一次：onChange 只在值**变化**时触发，
+            // 而冷启动直接落在某个已有对话上时 currentConversationID 从未"变过"，
+            // 只挂 onChange 的话面板会一直停在未绑定槽位（空的）。
+            // 重复调用是安全的：TodoStore.bind 对同一个 id 直接 return。
+            .onAppear {
+                todoStore.bind(conversationID: chatStore.currentConversationID)
             }
             .alert("出错了", isPresented: .init(
                 get: { errorMessage != nil },

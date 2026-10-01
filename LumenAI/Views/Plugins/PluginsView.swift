@@ -241,6 +241,13 @@ struct PluginsView: View {
                 importError = error
             } else {
                 toast(update.installedVersion == nil ? "安装成功" : "已更新到 v\(update.entry.version)")
+                // 成功但"有保留"的信息（未经验证的模块 / 工具名冲突）随后补一条提示。
+                // 不用 alert：模块已经装好了，弹一个需要用户点确认的报错框会把
+                // "装成功了吗"这件事本身变得含糊。toast 会互相覆盖，所以后一条
+                // 就是最需要用户看到的那条 —— 而"未经验证"比"安装成功"重要得多。
+                if let notice = pluginManager.installNotice {
+                    toast(notice)
+                }
             }
         }
     }

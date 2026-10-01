@@ -10,7 +10,9 @@
       "files": {
         "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/string-tools/manifest.json",
         "tools": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/string-tools/tools.js"
-      }
+      },
+      "sha256": "e146faf2dc501b6b999d82231b2273b65c552651eeb0bca90e424c5a48af4d1d",
+      "manifestSha256": "33ea05c51af4f419fbe992120ace7125f69fd9d84d0d8b959021337fac0f6526"
     },
     {
       "id": "weather",
@@ -25,7 +27,9 @@
       "files": {
         "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/weather/manifest.json",
         "tools": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/weather/tools.js"
-      }
+      },
+      "sha256": "89506c92182cb45217fb844eb5c3abbede60655dae4bead89d6a137328cd312b",
+      "manifestSha256": "1ed51a8a48758a7082f9876d2005b435610c2d0770e6a3736a923da8059add29"
     },
     {
       "id": "datetime",
@@ -37,7 +41,9 @@
       "files": {
         "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/datetime/manifest.json",
         "tools": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/datetime/tools.js"
-      }
+      },
+      "sha256": "afbfcb8e40b2da1ae1cc468d06415840a9f116fe8e86d408265180969e77897c",
+      "manifestSha256": "3258b16dbecd9f6ecaaabcfa46dcd2130ceb96e692c7c74d894395b416a3d226"
     },
     {
       "id": "fx",
@@ -52,7 +58,9 @@
       "files": {
         "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/fx/manifest.json",
         "tools": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/fx/tools.js"
-      }
+      },
+      "sha256": "f15b36a7930c44ccb6afe103f34bf517a548d17b20a658d8d68d8975fb111ce8",
+      "manifestSha256": "ffaac773e99c5778fd6b6e667e307bddb876f302e955a7f3aacc27f7817aab2d"
     },
     {
       "id": "json-tools",
@@ -64,7 +72,9 @@
       "files": {
         "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/json-tools/manifest.json",
         "tools": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/json-tools/tools.js"
-      }
+      },
+      "sha256": "e7c70bb8d7718aa133d77d63fe291e7c737fcea58049911dbb7c19b85275aeba",
+      "manifestSha256": "c47b11386854b89e784f5f8316c233c7e8c09ee83a98436ebc2ac15071cafd7c"
     },
     {
       "id": "color-tools",
@@ -76,7 +86,9 @@
       "files": {
         "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/color-tools/manifest.json",
         "tools": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/color-tools/tools.js"
-      }
+      },
+      "sha256": "c89063b74433688f2ca2283fff8afc3ea4c43c925a7a2bfef55c6338fb227958",
+      "manifestSha256": "5b84b984761fd6f8660fbbd759ac557c5ccce32e3c5411ff3394e4b08b37bac1"
     },
     {
       "id": "random-tools",
@@ -88,7 +100,9 @@
       "files": {
         "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/random-tools/manifest.json",
         "tools": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/modules/random-tools/tools.js"
-      }
+      },
+      "sha256": "9597826b2055591b7f144ce3cfa8f81658e6225e06bd67e35b5e31c291e1e484",
+      "manifestSha256": "d8995ff408140b8c379f225a782a0eb27f105d173d6e01307eed9722b57fe37a"
     }
   ]
 }

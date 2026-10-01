@@ -396,6 +396,11 @@ final class AgentService: ObservableObject {
                             // 用户拒绝：状态与措辞和单调用路径完全一致
                             record.status = .error
                             record.result = "用户拒绝执行"
+                            // 打上失败原因码：事后统计"失败原因分布"时，
+                            // 「用户拒绝」和「工具真的报错」必须能分开 ——
+                            // 否则用户会看到一条"错误率很高"的统计，却不知道那全是他自己点的拒绝。
+                            record.errorCode = "denied"
+                            record.finishedAt = Date()
                             appendStep(.result, "\(call.name) 已被用户拒绝")
                             if let id = iterationID { bridge?.attachToolCall(id, record) }
                         }
@@ -409,29 +414,42 @@ final class AgentService: ObservableObject {
                     let outcomes = await Self.executePendingCallsConcurrently(pendingCalls)
                     // 结果按 index 归位：withTaskGroup 产出的是**完成顺序**（快的先回来），
                     // 快慢取决于各工具自身耗时（网络工具可能几秒，纯计算 1 毫秒）。
-                    var resultByIndex: [Int: String] = [:]
-                    resultByIndex.reserveCapacity(outcomes.count)
-                    for item in outcomes { resultByIndex[item.index] = item.result }
+                    // 整个 outcome（含起止时刻）都存下来，不只存文本 —— 耗时正是
+                    // "快慢不同"这件事唯一能被事后看到的证据。
+                    var outcomeByIndex: [Int: AgentCallExecutionResult] = [:]
+                    outcomeByIndex.reserveCapacity(outcomes.count)
+                    for item in outcomes { outcomeByIndex[item.index] = item }
 
                     // ── ④ 回填：严格按**调用出现的原始顺序** ─────────────────────────────
                     // 不能按完成顺序回填：模型下一轮读到的上下文顺序若与它发出的顺序不一致，
                     // 它会按错位的顺序理解因果（把 A 的结果当成 B 的结果），据此得出错误结论。
                     // 所以这里遍历 `records` 的下标（= 原始顺序），而不是遍历 outcomes。
-                    // 注：ChatMessage.ToolCall 目前还没有 startedAt / finishedAt / durationMs
-                    // 字段（由另一个代理添加），所以本轮不记录耗时；字段落地后在此处补即可。
                     var orderedRecords: [ChatMessage.ToolCall] = []
                     var toolMessages: [ChatMessage] = []
                     orderedRecords.reserveCapacity(records.count)
                     toolMessages.reserveCapacity(records.count)
                     for (index, record) in records.enumerated() {
                         var r = record
-                        if let raw = resultByIndex[index] {
+                        if let outcome = outcomeByIndex[index] {
+                            let raw = outcome.result
                             // 每个结果**各自**截断（limitResult）、**各自**包成外部数据块（wrapToolOutput）：
                             // 一轮多调用时漏包任何一个，就等于给提示词注入留下一个未标记的入口。
                             let limited = Self.limitResult(raw)
                             r.result = limited
-                            r.status = .complete
+                            // 成败由**返回文本的约定前缀**决定，而不是"执行过程没抛异常"。
+                            // 之前这里无条件写 .complete：于是 `note` 回一句
+                            // 「错误: 名字不能为空」、`shell` 回「错误: 未知命令: xxx」，
+                            // 界面上一律是绿勾「完成」—— 用户看到的是工具成功了，
+                            // 而模型下一轮却按失败处理，两边对同一件事的判断完全相反。
+                            r.status = ToolResultFormat.isError(limited) ? .error : .complete
+                            if r.status == .error { r.errorCode = "unknown" }
                             r.truncated = limited != raw
+                            // 耗时来自该子任务自己的打点（见 AgentCallExecutionResult）。
+                            r.startedAt = outcome.startedAt
+                            r.finishedAt = outcome.finishedAt
+                            r.durationMs = Int(outcome.finishedAt
+                                .timeIntervalSince(outcome.startedAt) * 1000)
+                            r.exitCode = outcome.exitCode
                             appendStep(.result, "\(r.name) → \(limited)")
                             if let id = iterationID { bridge?.attachToolCall(id, r) }
                             toolMessages.append(ChatMessage(
@@ -441,6 +459,7 @@ final class AgentService: ObservableObject {
                             // 被用户拒绝的调用：沿用单调用路径的措辞，且**不做** untrusted 包裹 ——
                             // 运行时通知不是工具输出，云端提示词里明确要求这类通知要遵从；
                             // 包成"不可信数据"反而会让模型把它当资料忽略掉。
+                            // errorCode 已在批准阶段写成 "denied"（见上面 ② 段的拒绝分支）。
                             toolMessages.append(ChatMessage(
                                 role: .tool,
                                 content: "[\(r.name) 结果]\n用户拒绝执行该工具，请根据情况换用其他工具或直接回答。"))
@@ -448,6 +467,10 @@ final class AgentService: ObservableObject {
                             // 已批准却没拿到结果（并发组异常）：按失败回填，绝不能看起来像执行成功
                             r.status = .error
                             r.result = "未执行：本轮并发执行未返回结果"
+                            // 这不是"用户拒绝"，也不是任何具体工具的错误，如实记 unknown，
+                            // 别借用 denied —— 那会让"失败原因分布"统计骗人。
+                            r.errorCode = "unknown"
+                            r.finishedAt = Date()
                             appendStep(.result, "\(r.name) 未取得结果")
                             if let id = iterationID { bridge?.attachToolCall(id, r) }
                             toolMessages.append(ChatMessage(
@@ -575,13 +598,26 @@ final class AgentService: ObservableObject {
 
                 if approved {
                     record.status = .running
+                    let began = Date()
+                    record.startedAt = began
                     if let id = iterationID { bridge?.attachToolCall(id, record) }
 
-                    let result = await BuiltInTools.executeWithFallbacks(toolName: call.name, argumentsJSON: argsJSON)
+                    let outcome = await BuiltInTools.executeWithFallbacks(toolName: call.name, argumentsJSON: argsJSON)
+                    let result = outcome.text
                     let limited = Self.limitResult(result)
                     record.result = limited
-                    record.status = .complete
+                    // 同并发路径：失败与否看返回文本的约定前缀（ToolResultFormat），
+                    // 不看"有没有抛异常" —— 工具的失败是**正常返回**的错误文案。
+                    record.status = ToolResultFormat.isError(limited) ? .error : .complete
+                    if record.status == .error { record.errorCode = "unknown" }
                     record.truncated = limited != result
+                    // 退出码与文本走两条路：文本是给模型的，退出码是给用户/日志的。
+                    record.exitCode = outcome.exitCode
+                    // 与并发路径保持同一套打点方式（本地模型走的是这条单调用路径，
+                    // 两条路都填，UI 才不会出现"云端有耗时、本地没有"的割裂）。
+                    let ended = Date()
+                    record.finishedAt = ended
+                    record.durationMs = Int(ended.timeIntervalSince(began) * 1000)
                     allToolCalls.append(record)
                     appendStep(.result, "\(call.name) → \(limited)")
                     if let id = iterationID { bridge?.attachToolCall(id, record) }
@@ -604,6 +640,9 @@ final class AgentService: ObservableObject {
                     // 用户拒绝：记录错误并回填上下文，让模型决定换路或直接回答
                     record.status = .error
                     record.result = "用户拒绝执行"
+                    // 与并发路径一致：拒绝是**用户的选择**，不是工具故障，必须能和真实报错分开统计。
+                    record.errorCode = "denied"
+                    record.finishedAt = Date()
                     allToolCalls.append(record)
                     appendStep(.result, "\(call.name) 已被用户拒绝")
                     if let id = iterationID { bridge?.attachToolCall(id, record) }
@@ -798,6 +837,16 @@ final class AgentService: ObservableObject {
             3. Execute step by step, letting each result determine the next move.
             4. Verify before claiming success: re-read, re-query, or check status. A command that returned without an error is not proof that it worked.
             5. Break complex tasks into parts; do not try to do everything in one call.
+
+            ## Planning & Progress
+            - Three or more substantive steps: write the plan with `todo` before the first real action — that list is the plan. A one-action request gets no list.
+            - `todo` op=set replaces the ENTIRE list: send every item every time as `{content, status}`, status pending / in_progress / completed — never only what changed.
+            - Exactly one item is in_progress at a time. When a step finishes, mark it completed and the next one in_progress in the same call. Two active items is a bug.
+            - Update it as you go, not once at the start: the user watches it live, so a stale list lies about your progress.
+            - Write items for the user: one sentence each, concrete and checkable, in the user's language, imperative. No "step 1 / step 2" placeholders, nothing outside this task.
+            - Done means closed out: the last item goes to completed too, with one final `todo` call if needed. Do not leave an item in_progress, or refresh it just to show motion.
+            - Blocked or failed: leave that item in_progress and state in your answer where you are stuck. Never mark completed what you did not finish.
+            - `todo` records progress; it never does the work, never replaces a real tool call, never the final answer.
 
             ## Autonomy & Confirmation
             - Act on your own for read-only, reversible, in-scope work: searching, fetching, reading, calculating.
@@ -1154,11 +1203,15 @@ final class AgentService: ObservableObject {
         return await withTaskGroup(of: AgentCallExecutionResult.self) { group in
             for call in calls {
                 group.addTask {
-                    let result = await BuiltInTools.executeWithFallbacks(
+                    let began = Date()
+                    let outcome = await BuiltInTools.executeWithFallbacks(
                         toolName: call.name, argumentsJSON: call.argumentsJSON)
                     return AgentCallExecutionResult(index: call.index,
                                                     name: call.name,
-                                                    result: result)
+                                                    result: outcome.text,
+                                                    exitCode: outcome.exitCode,
+                                                    startedAt: began,
+                                                    finishedAt: Date())
                 }
             }
             var out: [AgentCallExecutionResult] = []
@@ -1235,4 +1288,12 @@ private struct AgentCallExecutionResult: Sendable {
     let index: Int
     let name: String
     let result: String
+    /// 进程退出码（只有 `shell` 会有；其余工具 nil）。见 `ToolExecutionOutcome`。
+    let exitCode: Int?
+    /// 起止时刻由**子任务自己**打点，而不是在 TaskGroup 外面统一记一笔。
+    /// 原因：这些子任务是并发的，`withTaskGroup` 的循环体在 `for await` 时所有任务
+    /// 早就发出去了 —— 在外层记时刻只会得到"N 个任务同时开始、同时结束"，
+    /// 完全看不出哪个工具慢。只有任务内部的时间戳才反映真实耗时。
+    let startedAt: Date
+    let finishedAt: Date
 }
