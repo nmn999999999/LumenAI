@@ -12,6 +12,10 @@ struct AgentToolDefinition: Codable, Identifiable, Sendable {
     /// 该工具调用前是否需要用户授权(opencode 风格).
     /// 网络/IPC 类副作用工具(SSH、MCP)默认 true；纯计算类(calculator/encoder)默认 false。
     /// 旧存档反序列化时若缺该字段，fallback 为 false（保持旧行为，向后兼容）。
+    ///
+    /// 当前判为 true 的只有 5 个：http_get、web_search（联网）、ssh、shell（执行命令）、
+    /// clipboard（读写系统剪贴板）。判定标准是"会不会联网 / 写文件 / 执行命令 / 改系统状态"。
+    /// 注意 note 虽然会写盘但仍是 false，理由写在该工具定义处（审批粒度到不了 op，会造成审批疲劳）。
     let requiresApproval: Bool
 
     struct ParameterSchema: Codable, Sendable {
@@ -114,24 +118,43 @@ struct ToolCallRequest: Codable {
     }
 }
 
+// MARK: - 工具结果的成败约定
+
+/// 工具返回值的成败约定：**失败一定以 `errorPrefix` 开头，成功一定不带这个前缀**。
+///
+/// 为什么要立这条约定：以前成功和失败走同一个字符串通道，且前缀五花八门
+/// （`MCP 调用失败: …`、`插件错误: …`、`HTTP 404: …`），上层没法判断这一步到底成没成，
+/// 只能全标成 `.complete` —— 于是"工具报错"在对话里显示成一次成功调用，
+/// 模型也会把错误正文（比如 404 页面的 HTML）当成有效内容继续总结给用户。
+/// 有了这个前缀，上层只要按 `isError` 判定，就能把失败如实标成 `.error`。
+///
+/// 注意：**不要**给成功结果加这个前缀，也不要给错误结果换别的措辞（如"失败: "），
+/// 判定只认这一个前缀。
+enum ToolResultFormat {
+    /// 所有工具失败时返回的文本都必须以此开头，上层据此把 ToolCall 标成 .error
+    static let errorPrefix = "错误: "
+    static func isError(_ text: String) -> Bool { text.hasPrefix(errorPrefix) }
+}
+
 enum BuiltInTools {
 
     static let allTools: [AgentToolDefinition] = [
         AgentToolDefinition(
             id: "http_get",
             name: "http_get",
-            description: "发起 HTTP GET 请求抓取网页 / JSON API 内容(仅 https)。返回文本;若响应是 JSON 会自动美化。适合获取天气 API、GitHub API、新闻 RSS 等公开数据",
+            description: "发起 HTTP GET 请求抓取网页 / JSON API 内容(仅 https)。返回文本;若响应是 JSON 会自动美化。适合获取天气 API、GitHub API、新闻 RSS 等公开数据。只能访问公网地址,内网/回环/元数据地址会被拒绝",
             parameters: [
                 "url": .init(type: "string", description: "完整 URL(https://...),如 https://api.github.com/repos/nmn999999999/LumenAI/releases/latest", enumValues: nil),
                 "timeout": .init(type: "number", description: "超时秒数(可选,默认 15)", enumValues: nil)
             ],
-            requiresApproval: true,  // 网络请求会访问外部站点
+            requiresApproval: true,  // 真实的网络出站：会把内网/外网内容拉回上下文，必须用户点头
         ),
         AgentToolDefinition(
             id: "device_info",
             name: "device_info",
             description: "获取当前 iOS 设备信息:机型、系统版本、内存/存储容量、当前电量、进程架构等",
             parameters: [:],
+            // 只读本机信息：不联网、不写盘、不改系统状态，纯查询，不需要授权。
             requiresApproval: false,
         ),
         AgentToolDefinition(
@@ -294,6 +317,15 @@ enum BuiltInTools {
                 "name": .init(type: "string", description: "笔记名称（save/read/delete 必填）", enumValues: nil),
                 "content": .init(type: "string", description: "笔记内容（save 必填）", enumValues: nil)
             ],
+            // 取舍：note 确实会持久化写盘（save）甚至删文件（delete），按"写文件就要授权"的
+            // 字面规则应该设 true。这里仍然保持 false，理由是**审批疲劳**：
+            // 授权粒度是"工具"而不是"op"，而 op 是参数 —— 一旦设 true，模型每次 list/read
+            // （跨对话记忆的读路径，一次对话里可能十几次）也会弹同一个框。
+            // 用户很快会习惯性点"允许本次会话"，授权形同虚设，真正危险的 delete 也一起被放行了，
+            // 反而比不弹更糟；而且 App 的立身之本就是长期记忆，让记忆写入每次都打断用户是产品自杀。
+            // 缓解措施：写入范围被限制在 App 私有目录 Documents/agent_notes，
+            // 内容在「设置 → 长期记忆」里用户随时可见可删，且不涉及网络外发。
+            // 如果将来审批能细到 (工具, op)，save/delete 应该改成 true。
             requiresApproval: false,
         ),
         AgentToolDefinition(
@@ -304,7 +336,14 @@ enum BuiltInTools {
                 "op": .init(type: "string", description: "操作", enumValues: ["get", "set"]),
                 "text": .init(type: "string", description: "要写入剪贴板的内容（set 必填）", enumValues: nil)
             ],
-            requiresApproval: false,
+            // 改成 true。和 note 的取舍不同点在于"频率"和"数据敏感度"：
+            // ① op:get 读的是**系统剪贴板**——里面可能是密码管理器复制出来的密码、验证码，
+            //    一旦进了上下文就等于泄露给了模型（并留在对话记录里）；
+            // ② op:set 会覆盖用户当前的剪贴板内容，是明确的系统状态修改；
+            // ③ clipboard 不是高频工具（一次对话通常 0~1 次），弹窗不会造成审批疲劳，
+            //    而 note 是每次都写的核心路径，两者不能按同一把尺子判。
+            // 代价：op:get 这种只读操作也会弹窗。可接受——真要看剪贴板，用户本来就该确认一次。
+            requiresApproval: true,
         ),
         AgentToolDefinition(
             id: "web_search",
@@ -313,7 +352,12 @@ enum BuiltInTools {
             parameters: [
                 "query": .init(type: "string", description: "搜索关键词", enumValues: nil)
             ],
-            requiresApproval: false,
+            // 策略修正：这里原本是 false，但 web_search 是**真联网**工具
+            // （executeWebSearch → SearchService → 向 Bing RSS / DuckDuckGo / 维基百科发起请求），
+            // 和文件顶部声明的"网络类默认 true"直接矛盾。搜索词是模型根据上下文自己拼的，
+            // 可能包含用户没说出口要外发的内容（笔记片段、剪贴板、设备信息），
+            // 所以必须让用户在请求真正发出前看到并确认。网络类工具一律 true。
+            requiresApproval: true,
         ),
         AgentToolDefinition(
             id: "regex_extract",
@@ -427,7 +471,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "ssh",
             name: "ssh",
-            description: "通过 SSH 在远程服务器上执行命令（默认使用「设置 → SSH 连接」中配置的主机/账号，也可在参数中临时覆盖）。支持密码(password)与私钥PEM(key)两种认证。参数：command(必填)要执行的命令；host/user/port 可选覆盖默认连接；auth_type 可选 password/key；password/private_key/passphrase 可选覆盖默认凭据",
+            description: "在远程服务器上通过 SSH 执行命令（需先在「设置 → SSH 连接」配置主机/账号）。本地沙盒操作用 shell，不要用这个。支持密码(password)与私钥PEM(key)两种认证。参数：command(必填)要执行的命令；host/user/port 可选覆盖默认连接；auth_type 可选 password/key；password/private_key/passphrase 可选覆盖默认凭据",
             parameters: [
                 "command": .init(type: "string", description: "要在远程执行的命令（必填），如 uname -a、df -h、systemctl status nginx", enumValues: nil),
                 "host": .init(type: "string", description: "主机地址（可选，默认使用设置中的主机）", enumValues: nil),
@@ -443,7 +487,13 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "shell",
             name: "shell",
-            description: "iOS 沙盒内受限 shell,执行文件 / 文本 / 系统类命令(ls、cat、echo、grep、sort、wc、head、tail、mkdir、rm、cp、mv、pwd、cd、stat、export 等),路径限定在 app 沙盒下 ~/Documents/shellbox。支持通配符、管道(|)、重定向(> >>)、链式执行(; && ||)。例如:'ls *.txt | head -5'、'grep -i keyword notes.md'、'echo hello > out.txt'。输入 'help' 查看完整命令列表",
+            // 排他说明放在**首句**，不是排版讲究：本地模型（model 走 prefix(12) 的本地模型）
+            // 的工具说明会被 AgentService 截断到 150 字（maxDesc = useCloud ? Int.max : 150），
+            // 写在后面的内容模型根本看不到 —— shell 和 ssh 都叫"执行命令"、参数都叫 command、
+            // 审批弹窗长得一模一样，模型最常犯的错就是把远程命令丢进本地沙盒。
+            // 所以第一句就必须互相点名（"要操作远程服务器请用 ssh"/"本地沙盒操作用 shell"），
+            // 保证截断后仍然保留。
+            description: "本地沙盒内执行命令（文件/文本/系统类）。要操作远程服务器请用 ssh，不要用这个。执行文件/文本/系统类命令(ls、cat、echo、grep、sort、wc、head、tail、mkdir、rm、cp、mv、pwd、cd、stat、export 等)，路径限定在 app 沙盒下 ~/Documents/shellbox。支持通配符、管道(|)、重定向(> >>)、链式执行(; && ||)。例如:'ls *.txt | head -5'、'grep -i keyword notes.md'、'echo hello > out.txt'。输入 'help' 查看完整命令列表",
             parameters: [
                 "command": .init(type: "string", description: "要执行的 shell 命令字符串(必填)。可一次写多段,用 ; 或 | 或 && 串连", enumValues: nil)
             ],
@@ -452,6 +502,12 @@ enum BuiltInTools {
     ]
 
     // MARK: - 执行入口
+
+    /// 「不认识这个工具名」的返回值既是给模型看的错误，也是 `executeWithFallbacks` 用来
+    /// 判断"要不要接着往 MCP / 插件找"的哨兵。以前这个哨兵是 `"未知工具: X"`，
+    /// 不以「错误: 」开头 —— 于是内置工具名打错时，上层会把这句失败当成成功的工具输出。
+    /// 现在它带错误前缀，同时用常量保证"产生哨兵"和"识别哨兵"两处不会各写一份字面量而漂移。
+    private static let unknownToolMarker = "错误: 未知工具: "
 
     /// arguments 以 JSON 字符串传入（String 为 Sendable，可安全跨 actor 传递）。
     static func execute(toolName: String, argumentsJSON: String) async -> String {
@@ -495,7 +551,7 @@ enum BuiltInTools {
         case "csv_table":       return executeCSVTable(arguments: arguments)
         case "jwt_decode":      return executeJWTDecode(arguments: arguments)
         default:
-            return "未知工具: \(toolName)"
+            return unknownToolMarker + toolName
         }
     }
 
@@ -505,7 +561,9 @@ enum BuiltInTools {
     @MainActor
     static func executeWithFallbacks(toolName: String, argumentsJSON: String) async -> String {
         let builtin = await execute(toolName: toolName, argumentsJSON: argumentsJSON)
-        if !builtin.hasPrefix("未知工具:") { return builtin }
+        // 用共享常量判哨兵：写成字面量的话，两处早晚会漂移成"不再匹配"，
+        // 结果是所有 MCP/插件工具突然全部变成"未知工具"。
+        if !builtin.hasPrefix(unknownToolMarker) { return builtin }
 
         // MCP 工具（由已连接服务器暴露）
         if MCPService.shared.server(forToolName: toolName) != nil {
@@ -518,6 +576,170 @@ enum BuiltInTools {
         }
 
         return builtin
+    }
+
+    // MARK: - 参数读取（"没传" 与 "传错" 必须分开）
+
+    /// 参数读取的统一结果：恰好只有一边非 nil。
+    /// 调用点固定写成两行：
+    ///     let daysRead = intArgument(arguments, "days", default: 0)
+    ///     guard let days = daysRead.value else { return daysRead.error ?? "错误: 参数 days 无效" }
+    /// 这么写是为了让「键不存在 → 用默认值」和「键存在但类型不符 → 报错」在代码里一眼可辨。
+    /// 原来满文件都是 `(arguments["days"] as? NSNumber)?.intValue ?? 0`：它把这两种情况
+    /// 压成同一件事 —— 模型传了 `"days": "三天"` 也会静默用默认值 0 算出一个"看着对"的日期，
+    /// 模型看不到任何异常，于是继续基于错结果往下走，用户最后拿到的是错的。
+    private enum ArgumentRead<T> {
+        case ok(T)
+        case fail(String)
+
+        var value: T? {
+            if case .ok(let v) = self { return v }
+            return nil
+        }
+
+        var error: String? {
+            if case .fail(let message) = self { return message }
+            return nil
+        }
+    }
+
+    /// 取原始参数值：键不存在、或显式写成 JSON null，都算"没传"（模型常把可选参数写成 null）。
+    private static func rawArgument(_ arguments: [String: Any], _ key: String) -> Any? {
+        guard let raw = arguments[key] else { return nil }
+        if raw is NSNull { return nil }
+        return raw
+    }
+
+    /// 把参数原值转成给模型看的一小段文本。回显原文很重要：模型收到"期望数字"时
+    /// 并不知道自己发的是什么，把收到的值照抄回去，它下一轮才有机会自我纠正。
+    private static func describeArgumentValue(_ value: Any?) -> String {
+        guard let value else { return "null" }
+        if let s = value as? String { return "「\(s)」（字符串）" }
+        // JSON 里的 true/false 在 Swift 侧同样是 NSNumber，所以必须先用 CFBoolean 的 typeID
+        // 区分开：`as? Bool` 对 NSNumber(1) 也成立（老坑），只按 as? 判断的话
+        // `"days": 1` 会被描述成 "true（布尔）"，回显给模型的就是错的信息。
+        if let n = value as? NSNumber {
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                return n.boolValue ? "true（布尔）" : "false（布尔）"
+            }
+            return n.stringValue
+        }
+        if let a = value as? [Any] { return "[\(a.count) 个元素的数组]" }
+        if let d = value as? [String: Any] { return "{\(d.count) 个键的对象}" }
+        return "\(value)"
+    }
+
+    /// 数字的核心解析。为什么要把数字**字符串**也当数字收下：
+    /// 小参数模型（lumen3/lumen4 这一档）经常把数字写成 `"3"`、`"3.5"`，
+    /// 老代码的 `as? NSNumber` 对字符串一律失败 → 静默落到默认值。
+    /// 所以这里先按 Double 解析字符串，只有真转换不了才报错。
+    private static func parseNumber(_ raw: Any, key: String) -> ArgumentRead<Double> {
+        if let n = raw as? NSNumber {
+            // 布尔不是数字：`"days": true` 不该被当成 1
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                return .fail("错误: 参数 \(key) 期望数字，实际收到 \(describeArgumentValue(raw))")
+            }
+            return .ok(n.doubleValue)
+        }
+        if let s = raw as? String {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let d = Double(trimmed) { return .ok(d) }
+        }
+        return .fail("错误: 参数 \(key) 期望数字，实际收到 \(describeArgumentValue(raw))")
+    }
+
+    private static func doubleArgument(_ arguments: [String: Any], _ key: String, default def: Double) -> ArgumentRead<Double> {
+        guard let raw = rawArgument(arguments, key) else { return .ok(def) }
+        return parseNumber(raw, key: key)
+    }
+
+    private static func intArgument(_ arguments: [String: Any], _ key: String, default def: Int) -> ArgumentRead<Int> {
+        guard let raw = rawArgument(arguments, key) else { return .ok(def) }
+        switch parseNumber(raw, key: key) {
+        case .fail(let message):
+            return .fail(message)
+        case .ok(let d):
+            // 3.7 天的语义不明，与其四舍五入猜一个，不如让模型自己改成整数
+            guard d == d.rounded(), Swift.abs(d) < 9.0e15 else {
+                return .fail("错误: 参数 \(key) 期望整数，实际收到 \(describeArgumentValue(raw))")
+            }
+            return .ok(Int(d))
+        }
+    }
+
+    /// 必填数字参数（没有默认值）：键不存在要明确说"缺少哪个参数"，而不是"缺少参数"。
+    private static func requiredDoubleArgument(_ arguments: [String: Any], _ key: String) -> ArgumentRead<Double> {
+        guard let raw = rawArgument(arguments, key) else { return .fail("错误: 缺少 \(key) 参数") }
+        return parseNumber(raw, key: key)
+    }
+
+    /// 布尔参数。同样要容忍字符串写法：模型发 `"dedup": "true"` 时，
+    /// 老的 `as? Bool ?? false` 会静默当成 false —— 模型以为去重了，其实没有。
+    private static func boolArgument(_ arguments: [String: Any], _ key: String, default def: Bool) -> ArgumentRead<Bool> {
+        guard let raw = rawArgument(arguments, key) else { return .ok(def) }
+        if let n = raw as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() {
+            return .ok(n.boolValue)
+        }
+        if let s = raw as? String {
+            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes", "y", "是": return .ok(true)
+            case "false", "0", "no", "n", "否": return .ok(false)
+            default: break
+            }
+        }
+        return .fail("错误: 参数 \(key) 期望布尔值(true/false)，实际收到 \(describeArgumentValue(raw))")
+    }
+
+    /// 字符串参数。用在原来是 `as? String ?? 默认值` 的地方：
+    /// 键不存在照旧用默认值，键存在却不是字符串就报错（而不是悄悄用默认值）。
+    private static func stringArgument(_ arguments: [String: Any], _ key: String, default def: String) -> ArgumentRead<String> {
+        guard let raw = rawArgument(arguments, key) else { return .ok(def) }
+        if let s = raw as? String { return .ok(s) }
+        return .fail("错误: 参数 \(key) 期望字符串，实际收到 \(describeArgumentValue(raw))")
+    }
+
+    /// 必填字符串参数：错误信息里点名是哪个参数（"缺少 path 参数" 而不是 "缺少参数"），
+    /// 模型才知道该补哪一个。
+    private static func requiredStringArgument(_ arguments: [String: Any], _ key: String) -> ArgumentRead<String> {
+        guard let raw = rawArgument(arguments, key) else { return .fail("错误: 缺少 \(key) 参数") }
+        if let s = raw as? String { return .ok(s) }
+        return .fail("错误: 参数 \(key) 期望字符串，实际收到 \(describeArgumentValue(raw))")
+    }
+
+    /// 取工具参数在 `allTools` 里**声明**的可选值。真源只留一份：
+    /// 如果一边在定义里写着 enum: ["save","read","list","delete"]、一边在执行里另抄一份，
+    /// 两边早晚会漂移（加了新 op 却忘了改校验，或者校验里留着早就删掉的 op）。
+    private static func allowedValues(tool: String, parameter: String, fallback: [String]) -> [String] {
+        allTools.first { $0.name == tool }?.parameters[parameter]?.enumValues ?? fallback
+    }
+
+    /// 枚举型字符串参数（op / mode / style / transform / algorithm / auth_type 这类）。
+    /// 为什么必须报错而不能兜底：原来 `arguments["op"] as? String ?? "list"` 这种写法里，
+    /// 打错的值会**静默降级到默认分支** —— 用户说"删掉那条笔记"，模型发 op="remove"，
+    /// 工具却去执行 list 并返回笔记列表，模型看到"有返回"就回复"已删除"。
+    /// 失败被伪装成成功，比直接报错危险得多。所以未知取值一律报错，并把可选值列全。
+    /// `default` 为 nil 表示这个参数必填。
+    private static func enumeratedArgument(
+        _ arguments: [String: Any],
+        _ key: String,
+        label: String,
+        allowed: [String],
+        default def: String?
+    ) -> ArgumentRead<String> {
+        guard let raw = rawArgument(arguments, key) else {
+            if let def { return .ok(def) }
+            return .fail("错误: 缺少 \(key) 参数，可选: \(allowed.joined(separator: ", "))")
+        }
+        guard let s = raw as? String else {
+            return .fail("错误: 参数 \(key) 期望字符串，实际收到 \(describeArgumentValue(raw))")
+        }
+        // 归一化大小写与空白："Save"、 " save " 都当 save 处理（模型输出大小写不稳），
+        // 但真正的错别字（"sav"/"remove"）仍然要拦下来报错。
+        let normalized = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard allowed.contains(normalized) else {
+            return .fail("错误: 未知\(label) \"\(s)\"，可选: \(allowed.joined(separator: ", "))")
+        }
+        return .ok(normalized)
     }
 
     // MARK: - 工具实现
@@ -547,9 +769,13 @@ enum BuiltInTools {
     }
 
     private static func executeRandomNumber(arguments: [String: Any]) -> String {
-        let minV = (arguments["min"] as? NSNumber)?.intValue ?? 1
-        let maxV = (arguments["max"] as? NSNumber)?.intValue ?? 100
-        guard minV <= maxV else { return "错误: min 应不大于 max" }
+        // 原写法 `(arguments["min"] as? NSNumber)?.intValue ?? 1`：min 传了 "abc" 也会
+        // 静默按 1 算，回给用户的却是"范围 1~100"，请求的范围和实际用的根本不是一回事。
+        let minRead = intArgument(arguments, "min", default: 1)
+        guard let minV = minRead.value else { return minRead.error ?? "错误: 参数 min 无效" }
+        let maxRead = intArgument(arguments, "max", default: 100)
+        guard let maxV = maxRead.value else { return maxRead.error ?? "错误: 参数 max 无效" }
+        guard minV <= maxV else { return "错误: min 应不大于 max（收到 min=\(minV), max=\(maxV)）" }
         return "随机数: \(Int.random(in: minV...maxV))（范围 \(minV)~\(maxV)）"
     }
 
@@ -564,9 +790,17 @@ enum BuiltInTools {
     }
 
     private static func executeTextTransform(arguments: [String: Any]) -> String {
-        guard let text = arguments["text"] as? String,
-              let transform = arguments["transform"] as? String else {
-            return "错误: 缺少参数"
+        // 原来是两条 `as? String` 合在一个 guard 里、报"错误: 缺少参数"：
+        // 模型只知道自己少传了东西，却不知道是 text 还是 transform，只能瞎猜一轮。
+        let textRead = requiredStringArgument(arguments, "text")
+        guard let text = textRead.value else { return textRead.error ?? "错误: 缺少 text 参数" }
+        let transformRead = enumeratedArgument(
+            arguments, "transform", label: "转换类型",
+            allowed: allowedValues(tool: "text_transform", parameter: "transform",
+                                   fallback: ["uppercase", "lowercase", "reverse", "base64_encode", "base64_decode"]),
+            default: nil)
+        guard let transform = transformRead.value else {
+            return transformRead.error ?? "错误: 缺少 transform 参数"
         }
         switch transform {
         case "uppercase":
@@ -578,10 +812,17 @@ enum BuiltInTools {
         case "base64_encode":
             return Data(text.utf8).base64EncodedString()
         case "base64_decode":
-            guard let data = Data(base64Encoded: text) else { return "Base64解码失败" }
-            return String(data: data, encoding: .utf8) ?? "解码结果非有效UTF-8文本"
+            // 失败分支也要带「错误: 」前缀：上层靠它把这步标成 error，
+            // 否则"Base64解码失败"会被当成一次成功的工具输出喂回给模型。
+            guard let data = Data(base64Encoded: text) else { return "错误: Base64 解码失败（输入不是合法的 base64）" }
+            guard let decoded = String(data: data, encoding: .utf8) else {
+                return "错误: Base64 解码结果不是有效的 UTF-8 文本（原始 \(data.count) 字节）"
+            }
+            return decoded
         default:
-            return "未知转换类型: \(transform)"
+            // enumeratedArgument 已经挡住了未知值，走到这里说明 allowedValues 的声明被人改过，
+            // 保守起见仍然报错而不是猜一个分支执行。
+            return "错误: 未知转换类型「\(transform)」"
         }
     }
 
@@ -594,21 +835,42 @@ enum BuiltInTools {
     }()
 
     private static func executeDateAdd(arguments: [String: Any]) -> String {
-        let dateStr = arguments["date"] as? String ?? ""
-        let days = (arguments["days"] as? NSNumber)?.intValue ?? 0
-        let base = dateStr.isEmpty ? Date() : (dateFormatter.date(from: dateStr) ?? Date())
+        let dateRead = stringArgument(arguments, "date", default: "")
+        guard let dateStr = dateRead.value else { return dateRead.error ?? "错误: 参数 date 无效" }
+        let daysRead = intArgument(arguments, "days", default: 0)
+        guard let days = daysRead.value else { return daysRead.error ?? "错误: 参数 days 无效" }
+
+        // 原写法 `dateFormatter.date(from: dateStr) ?? Date()` 是个隐蔽的坑：
+        // date 只在**为空**时才代表"今天"，但解析失败（"2026-8-29"、"2026/08/29"、"明天"）
+        // 也被 `?? Date()` 吞成了今天，于是"2026-8-29 加 7 天"会返回"今天 +7 天"这种
+        // 看似正确的错误答案 —— 用户完全无法察觉。日期串非空就必须解析成功，否则报错。
+        let base: Date
+        if dateStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            base = Date()
+        } else if let parsed = dateFormatter.date(from: dateStr) {
+            base = parsed
+        } else {
+            return "错误: 无法解析日期 \"\(dateStr)\"，请用 yyyy-MM-dd 格式"
+        }
+
         guard let result = Calendar.current.date(byAdding: .day, value: days, to: base) else {
-            return "日期计算失败"
+            return "错误: 日期计算失败（\(dateStr) 加减 \(days) 天超出可表示范围）"
         }
         return "\(dateFormatter.string(from: base)) + \(days) 天 = \(dateFormatter.string(from: result))"
     }
 
     private static func executeDateDiff(arguments: [String: Any]) -> String {
-        guard let d1 = arguments["date1"] as? String,
-              let d2 = arguments["date2"] as? String,
-              let a = dateFormatter.date(from: d1),
-              let b = dateFormatter.date(from: d2) else {
-            return "错误: 需要有效的 date1 和 date2（格式 yyyy-MM-dd）"
+        // 原来把两个日期捏在一个 guard 里报"需要有效的 date1 和 date2"，
+        // 模型无法知道该修哪一个（甚至不知道是"没传"还是"格式错"），这里逐个点名 + 回显原值。
+        let d1Read = requiredStringArgument(arguments, "date1")
+        guard let d1 = d1Read.value else { return d1Read.error ?? "错误: 缺少 date1 参数" }
+        let d2Read = requiredStringArgument(arguments, "date2")
+        guard let d2 = d2Read.value else { return d2Read.error ?? "错误: 缺少 date2 参数" }
+        guard let a = dateFormatter.date(from: d1) else {
+            return "错误: 无法解析日期 \"\(d1)\"（date1），请用 yyyy-MM-dd 格式"
+        }
+        guard let b = dateFormatter.date(from: d2) else {
+            return "错误: 无法解析日期 \"\(d2)\"（date2），请用 yyyy-MM-dd 格式"
         }
         let days = Calendar.current.dateComponents([.day], from: a, to: b).day ?? 0
         return "\(d1) 到 \(d2) 相差 \(Swift.abs(days)) 天"
@@ -616,7 +878,16 @@ enum BuiltInTools {
 
     private static func executeHashText(arguments: [String: Any]) -> String {
         guard let text = arguments["text"] as? String else { return "错误: 缺少 text 参数" }
-        let algorithm = (arguments["algorithm"] as? String)?.lowercased() ?? "sha256"
+        // 原来 `(arguments["algorithm"] as? String)?.lowercased() ?? "sha256"`：
+        // algorithm 传了数字、或者拼成 "sha-256"，都会静默按 sha256 计算 ——
+        // 用户要的是 MD5，拿回来的是 SHA256，值长得一样长，肉眼看不出来。
+        let algorithmRead = enumeratedArgument(
+            arguments, "algorithm", label: "算法",
+            allowed: allowedValues(tool: "hash_text", parameter: "algorithm", fallback: ["md5", "sha1", "sha256"]),
+            default: "sha256")
+        guard let algorithm = algorithmRead.value else {
+            return algorithmRead.error ?? "错误: 参数 algorithm 无效"
+        }
         let data = Data(text.utf8)
         let hex: String
         switch algorithm {
@@ -627,14 +898,17 @@ enum BuiltInTools {
         case "sha256":
             hex = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         default:
-            return "未知算法: \(algorithm)（可选 md5/sha1/sha256）"
+            return "错误: 未知算法「\(algorithm)」（可选 md5/sha1/sha256）"
         }
         return "\(algorithm) = \(hex)"
     }
 
     private static func executeJsonFormat(arguments: [String: Any]) -> String {
         guard let json = arguments["json"] as? String else { return "错误: 缺少 json 参数" }
-        let pretty = (arguments["pretty"] as? Bool) ?? true
+        // 布尔参数同样不能再 `?? true`：模型发 pretty:"false"（字符串）时会被当成 true，
+        // 用户明确要求压缩，拿到的却是美化后的多行 JSON。
+        let prettyRead = boolArgument(arguments, "pretty", default: true)
+        guard let pretty = prettyRead.value else { return prettyRead.error ?? "错误: 参数 pretty 无效" }
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) else {
             return "错误: JSON 解析失败"
@@ -650,12 +924,27 @@ enum BuiltInTools {
 
     private static func executeUrlCodec(arguments: [String: Any]) -> String {
         guard let text = arguments["text"] as? String else { return "错误: 缺少 text 参数" }
-        let mode = arguments["mode"] as? String ?? "encode"
+        // 原来 `arguments["mode"] as? String ?? "encode"`：mode 打成 "decde" 会走 encode，
+        // 也就是把已经编码的文本**再编码一次**，返回一坨双重编码的 %25E4%25B8... 给模型，
+        // 模型会当成"解码结果"直接展示给用户。
+        let modeRead = enumeratedArgument(
+            arguments, "mode", label: "模式",
+            allowed: allowedValues(tool: "url_codec", parameter: "mode", fallback: ["encode", "decode"]),
+            default: "encode")
+        guard let mode = modeRead.value else { return modeRead.error ?? "错误: 参数 mode 无效" }
         if mode == "decode" {
-            return text.removingPercentEncoding ?? "解码失败"
+            // 解码失败也要走错误通道：原来返回 "解码失败" 不带前缀，
+            // 上层会把它当成正常的工具输出，模型于是把"解码失败"四个字当内容用了。
+            guard let decoded = text.removingPercentEncoding else {
+                return "错误: URL 解码失败（输入里有非法的百分号转义）"
+            }
+            return decoded
         }
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))
-        return text.addingPercentEncoding(withAllowedCharacters: allowed) ?? text
+        guard let encoded = text.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            return "错误: URL 编码失败（输入含无法编码的字符）"
+        }
+        return encoded
     }
 
     private static let notesDirectory: URL = {
@@ -672,7 +961,16 @@ enum BuiltInTools {
     /// 注意：返回的字符串必须与训练数据逐字一致 —— lumen3 / lumen4 就是照这些字符串
     /// 练出来的记忆行为（真源在 `build_lumen_train.py`），改文案会让模型在真实 App 里对不上。
     private static func executeNote(arguments: [String: Any]) async -> String {
-        let op = arguments["op"] as? String ?? "list"
+        // op 必须先校验：`NoteStore.perform` 的 default 分支是 list，所以 op 打错（"remove"/"保存"）
+        // 会被静默当成"列出笔记"执行 —— 用户说删笔记，工具返回一份笔记清单，
+        // 模型看到"有内容返回"就回复"已删除"，用户以为删了，其实一条没动。
+        // 这里归一化大小写后只放行声明过的四个 op，其余一律报错并列出可选值。
+        // 没传 op 时的默认值仍然是 "list"（保持旧行为与既有训练数据一致）。
+        let opRead = enumeratedArgument(
+            arguments, "op", label: "操作",
+            allowed: allowedValues(tool: "note", parameter: "op", fallback: ["save", "read", "list", "delete"]),
+            default: "list")
+        guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
         let rawName = (arguments["name"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let content = arguments["content"] as? String ?? ""
@@ -684,7 +982,14 @@ enum BuiltInTools {
     }
 
     private static func executeClipboard(arguments: [String: Any]) -> String {
-        let op = arguments["op"] as? String ?? "get"
+        // 和 note 同样的坑：原来 `arguments["op"] as? String ?? "get"` 里，op 打错（"write"）
+        // 会退化成读取剪贴板并返回内容，模型拿到一段文本就以为"已写入"。
+        // 默认值仍是 "get"（读取是无副作用的一侧，缺参数时保守取值）。
+        let opRead = enumeratedArgument(
+            arguments, "op", label: "操作",
+            allowed: allowedValues(tool: "clipboard", parameter: "op", fallback: ["get", "set"]),
+            default: "get")
+        guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
         #if canImport(UIKit)
         if op == "set" {
             guard let text = arguments["text"] as? String else { return "错误: 缺少 text 参数" }
@@ -697,7 +1002,7 @@ enum BuiltInTools {
         }
         return "剪贴板为空"
         #else
-        return "剪贴板在当前平台不可用"
+        return "错误: 剪贴板在当前平台不可用"
         #endif
     }
 
@@ -954,7 +1259,11 @@ enum BuiltInTools {
         }
         
         var results: [String] = []
-        for (i, match) in matches.prefix(20).enumerated() {
+        // 上限 20 条是为了别撑爆上下文，但**必须把这个截断说出来**。
+        // 原来只列 20 条、结尾却写"找到 N 个匹配"，模型会理所当然地认为手上就是全部：
+        // 让它统计"一共有多少条日志"，它数了 20 条就报 20 —— 数据是错的，而且看不出错。
+        let displayLimit = 20
+        for (i, match) in matches.prefix(displayLimit).enumerated() {
             // 完整匹配
             let fullMatch = nsText.substring(with: match.range)
             
@@ -975,8 +1284,17 @@ enum BuiltInTools {
             }
             results.append(line)
         }
-        
-        return "找到 \(matches.count) 个匹配:\n\(results.joined(separator: "\n"))"
+
+        let truncated = matches.count > displayLimit
+        let header = truncated
+            ? "找到 \(matches.count) 个匹配（仅显示前 \(displayLimit) 个，其余 \(matches.count - displayLimit) 个未显示）"
+            : "找到 \(matches.count) 个匹配"
+        var output = "\(header):\n\(results.joined(separator: "\n"))"
+        if truncated {
+            // 明确告诉模型"下面这份列表不完整"以及怎么办，否则它会拿前 20 条当全集去做统计/汇总
+            output += "\n（注意：以上不是全部结果，不要据此统计总数；需要全部匹配时请用更精确的正则，或先用更小的 text 分段调用）"
+        }
+        return output
     }
 
     // MARK: - 文本摘要工具
@@ -986,8 +1304,15 @@ enum BuiltInTools {
             return "错误: 缺少 text 参数"
         }
         
-        let maxLength = (arguments["max_length"] as? NSNumber)?.intValue ?? 200
-        
+        let maxRead = intArgument(arguments, "max_length", default: 200)
+        guard let maxLength = maxRead.value else { return maxRead.error ?? "错误: 参数 max_length 无效" }
+        // 下界不能省：max_length 传 1 或 2 时，下面 `String(summary.prefix(maxLength - 3))`
+        // 拿到的是**负长度**，prefix 会直接触发运行期崩溃（不是返回错误，是 App 闪退）。
+        // 这种崩溃只会在模型恰好传了小数值时才出现，测试很难覆盖到，所以在这里拦住。
+        guard maxLength >= 3 else {
+            return "错误: max_length 至少为 3（收到 \(maxLength)）"
+        }
+
         if text.count <= maxLength {
             return "原文较短，无需摘要:\n\(text)"
         }
@@ -998,7 +1323,7 @@ enum BuiltInTools {
             .filter { !$0.isEmpty }
         
         if sentences.isEmpty {
-            return "无法提取有效内容"
+            return "错误: 无法提取有效内容（文本里没有可分句的句子）"
         }
         
         // 简单的关键词提取和句子重要性评分
@@ -1065,8 +1390,15 @@ enum BuiltInTools {
     private static func executeNumberBase(arguments: [String: Any]) -> String {
         guard let value = (arguments["value"] as? String)?.trimmingCharacters(in: .whitespaces),
               !value.isEmpty else { return "错误: 缺少 value 参数" }
-        let from = (arguments["from"] as? String)?.lowercased() ?? "decimal"
-        let to = (arguments["to"] as? String)?.lowercased() ?? "hex"
+        // from/to 用 stringArgument 而不是 `as? String ?? 默认值`：模型把 from 写成数字 16 时，
+        // 老写法会静默按 decimal 解析 —— 输入 "FF" 于是报"无法按 decimal 解析"，
+        // 但真正的问题在参数类型，报错信息把模型引到了错误的方向。
+        let fromRead = stringArgument(arguments, "from", default: "decimal")
+        guard let fromRaw = fromRead.value else { return fromRead.error ?? "错误: 参数 from 无效" }
+        let toRead = stringArgument(arguments, "to", default: "hex")
+        guard let toRaw = toRead.value else { return toRead.error ?? "错误: 参数 to 无效" }
+        let from = fromRaw.lowercased()
+        let to = toRaw.lowercased()
         guard let fr = radixFor(name: from), let tr = radixFor(name: to) else {
             return "错误: from/to 必须是 decimal/binary/octal/hex 之一"
         }
@@ -1080,7 +1412,13 @@ enum BuiltInTools {
     // MARK: - 颜色转换
 
     private static func executeColorConvert(arguments: [String: Any]) -> String {
-        guard let mode = arguments["mode"] as? String else { return "错误: 缺少 mode 参数(to_hex/to_rgb)" }
+        // mode 只在最后那个 else 里兜底，等于"能执行的分支"和"可选值清单"各写一份；
+        // 改成前面就校验，错误信息里直接把可选值列全，模型不用猜。
+        let modeRead = enumeratedArgument(
+            arguments, "mode", label: "转换方向",
+            allowed: allowedValues(tool: "color_convert", parameter: "mode", fallback: ["to_hex", "to_rgb"]),
+            default: nil)
+        guard let mode = modeRead.value else { return modeRead.error ?? "错误: 缺少 mode 参数(to_hex/to_rgb)" }
         guard let value = (arguments["value"] as? String)?.trimmingCharacters(in: .whitespaces),
               !value.isEmpty else { return "错误: 缺少 value 参数" }
         if mode == "to_hex" {
@@ -1102,16 +1440,23 @@ enum BuiltInTools {
             let b = intVal & 0xFF
             return "\(r), \(g), \(b)"
         }
-        return "错误: mode 必须是 to_hex 或 to_rgb"
+        // enumeratedArgument 已经拦掉了非法 mode，这里只是防御：如果将来 allTools 里的
+        // enumValues 被改成包含了本函数没实现的值，也要报错而不是悄悄按 to_hex 处理。
+        return "错误: 未实现的 mode「\(mode)」（当前支持 to_hex / to_rgb）"
     }
 
     // MARK: - 文本排序
 
     private static func executeSortText(arguments: [String: Any]) -> String {
         guard let text = arguments["text"] as? String else { return "错误: 缺少 text 参数" }
-        let reverse = (arguments["reverse"] as? Bool) ?? false
-        let ignoreCase = (arguments["ignore_case"] as? Bool) ?? false
-        let dedup = (arguments["dedup"] as? Bool) ?? false
+        // 三个布尔参数原来都是 `as? Bool ?? false`：模型把 true 写成字符串 "true" 时
+        // 会静默变成 false —— 用户要求去重，结果原样返回，模型还回复"已去重"。
+        let reverseRead = boolArgument(arguments, "reverse", default: false)
+        guard let reverse = reverseRead.value else { return reverseRead.error ?? "错误: 参数 reverse 无效" }
+        let ignoreCaseRead = boolArgument(arguments, "ignore_case", default: false)
+        guard let ignoreCase = ignoreCaseRead.value else { return ignoreCaseRead.error ?? "错误: 参数 ignore_case 无效" }
+        let dedupRead = boolArgument(arguments, "dedup", default: false)
+        guard let dedup = dedupRead.value else { return dedupRead.error ?? "错误: 参数 dedup 无效" }
         var lines = text.components(separatedBy: .newlines)
         lines.sort {
             ignoreCase ? ($0.localizedCaseInsensitiveCompare($1) == .orderedAscending) : ($0 < $1)
@@ -1130,9 +1475,28 @@ enum BuiltInTools {
     private static func executeFindReplace(arguments: [String: Any]) -> String {
         guard let text = arguments["text"] as? String else { return "错误: 缺少 text 参数" }
         guard let find = arguments["find"] as? String else { return "错误: 缺少 find 参数" }
+        // 空 find 不是"替换不了"，而是"没定义要替换什么"：
+        // replacingOccurrences(of: "") 会原样返回文本，工具看起来成功了，其实什么都没做。
+        guard !find.isEmpty else {
+            return "错误: find 不能为空字符串（否则无法确定要替换的内容）"
+        }
         let replace = arguments["replace"] as? String ?? ""
-        let regex = (arguments["regex"] as? Bool) ?? false
-        let all = (arguments["all"] as? Bool) ?? true
+        let regexRead = boolArgument(arguments, "regex", default: false)
+        guard let regex = regexRead.value else { return regexRead.error ?? "错误: 参数 regex 无效" }
+        let allRead = boolArgument(arguments, "all", default: true)
+        guard let all = allRead.value else { return allRead.error ?? "错误: 参数 all 无效" }
+
+        // 返回里必须带替换计数：原来是"找不到就 return text"，用户看到的是一段没有任何说明的
+        // 原文，模型据此回复"已替换"。带上计数后，"0 处（未找到匹配）"会让模型和用户立刻
+        // 意识到 find 写错了（大小写、全半角、正则语法），而不是以为操作成功。
+        func report(_ count: Int, _ result: String, onlyFirst: Bool) -> String {
+            if count == 0 {
+                return "已替换 0 处（未找到匹配）\n\(result)"
+            }
+            let suffix = onlyFirst ? "（仅替换了首个匹配）" : ""
+            return "已替换 \(count) 处\(suffix)\n\(result)"
+        }
+
         if regex {
             guard let re = try? NSRegularExpression(pattern: find) else {
                 return "错误: 无效的正则「\(find)」"
@@ -1140,18 +1504,33 @@ enum BuiltInTools {
             let nsText = text as NSString
             let range = NSRange(location: 0, length: nsText.length)
             if all {
-                return re.stringByReplacingMatches(in: text, range: range, withTemplate: replace)
-            } else if let match = re.firstMatch(in: text, range: range) {
-                let result = re.replacementString(for: match, in: text, offset: 0, template: replace)
-                return nsText.replacingCharacters(in: match.range, with: result)
+                let count = re.numberOfMatches(in: text, options: [], range: range)
+                let result = re.stringByReplacingMatches(in: text, range: range, withTemplate: replace)
+                return report(count, result, onlyFirst: false)
             }
-            return text
-        } else if all {
-            return text.replacingOccurrences(of: find, with: replace)
-        } else if let r = text.range(of: find) {
-            return text.replacingCharacters(in: r, with: replace)
+            guard let match = re.firstMatch(in: text, range: range) else {
+                return report(0, text, onlyFirst: true)
+            }
+            let result = re.replacementString(for: match, in: text, offset: 0, template: replace)
+            return report(1, nsText.replacingCharacters(in: match.range, with: result), onlyFirst: true)
         }
-        return text
+
+        if all {
+            // 计数用不重叠匹配（与 replacingOccurrences 的行为一致），
+            // find 已在上面保证非空，所以不会出现空匹配导致的无限计数。
+            var count = 0
+            var searchStart = text.startIndex
+            while searchStart < text.endIndex,
+                  let r = text.range(of: find, range: searchStart..<text.endIndex) {
+                count += 1
+                searchStart = r.upperBound
+            }
+            return report(count, text.replacingOccurrences(of: find, with: replace), onlyFirst: false)
+        }
+        guard let r = text.range(of: find) else {
+            return report(0, text, onlyFirst: true)
+        }
+        return report(1, text.replacingCharacters(in: r, with: replace), onlyFirst: true)
     }
 
     // MARK: - 命名风格转换
@@ -1179,25 +1558,42 @@ enum BuiltInTools {
 
     private static func executeCaseConvert(arguments: [String: Any]) -> String {
         guard let text = arguments["text"] as? String, !text.isEmpty else { return "错误: 缺少 text 参数" }
-        guard let style = arguments["style"] as? String else { return "错误: 缺少 style 参数" }
+        // style 也走统一的枚举校验：原来 `as? String` 失败时报的是"缺少 style 参数"，
+        // 但参数其实传了（只是类型/拼写不对），错误信息把模型引向了错误的方向。
+        let styleRead = enumeratedArgument(
+            arguments, "style", label: "风格",
+            allowed: allowedValues(tool: "case_convert", parameter: "style", fallback: ["snake", "camel", "pascal", "kebab"]),
+            default: nil)
+        guard let style = styleRead.value else { return styleRead.error ?? "错误: 缺少 style 参数" }
         let words = splitIdentifier(text)
         switch style {
         case "snake":  return words.map { $0.lowercased() }.joined(separator: "_")
         case "kebab":  return words.map { $0.lowercased() }.joined(separator: "-")
         case "camel":  return words.enumerated().map { i, w in i == 0 ? w.lowercased() : w.capitalized }.joined()
         case "pascal": return words.map { $0.capitalized }.joined()
-        default: return "错误: style 必须是 snake/camel/pascal/kebab"
+        default: return "错误: 未实现的 style「\(style)」（当前支持 snake/camel/pascal/kebab）"
         }
     }
 
     // MARK: - 密码生成
 
     private static func executePasswordGenerate(arguments: [String: Any]) -> String {
-        let length = min(max((arguments["length"] as? NSNumber)?.intValue ?? 16, 4), 128)
-        let digits = (arguments["digits"] as? Bool) ?? true
-        let symbols = (arguments["symbols"] as? Bool) ?? true
-        let uppercase = (arguments["uppercase"] as? Bool) ?? true
-        let lowercase = (arguments["lowercase"] as? Bool) ?? true
+        let lengthRead = intArgument(arguments, "length", default: 16)
+        guard let rawLength = lengthRead.value else { return lengthRead.error ?? "错误: 参数 length 无效" }
+        // 越界仍然是"钳制"而不是报错：范围(4~128)是定义里就写明的，钳制后返回值里会回显
+        // 真正使用的长度（"生成密码（长度 N）"），模型看得到实际生效值，不算静默失败。
+        // 但"传了字符串 / 传了非数字"必须报错 —— 那种情况模型以为自己指定了长度。
+        let length = min(max(rawLength, 4), 128)
+        // 四个开关同理：`as? Bool ?? true` 会把 "false"（字符串）当成 true，
+        // 也就是用户明确要求"不要符号"，密码里照样出现符号。
+        let digitsRead = boolArgument(arguments, "digits", default: true)
+        guard let digits = digitsRead.value else { return digitsRead.error ?? "错误: 参数 digits 无效" }
+        let symbolsRead = boolArgument(arguments, "symbols", default: true)
+        guard let symbols = symbolsRead.value else { return symbolsRead.error ?? "错误: 参数 symbols 无效" }
+        let uppercaseRead = boolArgument(arguments, "uppercase", default: true)
+        guard let uppercase = uppercaseRead.value else { return uppercaseRead.error ?? "错误: 参数 uppercase 无效" }
+        let lowercaseRead = boolArgument(arguments, "lowercase", default: true)
+        guard let lowercase = lowercaseRead.value else { return lowercaseRead.error ?? "错误: 参数 lowercase 无效" }
         let lowers = "abcdefghijklmnopqrstuvwxyz"
         let uppers = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         let digs = "0123456789"
@@ -1306,9 +1702,11 @@ enum BuiltInTools {
     }
 
     private static func executeUnitConvert(arguments: [String: Any]) -> String {
-        guard let valueNum = (arguments["value"] as? NSNumber)?.doubleValue else {
-            return "错误: 缺少或无效 value 参数"
-        }
+        // 原来写的是 `(arguments["value"] as? NSNumber)?.doubleValue`：模型把数值写成字符串
+        // （"3.5"，很常见）就一律报"缺少或无效 value 参数"，模型只好换个说法再试一轮。
+        // requiredDoubleArgument 会接受数字字符串，只有真不是数字时才报错并回显原值。
+        let valueRead = requiredDoubleArgument(arguments, "value")
+        guard let valueNum = valueRead.value else { return valueRead.error ?? "错误: 缺少 value 参数" }
         guard let from = (arguments["from"] as? String)?.lowercased(), !from.isEmpty else {
             return "错误: 缺少 from 参数"
         }
@@ -1346,10 +1744,25 @@ enum BuiltInTools {
         guard !user.isEmpty else {
             return "错误: 未配置 SSH 用户名（请在设置中填写，或提供 user 参数）"
         }
-        let port = Int32((arguments["port"] as? NSNumber)?.intValue
-                         ?? (s.sshPort > 0 ? s.sshPort : 22))
+        let portRead = intArgument(arguments, "port", default: s.sshPort > 0 ? s.sshPort : 22)
+        guard let portValue = portRead.value else { return portRead.error ?? "错误: 参数 port 无效" }
+        guard (1...65535).contains(portValue) else {
+            return "错误: port 需在 1~65535 之间（收到 \(portValue)）"
+        }
+        let port = Int32(portValue)
 
-        let authArg = trimmed(arguments["auth_type"] as? String).lowercased()
+        // auth_type 原来用 `if authArg == "key" || ... else 走密码` 兜底：打成 "keys"、"公开密钥"
+        // 都会静默按密码认证走，然后报"密码为空" —— 真正的问题（认证方式拼错）被掩盖了，
+        // 模型会去补密码而不是改认证方式，白烧好几轮。这里未知取值直接报错。
+        // 声明里是 ["password","key"]，但历史实现还兼容 "privatekey"/"pem" 两种写法，
+        // 一并保留，避免既有提示词失效。
+        let authRead = enumeratedArgument(
+            arguments, "auth_type", label: "认证方式",
+            allowed: allowedValues(tool: "ssh", parameter: "auth_type", fallback: ["password", "key"])
+                + ["privatekey", "pem"],
+            default: "")
+        guard let authValue = authRead.value else { return authRead.error ?? "错误: 参数 auth_type 无效" }
+        let authArg = authValue.lowercased()
         let useKey: Bool
         if !authArg.isEmpty {
             useKey = (authArg == "key" || authArg == "privatekey" || authArg == "pem")
@@ -1390,7 +1803,15 @@ enum BuiltInTools {
         let output = outBuf.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
 
         if rc < 0 {
-            return "SSH 执行失败（错误码 \(rc)）: \(output)"
+            // 连接/认证层面的失败：以「错误: 」开头，上层才会把这一步标成 error（红色），
+            // 而不是当成一次"成功返回了一句话"的工具调用。
+            return "错误: SSH 执行失败（错误码 \(rc)）: \(output)"
+        }
+        if rc > 0 {
+            // 命令本身失败（退出码非 0）：也算失败，同样走错误通道，但把输出完整带上 ——
+            // 编译报错、grep 无匹配、diff 有差异这些都有用输出，不能丢。
+            // 注意区分措辞：连接是好的，失败的是远程命令，模型据此才知道该改命令而不是改主机。
+            return "错误: 远程命令退出码 \(rc)（SSH 连接正常）\n--- 输出 ---\n\(output)"
         }
         return "命令退出码: \(rc)\n--- 输出 ---\n\(output)"
     }
@@ -1402,6 +1823,14 @@ enum BuiltInTools {
         }
         // 输出截断保护:避免一次性 output 巨大撑爆上下文
         let raw = ShellSandbox.run(command)
+        // ShellSandbox.run 只返回文本、丢掉了退出码（`run` 内部是 (text, exitCode) 的，但没暴露），
+        // 所以这里能做的只有一条最保守的判断：模型自造了沙盒不支持的命令时，
+        // run 会返回 "未知命令: xxx"，加上「错误: 」前缀让上层标成失败。
+        // 更彻底的做法是让 ShellSandbox 暴露退出码，那属于 ShellSandbox.swift 的改动范围
+        //（本文件不允许改它），这里先处理最常见的一类失败，其余保持原样。
+        if raw.hasPrefix("未知命令:") {
+            return "错误: " + raw
+        }
         if raw.count > 4000 {
             return String(raw.prefix(4000)) + "\n…(输出过长，已截断)"
         }
@@ -1410,29 +1839,110 @@ enum BuiltInTools {
 
     // MARK: - v0.3.18 新增工具
 
+    /// 重定向链的守卫：URLSession 默认自己跟随 3xx，**跟随后的目标不会再经过入口校验**。
+    /// 这不是理论问题：入口校验放行了 https://example.com/r（公网合法域名），
+    /// 只要对面回一个 `302 Location: https://169.254.169.254/latest/meta-data/`，
+    /// 请求就会把云元数据（实例凭据）拉回来当成"网页内容"总结给用户 —— 入口的 SSRF 校验等于白做。
+    /// URLSession 没有"自动跟随但要回调校验"的开关，只能自己实现 delegate 逐跳放行。
+    private final class RedirectGuard: NSObject, URLSessionTaskDelegate {
+        /// delegate 回调跑在 URLSession 自己的后台队列上，而结果要在请求结束后由主流程读出来，
+        /// 所以这份可变状态必须加锁。盒子显式标成 `@unchecked Sendable`：
+        /// URLSessionTaskDelegate 隐含 Sendable，直接在 delegate 类里放可变属性会让 Swift 6
+        /// 报 "stored property is mutable" 警告 —— 我们用 NSLock 保证安全，
+        /// 需要显式声明才能把这个保证告诉编译器。
+        private final class ReasonBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var reason: String?
+
+            func record(_ value: String) {
+                lock.lock(); defer { lock.unlock() }
+                // 只记第一跳：链上可能连续被拦，但给用户看的原因保留最早的那个（最接近原始请求）
+                if reason == nil { reason = value }
+            }
+
+            var current: String? {
+                lock.lock(); defer { lock.unlock() }
+                return reason
+            }
+        }
+
+        private let box = ReasonBox()
+
+        var denialReason: String? { box.current }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let target = request.url else {
+                box.record("重定向目标缺少 URL")
+                completionHandler(nil)
+                return
+            }
+            if case .deny(let reason) = NetworkGuard.validate(target) {
+                box.record(reason)
+                // 传 nil = 不跟随这一跳。请求不会继续发出，数据也拿不到。
+                completionHandler(nil)
+                return
+            }
+            completionHandler(request)
+        }
+    }
+
     /// HTTP GET 抓取网页/API(仅 https;JSON 自动美化)
     private static func executeHTTPGet(arguments: [String: Any]) async -> String {
         guard let urlString = arguments["url"] as? String, !urlString.isEmpty else {
             return "错误: 缺少 url 参数"
         }
-        // 强制 https(ATS 默认允许;http 直接提示改用 https)
-        guard let lower = URL(string: urlString), lower.scheme?.lowercased() == "https" else {
-            return "错误: 仅支持 https URL(ATS 默认禁止明文 http)"
+        guard let url = URL(string: urlString) else {
+            return "错误: 无法解析 URL「\(urlString)」"
         }
-        let timeout = (arguments["timeout"] as? NSNumber)?.doubleValue ?? 15
-        var request = URLRequest(url: lower)
+        // 目的地校验（防 SSRF）：https 只是最低要求，127.0.0.1 / 10.x / 169.254.169.254 /
+        // localhost / 内网单标签主机名这些"看着像外网其实打内网"的地址必须在这里挡掉。
+        // 具体规则和理由见 Services/NetworkGuard.swift。
+        if case .deny(let reason) = NetworkGuard.validate(url) {
+            return "错误: \(reason)"
+        }
+        let timeoutRead = doubleArgument(arguments, "timeout", default: 15)
+        guard let timeout = timeoutRead.value else { return timeoutRead.error ?? "错误: 参数 timeout 无效" }
+        guard timeout > 0, timeout <= 300 else {
+            return "错误: timeout 需在 0~300 秒之间（收到 \(timeout)）"
+        }
+        var request = URLRequest(url: url)
         request.timeoutInterval = timeout
         request.setValue("LumenAI-Agent/0.3 (iOS Sandbox)", forHTTPHeaderField: "User-Agent")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
 
+        // 用带 delegate 的 session 代替 URLSession.shared：只有这样才能在每一跳 3xx 上重新校验。
+        // 用 .ephemeral 配置：不落盘 cookie/缓存（工具请求不该在设备上留下痕迹）。
+        let guardDelegate = RedirectGuard()
+        let session = URLSession(configuration: .ephemeral, delegate: guardDelegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
+            // 被拦下的重定向：URLSession 会把 3xx 响应原样返回，这里必须显式转成失败，
+            // 否则下面非 2xx 的分支会把这句"错误: HTTP 302"当成一次普通的 HTTP 失败，
+            // 看不出真正原因是"重定向去了不允许的地址"。
+            if let reason = guardDelegate.denialReason {
+                return "错误: 重定向到不允许的地址，已中止请求（\(reason)）"
+            }
             guard let http = response as? HTTPURLResponse else {
                 return "错误: 无效响应"
             }
             guard (200...299).contains(http.statusCode) else {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                return "HTTP \(http.statusCode): \(String(body.prefix(300)))"
+                // 非 2xx 必须走「错误: 」前缀并把状态码原因写清楚：
+                // 原来是 "HTTP 404: <正文>"，不以错误开头 → 上层标成成功，
+                // 模型于是把 404 页面的 HTML（"页面不存在"、"请开启 JavaScript"）
+                // 当作接口返回的内容总结给用户，编出根本不存在的"查询结果"。
+                let body = (String(data: data, encoding: .utf8) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let phrase = HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+                let preview = body.isEmpty ? "(响应正文为空)" : String(body.prefix(300))
+                return "错误: HTTP \(http.statusCode) \(phrase) — \(preview)"
             }
             // JSON 美化输出
             if let obj = try? JSONSerialization.jsonObject(with: data),
@@ -1443,7 +1953,11 @@ enum BuiltInTools {
             let text = String(data: data, encoding: .utf8) ?? "(非 UTF-8 内容,返回 \(data.count) 字节)"
             return text.count > 6000 ? String(text.prefix(6000)) + "\n…(内容过长，已截断)" : text
         } catch {
-            return "请求失败: \(error.localizedDescription)"
+            // 失败也要带「错误: 」前缀（原来只有 "请求失败: "）。
+            // 网络错误是**已经重试过一跳以上**的结果（比如重定向一被拒就中止），
+            // 上层必须能看出这是失败，否则模型会把 error.localizedDescription
+            // 当成抓回来的"网页内容"继续总结。
+            return "错误: 请求失败 — \(error.localizedDescription)"
         }
     }
 
@@ -1494,10 +2008,12 @@ enum BuiltInTools {
 
     /// JSON 取值(a.b.c 点路径 + [n] 下标)
     private static func executeJSONQuery(arguments: [String: Any]) -> String {
-        guard let json = arguments["json"] as? String,
-              let path = arguments["path"] as? String else {
-            return "错误: 缺少 json / path 参数"
-        }
+        // 原来两个参数捏在一个 guard 里报"缺少 json / path 参数"：模型只知道"少了东西"，
+        // 不知道是哪一个（更不知道是"没传"还是"类型错了"），下一轮照样可能漏同样的参数。
+        let jsonRead = requiredStringArgument(arguments, "json")
+        guard let json = jsonRead.value else { return jsonRead.error ?? "错误: 缺少 json 参数" }
+        let pathRead = requiredStringArgument(arguments, "path")
+        guard let path = pathRead.value else { return pathRead.error ?? "错误: 缺少 path 参数" }
         guard let data = json.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) else {
             return "错误: JSON 解析失败"
@@ -1552,7 +2068,14 @@ enum BuiltInTools {
         guard let value = arguments["value"] as? String, !value.isEmpty else {
             return "错误: 缺少 value 参数"
         }
-        let offsetHours = (arguments["timezone_offset"] as? NSNumber)?.intValue ?? 8
+        let offsetRead = intArgument(arguments, "timezone_offset", default: 8)
+        guard let offsetHours = offsetRead.value else { return offsetRead.error ?? "错误: 参数 timezone_offset 无效" }
+        // 范围检查不能省：原来 TimeZone(secondsFromGMT:) 失败会 `?? UTC` 静默改用 UTC，
+        // 但返回文本里仍然写着 "UTC+1000" —— 模型和用户都会以为按 UTC+1000 算过，
+        // 实际拿到的是 UTC 时间，差了好几天还看不出来。
+        guard (-12...14).contains(offsetHours) else {
+            return "错误: timezone_offset 需在 -12~14 小时之间（收到 \(offsetHours)）"
+        }
         var tz = TimeZone(identifier: "UTC")!
         if offsetHours != 0 {
             tz = TimeZone(secondsFromGMT: offsetHours * 3600) ?? TimeZone(identifier: "UTC")!
@@ -1609,7 +2132,10 @@ enum BuiltInTools {
         if let d = arguments["delimiter"] as? String, !d.isEmpty {
             delimiter = d == "\\t" ? "\t" : d
         }
-        let hasHeader = (arguments["header"] as? Bool) ?? true
+        // header 是布尔：模型发 "false"（字符串）时老写法会当成 true，
+        // 用户要的是"首行是数据"，结果首行被当成表头画了分隔线，数据少了一行。
+        let headerRead = boolArgument(arguments, "header", default: true)
+        guard let hasHeader = headerRead.value else { return headerRead.error ?? "错误: 参数 header 无效" }
 
         var rows: [[String]] = []
         for rawLine in text.components(separatedBy: .newlines) {

@@ -52,9 +52,59 @@ struct ChatMessage: Identifiable, Codable, Sendable {
         var title: String?
         var truncated: Bool = false
 
+        // MARK: - 可观测性字段（v0.3.51 新增，供上层填充）
+        //
+        // 为什么加：原来只有 id/name/arguments/result/status/title/truncated，
+        // 事后再看一条历史对话，**无法回答**"这次是哪个工具慢、哪个工具失败多、
+        // 失败到底是因为超时还是被用户拒绝还是沙盒拦了路径" —— status 只有
+        // complete/error 两态，error 的原因全被压进 result 字符串里，只能靠人读文本。
+        //
+        // 全部是 `Optional`（或带默认值），且都在 CodingKeys 里用 decodeIfPresent 解码：
+        // 老对话存档里没有这些键 → 解出 nil → **不会**解码失败。
+        // 反过来，新版本写出的多字段 JSON 被老版本 App 读到时，Codable 会忽略
+        // 未知键，所以向前兼容（新档能被旧版本打开，只是看不到这些信息）。
+
+        /// 工具开始执行的时刻（上层在发起调用前写入）
+        var startedAt: Date?
+        /// 工具结束的时刻（成功 / 失败 / 被拒绝都写）
+        var finishedAt: Date?
+        /// 执行耗时（毫秒）。优先取这个字段，缺失时 durationDescription 会用
+        /// startedAt/finishedAt 现算，所以上层只填时间戳也能看到耗时。
+        var durationMs: Int?
+        /// 进程/命令退出码：当前只有 `shell` 这类"真执行外部命令"的工具能给出
+        /// （ShellSandbox 的 (text, exitCode) 里就有）；纯网络/纯计算工具留 nil。
+        var exitCode: Int?
+        /// 机器可读的失败原因码，便于统计"失败原因分布"。
+        /// 建议取值（上层约定，别塞自由文本）："timeout" | "cancelled" | "denied"
+        /// （用户拒绝授权）| "sandbox_denied"（路径越界被沙盒拦下）| "not_found"
+        /// （工具不存在）| "invalid_args" | "network" | "unknown"。
+        var errorCode: String?
+
+        /// 耗时的人类可读描述，例："850ms" / "1.2s" / "2m3s"。
+        /// 没有 durationMs 时用 startedAt/finishedAt 现算；两者都没有则返回 nil
+        /// （UI 可以据此决定不显示耗时标签，而不是显示 "0ms" 误导用户）。
+        var durationDescription: String? {
+            let ms: Int
+            if let durationMs {
+                ms = durationMs
+            } else if let startedAt, let finishedAt {
+                ms = Int((finishedAt.timeIntervalSince(startedAt) * 1000).rounded())
+            } else {
+                return nil
+            }
+            if ms < 0 { return nil }                     // 时钟回拨等异常值：宁可不显示
+            if ms < 1000 { return "\(ms)ms" }
+            // 59.95s 起进位到分钟档，避免显示 "60.0s" 这种别扭的值；
+            // 分钟档先把总秒数四舍五入再拆，避免出现 "0m0s"
+            if ms < 59_950 { return String(format: "%.1fs", Double(ms) / 1000) }
+            let totalSeconds = Int((Double(ms) / 1000).rounded())
+            return "\(totalSeconds / 60)m\(totalSeconds % 60)s"
+        }
+
         /// Memberwise init: 给 AgentService / UI 等代码路径直接构造。
         /// status 默认 .complete（与旧行为一致，向上兼容）：
         /// 历史已保存的 toolCalls 全部走 decode(from:) → 不经此 init → 不受影响。
+        /// 新的可观测性参数都排在最后且都有默认值，所以现有调用点无需改动。
         init(
             id: String,
             name: String,
@@ -62,7 +112,12 @@ struct ChatMessage: Identifiable, Codable, Sendable {
             result: String? = nil,
             status: Status = .complete,
             title: String? = nil,
-            truncated: Bool = false
+            truncated: Bool = false,
+            startedAt: Date? = nil,
+            finishedAt: Date? = nil,
+            durationMs: Int? = nil,
+            exitCode: Int? = nil,
+            errorCode: String? = nil
         ) {
             self.id = id
             self.name = name
@@ -71,11 +126,18 @@ struct ChatMessage: Identifiable, Codable, Sendable {
             self.status = status
             self.title = title
             self.truncated = truncated
+            self.startedAt = startedAt
+            self.finishedAt = finishedAt
+            self.durationMs = durationMs
+            self.exitCode = exitCode
+            self.errorCode = errorCode
         }
 
         // 显式 Codable：旧存档没有 status/title/truncated，用 decodeIfPresent 兜底
         private enum CodingKeys: String, CodingKey {
             case id, name, arguments, result, status, title, truncated
+            // 可观测性字段（v0.3.51 新增）
+            case startedAt, finishedAt, durationMs, exitCode, errorCode
         }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -88,6 +150,14 @@ struct ChatMessage: Identifiable, Codable, Sendable {
             self.status = Status(rawValue: raw) ?? .complete
             self.title = try c.decodeIfPresent(String.self, forKey: .title)
             self.truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+            // 旧存档没有这五个键 → decodeIfPresent 返回 nil → 不抛错，旧对话照常打开。
+            // （这就是为什么不能用合成的 init(from:)：合成实现把每个非 Optional 字段
+            //   当必填，缺键直接抛 keyNotFound，配合上层的 `try?` 会静默吞掉整份历史。）
+            self.startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt)
+            self.finishedAt = try c.decodeIfPresent(Date.self, forKey: .finishedAt)
+            self.durationMs = try c.decodeIfPresent(Int.self, forKey: .durationMs)
+            self.exitCode = try c.decodeIfPresent(Int.self, forKey: .exitCode)
+            self.errorCode = try c.decodeIfPresent(String.self, forKey: .errorCode)
         }
         func encode(to encoder: Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
@@ -98,6 +168,12 @@ struct ChatMessage: Identifiable, Codable, Sendable {
             try c.encode(status.rawValue, forKey: .status)
             try c.encodeIfPresent(title, forKey: .title)
             try c.encode(truncated, forKey: .truncated)
+            // 全部用 encodeIfPresent：为 nil 时不写键，旧档写回去也不会多出 null 噪音
+            try c.encodeIfPresent(startedAt, forKey: .startedAt)
+            try c.encodeIfPresent(finishedAt, forKey: .finishedAt)
+            try c.encodeIfPresent(durationMs, forKey: .durationMs)
+            try c.encodeIfPresent(exitCode, forKey: .exitCode)
+            try c.encodeIfPresent(errorCode, forKey: .errorCode)
         }
     }
 

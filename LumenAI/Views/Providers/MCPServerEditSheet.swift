@@ -82,6 +82,9 @@ struct MCPServerEditSheet: View {
             tools: existing?.tools ?? [],
             sessionID: existing?.sessionID,
             lastError: existing?.lastError,
+            // 保留状态说明：编辑一次不该把「已断开」「已连接（无工具）」这类
+            // 正常状态文案清掉（MCPService 刚把状态与错误拆开，这里要对齐）。
+            statusNote: existing?.statusNote,
             createdAt: existing?.createdAt ?? Date()
         )
         store.upsert(server)

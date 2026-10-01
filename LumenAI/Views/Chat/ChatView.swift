@@ -38,13 +38,17 @@ struct ChatView: View {
     @FocusState private var inputFocused: Bool
 
     /// 工具授权弹窗：当 AgentService 解析到 requiresApproval=true 的工具时挂起等用户决策。
-    /// 阻断式 alert：等用户按"允许/拒绝"前，AgentService.run() 在 await bridge.requestApproval 阻塞。
+    /// 阻断式 alert：等用户按「允许 / 本会话内总是允许 / 拒绝」前，AgentService.run() 在
+    /// await bridge.requestApproval 阻塞。
+    /// 三态而不是 Bool 的原因：同一个副作用工具在一次 agent 任务里常被调用多次，
+    /// 只有「允许/拒绝」就意味着弹窗也来 N 次 —— 用户到第三次会开始无脑点「允许」，
+    /// 审批反而失去了把关作用。见 AgentService.ApprovalDecision。
     @State private var pendingApproval: PendingApproval?
 
     struct PendingApproval: Identifiable {
         let id = UUID()
         let call: ChatMessage.ToolCall
-        let continuation: CheckedContinuation<Bool, Never>
+        let continuation: CheckedContinuation<ApprovalDecision, Never>
     }
 
     /// Agent 模式下整个 agent run() 周期共享同一个 assistant 气泡 id。
@@ -141,22 +145,41 @@ struct ChatView: View {
                     get: { pendingApproval != nil },
                     set: { if !$0 {
                         // 自动关闭（如返回上一级）= 拒绝，避免 AgentService 永久阻塞
-                        pendingApproval?.continuation.resume(returning: false)
+                        pendingApproval?.continuation.resume(returning: .deny)
                         pendingApproval = nil
                     } }
                 )
             ) {
                 Button("拒绝", role: .destructive) {
-                    pendingApproval?.continuation.resume(returning: false)
+                    pendingApproval?.continuation.resume(returning: .deny)
+                    pendingApproval = nil
+                }
+                // 本会话内总是允许：消掉「同一个工具在循环里被反复弹窗」造成的审批疲劳。
+                // 作用域是 AgentService 本次 run（一个 agent 任务），不是整个对话 ——
+                // 理由见 AgentService.run 里 runApprovedTools 的注释（对话级授权会让
+                // 被注入污染过的上下文拥有静默触发副作用工具的能力）。
+                Button("本会话内总是允许") {
+                    pendingApproval?.continuation.resume(returning: .alwaysForSession)
                     pendingApproval = nil
                 }
                 Button("允许") {
-                    pendingApproval?.continuation.resume(returning: true)
+                    pendingApproval?.continuation.resume(returning: .once)
                     pendingApproval = nil
                 }
             } message: {
                 if let pending = pendingApproval {
-                    Text("此工具会运行真实操作（SSH / MCP 等），是否授权?\n\n参数:\n\(prettyArgumentsForApproval(pending.call.arguments))")
+                    // 工具名单独列一行（原来只在标题里，标题过长时会被截断），参数用缩进 JSON 展示；
+                    // lineLimit 限制弹窗高度：参数很长时 alert 会被撑破、按钮被挤出屏幕点不到。
+                    // 完整参数仍可在气泡里的工具 chip 中展开查看。
+                    Text("""
+                    此工具会运行真实操作（SSH / MCP 等），是否授权?
+
+                    工具: \(pending.call.name)
+
+                    参数:
+                    \(prettyArgumentsForApproval(pending.call.arguments))
+                    """)
+                    .lineLimit(16)
                 }
             }
         }
@@ -737,9 +760,11 @@ struct ChatView: View {
                         finalizeMessage(id: id)
                     },
                     requestApproval: { _, call in
-                        // 阻塞等用户在 chat 里点"允许/拒绝"。@MainActor self 才能写 @State。
-                        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                        // 阻塞等用户在 chat 里点「允许 / 本会话内总是允许 / 拒绝」。
+                        // @MainActor self 才能写 @State。
+                        await withCheckedContinuation { (cont: CheckedContinuation<ApprovalDecision, Never>) in
                             // setState 派发到 main；cont 只在用户点按钮时 resume 一次
+                            // （弹窗被系统关掉的情形走 alert 的 set(false) 分支，同样会 resume，不会泄漏）
                             pendingApproval = PendingApproval(call: call, continuation: cont)
                         }
                     }

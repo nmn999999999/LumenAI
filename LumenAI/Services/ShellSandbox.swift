@@ -18,25 +18,143 @@ enum ShellSandbox {
         return root
     }()
 
-    /// 当前工作目录(每次 process 重置;AgentService 跨调用可保留)
-    nonisolated(unsafe) static var cwd: String = sandboxRoot
+    // MARK: - 会话状态(cwd / env / history):统一由一把锁保护
 
-    /// 简单会话环境(export 写入的变量)
-    nonisolated(unsafe) static var env: [String: String] = [
-        "HOME": sandboxRoot,
-        "USER": "mobile",
-        "PWD": sandboxRoot,
-        "SHELL": "LumenAI-SandboxShell",
-        "PATH": "/bin:/usr/bin"  // 虚拟 PATH,本沙箱内置命令等价于"在 PATH 中"
-    ]
+    /// 保护 `cwd` / `env` / `history` 的锁。
+    ///
+    /// 为什么非加不可:这三者原来是 `nonisolated(unsafe) static var`,
+    /// 等于"向编译器承诺我自己保证线程安全",但代码里没有任何同步措施 —— 承诺是空的。
+    /// 这不是理论风险:调用方 AgentTool.executeShell 在**非隔离 async 上下文**里
+    /// 同步调用 `run`,多个对话 / 多个 Task 可以真的并发进来。
+    /// 原来的后果:
+    ///  - `history.append(...)` / `history.removeFirst(...)` / `env[k] = v` 全是"读-改-写",
+    ///    Swift 的 Array / Dictionary 是值类型(COW),并发执行时不是原子的:
+    ///    轻则丢更新(刚跑过的命令没进历史),重则两线程同时复制/释放同一块缓冲区
+    ///    → 内存错误崩溃(EXC_BAD_ACCESS,线上表现为随机闪退且极难复现)。
+    ///  - `cd` 写 cwd 与 `resolvePath` 读 cwd 并发 → 相对路径可能被解析到别人的 cwd 下。
+    /// 现在:所有读写都经过同一把 NSLock,达到的最低保证是**无数据竞争**。
+    /// ⚠️ 这把锁只保证内存安全,不保证"会话隔离" —— 见下面 resetSession() 的说明。
+    private static let stateLock = NSLock()
 
-    /// 命令历史(v0.3.19:history 命令读取;重复命令去重,上限 200)
-    nonisolated(unsafe) static var history: [String] = []
+    /// 会话初始环境(export 会在这份基础上叠加)
+    private static func defaultEnv() -> [String: String] {
+        [
+            "HOME": sandboxRoot,
+            "USER": "mobile",
+            "PWD": sandboxRoot,
+            "SHELL": "LumenAI-SandboxShell",
+            "PATH": "/bin:/usr/bin"  // 虚拟 PATH,本沙箱内置命令等价于"在 PATH 中"
+        ]
+    }
+
+    // 下面是受 stateLock 保护的真实存储(私有);对外仍是 cwd / env / history 三个名字,
+    // 名字与类型保持不变,所以其它文件(agentTool 等)即使读它们也不会编译失败。
+    private nonisolated(unsafe) static var _cwd: String = sandboxRoot
+    private nonisolated(unsafe) static var _env: [String: String] = defaultEnv()
+    private nonisolated(unsafe) static var _history: [String] = []
+
+    /// 当前工作目录(加锁读写)。
+    /// ⚠️ 语义提醒:它是**进程级单例**,不区分对话 —— 一个对话里的 `cd` 会影响
+    /// 其它对话的相对路径解析(跨对话泄漏)。上层应在每次新对话开始时调用
+    /// `resetSession()`;想真正隔离必须按会话分片存储(需改调用方签名,本次没做)。
+    static var cwd: String {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _cwd }
+        set { stateLock.lock(); defer { stateLock.unlock() }; _cwd = newValue }
+    }
+
+    /// 简单会话环境(export 写入的变量)。
+    /// 注意:`env["K"] = v` 这种写法会走 get + set **两次加锁**,
+    /// 两次加锁之间可能被其它线程插入而丢更新,所以本文件内部一律改用
+    /// `setEnvVar(_:_:)` / `updateCwd(_:)` 这类"在锁内一次性完成读-改-写"的辅助函数。
+    static var env: [String: String] {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _env }
+        set { stateLock.lock(); defer { stateLock.unlock() }; _env = newValue }
+    }
+
+    /// 命令历史(v0.3.19:history 命令读取;追加去重与 200 上限见 appendHistory)
+    static var history: [String] {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _history }
+        set { stateLock.lock(); defer { stateLock.unlock() }; _history = newValue }
+    }
+
+    /// 在锁内完成 env 的单键读-改-写(避免 get/set 两次加锁之间丢更新)
+    private static func setEnvVar(_ key: String, _ value: String) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        _env[key] = value
+    }
+
+    /// 在锁内同时更新 cwd 与 PWD —— 两者语义上必须一致,
+    /// 分开加锁会出现"cwd 已经换了、PWD 还是旧的"的中间态,`cd` 之后 `env` 输出会自相矛盾。
+    private static func updateCwd(_ path: String) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        _cwd = path
+        _env["PWD"] = path
+    }
+
+    /// 在锁内追加一条命令历史并裁剪到 200 条上限(原来是两步读-改-写,并发下会丢条目)
+    private static func appendHistory(_ line: String) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        _history.append(line)
+        if _history.count > 200 { _history.removeFirst(_history.count - 200) }
+    }
+
+    // MARK: - 资源上限(把"跑不完 / 吃光内存"变成"有界")
+
+    /// 单条命令链返回内容的上限(字符数)。
+    /// 为什么需要:调用方 AgentTool.executeShell 是在**拿到完整字符串之后**才
+    /// `prefix(4000)`,也就是说内存里已经先构造过一遍完整输出;
+    /// 本上限保证沙盒自己不会构造出无界字符串。
+    static let maxOutputCharacters = 200_000
+
+    /// 单次 `cat` 从文件读取的总字节上限(`cat` 一个几百 MB 的日志原来会直接 OOM)
+    private static let maxFileReadBytes = 4 * 1024 * 1024
+
+    /// `find` / `du` 目录遍历的条目总数上限与深度上限
+    private static let maxWalkEntries = 20_000
+    private static let maxWalkDepth = 6
+
+    /// tokenize / 链切分的迭代步数上限(纯防御:现有循环都会推进,
+    /// 这里加一道闸,防止以后改动引入"不推进 i"的分支变成死循环占住线程)
+    private static let maxParseIterations = 1_000_000
+
+    /// 输出上限截断(统一在同步入口出口处调用)
+    private static func capOutput(_ text: String) -> String {
+        guard text.count > maxOutputCharacters else { return text }
+        return String(text.prefix(maxOutputCharacters))
+            + "\n…(沙箱输出超过 \(maxOutputCharacters) 字符上限，已截断)"
+    }
 
     /// 同步入口:执行一条 shell 命令字符串,返回标准输出
+    ///
+    /// ⚠️ 这个入口**做不到超时**(如实说明,不要当作已有保护):
+    /// 它是同步阻塞实现,一旦进入"读大文件"或长时间运算,调用方只能等它跑完 ——
+    /// 同步调用没有取消点,外面套 `Task` / `async` 都无法打断正在执行的这一帧,
+    /// `Task.cancel()` 也无效。本文件能做的只有"让单条命令有界":
+    ///   - 输出上限(maxOutputCharacters)
+    ///   - 单次读文件上限(maxFileReadBytes)
+    ///   - 目录遍历上限(maxWalkEntries / maxWalkDepth)
+    ///   - 解析循环迭代上限(maxParseIterations,防御性)
+    /// 真正的超时只能由调用方实现:用 `withTaskGroup` 让"命令"与 `Task.sleep` 竞速,
+    /// 或者改调本文件的 `runAsync(_:timeoutSeconds:)`(超时后调用方不再等待,
+    /// 但**不能**让已经在跑的命令停下 —— 见其注释)。
+    /// 另外:同步入口还会长时间占用 Swift 并发协作线程池的一个线程(iPhone 上该池
+    /// 宽度≈核数),所以新代码应优先用 runAsync。
     static func run(_ input: String) -> String {
+        runWithExitCode(input).text
+    }
+
+    /// 与 `run` 完全同逻辑,额外返回命令链**最后一段**的退出码(0=成功)。
+    ///
+    /// 为什么需要:`run` 只返回文本,上层(AgentTool.executeShell)拿不到退出码,
+    /// 于是 `ChatMessage.ToolCall.exitCode` 永远填不进去 —— "哪个工具失败多、
+    /// 失败是命令本身失败还是沙盒拒绝"这类问题就答不了。
+    /// 这里只是把内部本来就有的 lastExit 暴露出来,不改动 `run` 的签名与行为
+    /// (调用方在别的文件,签名必须保持稳定)。
+    /// ⚠️ 局限:退出码只反映最后一段(`;` / `&&` / `|` 链的最后一段);多段命令
+    /// 中前面某段的失败不会体现在这里,与真实 shell 的 `$?` 语义一致,不要过度解读。
+    static func runWithExitCode(_ input: String) -> (text: String, exitCode: Int) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
+        guard !trimmed.isEmpty else { return ("", 0) }
         // 支持 && 和 || 链(简单优先匹配)
         let segments = splitByChaining(trimmed)
         var output = ""
@@ -56,7 +174,96 @@ enum ShellSandbox {
                 lastExit = res.exitCode
             }
         }
-        return output
+        return (capOutput(output), lastExit)
+    }
+
+    // MARK: - 异步入口(推荐的新代码走这里,避免占住 Swift 并发协作线程池)
+
+    /// 沙盒专用的执行队列:承载**同步阻塞**的 `run`。
+    ///
+    /// 为什么不用 `DispatchQueue.global()`:global 是全局共享队列,
+    /// 长任务会跟其它模块抢同一批线程,还可能互相饿死;用一条本模块专属队列,
+    /// 至少把"沙盒在阻塞"这件事限制在自己这口锅里。
+    /// 为什么用 `.concurrent` 而不是串行队列:串行会让"某个对话的一条慢命令"
+    /// 挡住**所有**其它对话的 shell 命令,而 cwd 泄漏问题并不会因此消失
+    /// (那是"单份全局状态"的问题,不是并发度的问题)。这里只解决
+    /// "不要把协作线程池的线程长期占住"这一件事。
+    private static let execQueue = DispatchQueue(
+        label: "com.lumenai.shellsandbox.exec",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    /// 保证 continuation 只被 resume 一次("命令跑完"与"超时"谁先到谁赢)。
+    /// CheckedContinuation 被 resume 两次会直接 crash,所以必须用锁守一道。
+    private final class OnceFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fired = false
+        func fireOnce(_ body: () -> Void) {
+            lock.lock(); defer { lock.unlock() }
+            guard !fired else { return }
+            fired = true
+            body()
+        }
+    }
+
+    /// 异步包装:把同步执行挪到专用队列,让 Swift 并发协作线程池不被长期占用
+    /// (iPhone 上协作池宽度≈核数,一条 `cat 大文件` 就能占掉其中一个)。
+    ///
+    /// ⚠️ 局限(如实说明,别当成"已经有超时了"):
+    /// 1) 底层 `run` 仍是同步阻塞实现,进入后**没有取消点**:本包装只是
+    ///    "不阻塞调用方所在的执行器",并不会让命令变快,`Task.cancel()` 也停不下它。
+    /// 2) 传了 `timeoutSeconds` 时,超时的含义是"调用方不再等待":
+    ///    被放弃的那条命令仍会在 execQueue 上跑完(继续占一个线程);
+    ///    想要"真的中断执行",必须把沙盒改写成可中断的分步实现(每一步检查取消),
+    ///    工作量较大,本次没做。
+    /// 3) 现状:调用方 AgentTool.executeShell 用的**仍是同步 `run`**,
+    ///    所以线上没有任何超时保护 —— 要生效必须由上层改调本函数或自己做竞速,
+    ///    而那个文件不在本次允许修改的范围内。
+    static func runAsync(_ input: String, timeoutSeconds: Double? = nil) async -> String {
+        await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            let once = OnceFlag()
+            execQueue.async {
+                let out = run(input)
+                once.fireOnce { cont.resume(returning: out) }
+            }
+            if let timeoutSeconds, timeoutSeconds > 0 {
+                Task.detached(priority: .utility) {
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    once.fireOnce {
+                        cont.resume(returning: "(shell 超时:命令在 \(timeoutSeconds)s 内未返回，已放弃等待；该命令的后台执行仍可能继续)\n")
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 会话状态重置
+
+    /// 重置"会话级"状态:cwd / PWD 回沙盒根、export 的环境变量清空、命令历史清空。
+    ///
+    /// 谁该调用:上层(AgentService / ChatView 等)在**每次新对话开始时**调用一次。
+    /// 本次改动**没有在任何地方调用它** —— 调用方都在不允许修改的文件里。
+    ///
+    /// 为什么需要它(cwd 到底该不该跨对话保留):
+    /// `cwd` 是进程级单例,不区分对话。于是对话 A 执行 `cd sub` 之后,
+    /// 对话 B 的 `cat a.txt` 会在 `<root>/sub` 下解析;A 把 cwd 切到某个深层目录后,
+    /// B 的 `rm -r .` / `ls` 的目标也跟着变 —— 跨对话状态泄漏,既难排查也危险。
+    /// 所以语义上 cwd **不该**跨对话保留;但不能简单地去掉它(同一条命令链里的
+    /// `cd x ; cat y` 就是要共享 cwd),折中方案就是这个显式重置入口。
+    ///
+    /// ⚠️ 局限(不要声称已经做到会话隔离):这只是"泄漏之后能被补救",
+    /// **不是真正的会话隔离**。真正隔离需要把状态按会话 id 分片,即把入口改成
+    /// `run(_:session:)` 之类的签名 —— 那要同时改调用方 AgentTool.executeShell,
+    /// 不在本次允许的修改范围内。在没人调用本函数之前,cwd/env/history 依然
+    /// 是全局共享的;本次改动只保证了**无数据竞争**(见 stateLock 注释)。
+    /// 另外:`reset()` 是旧的测试辅助函数,只重置 cwd/PWD 且保留历史与 export 变量,
+    /// 新代码请用本函数。
+    static func resetSession() {
+        stateLock.lock(); defer { stateLock.unlock() }
+        _cwd = sandboxRoot
+        _env = defaultEnv()
+        _history = []
     }
 
     private enum ChainCond { case none, and, or }
@@ -67,7 +274,11 @@ enum ShellSandbox {
         var current = ""
         var pending: ChainCond = .none
         var i = s.startIndex
+        // 迭代步数闸(防御性):现有分支都会推进 i,这里保证即使以后改错也不会死循环
+        var steps = 0
         while i < s.endIndex {
+            steps += 1
+            if steps > maxParseIterations { break }
             // 检查 &&
             if s[i...].hasPrefix("&&") {
                 out.append((pending, current.trimmingCharacters(in: .whitespaces)))
@@ -172,7 +383,10 @@ enum ShellSandbox {
     /// 真正分派:从已 tokenize 的 argv 数组展开通配符,调用对应 builtin
     private static func dispatch(tokens: [String], stdin: String) -> (text: String, exitCode: Int) {
         // 取出环境变量 $VAR 替换(只支持 $FOO, 不支持 ${FOO})
-        let expanded = tokens.map { expandEnvVars($0) }
+        // 在锁内取一次快照再逐 token 展开:否则每个 token 都会单独读一次 env,
+        // 同一个命令里可能出现"前半段用旧值、后半段用新值"的不一致结果
+        let envSnapshot = env
+        let expanded = tokens.map { expandEnvVars($0, env: envSnapshot) }
         guard let cmd = expanded.first, !cmd.isEmpty else { return ("", 0) }
         var args = Array(expanded.dropFirst())
 
@@ -191,9 +405,10 @@ enum ShellSandbox {
     /// 内置命令分派
     private static func execBuiltin(_ cmd: String, args: [String], stdin: String) -> (text: String, exitCode: Int) {
         // 记录 history(重复命令去重,上限 200)
+        // 走 appendHistory:原来的 "append + 判断 count + removeFirst" 是三步读-改-写,
+        // 多 Task 并发时既可能丢条目也可能越界,现在整段在锁内完成
         if !cmd.isEmpty && cmd != "history" {
-            history.append(cmd + (args.isEmpty ? "" : " " + args.joined(separator: " ")))
-            if history.count > 200 { history.removeFirst(history.count - 200) }
+            appendHistory(cmd + (args.isEmpty ? "" : " " + args.joined(separator: " ")))
         }
         switch cmd {
         case "ls":       return lsCmd(args)
@@ -341,21 +556,40 @@ enum ShellSandbox {
 
     /// 把 `~/foo` 解析为 sandboxRoot/foo;把相对路径解析为 cwd 下
     private static func resolvePath(_ raw: String) -> String {
-        if raw == "~" { return sandboxRoot }
-        if raw.hasPrefix("~/") {
-            return sandboxRoot + String(raw.dropFirst(2))
+        let candidate: String
+        if raw == "~" {
+            candidate = sandboxRoot
+        } else if raw.hasPrefix("~/") {
+            candidate = sandboxRoot + String(raw.dropFirst(2))
+        } else if raw.hasPrefix("/") {
+            candidate = raw
+        } else {
+            candidate = (cwd as NSString).appendingPathComponent(raw)
         }
-        if raw.hasPrefix("/") {
-            // 绝对路径也限制在 sandboxRoot:越界路径重映射到 sandboxRoot
-            if raw.hasPrefix(sandboxRoot) { return raw }
-            // 拒绝越界并落到 sandboxRoot
-            return sandboxRoot + raw
-        }
-        return (cwd as NSString).appendingPathComponent(raw)
+
+        // ⚠ 必须先归一化再做前缀校验，否则沙盒是假的。
+        // 原实现直接把拼好的字符串返回，两个洞：
+        //  1) `appendingPathComponent` **不做 `..` 归一化** —— `cat ../mcp-servers.json`
+        //     会由文件系统展开 `..`，读到沙盒外的 Documents/（对话记录、笔记、MCP 配置）；
+        //     再往上 `../../Library/Preferences/<bundle>.plist` 就是含 SSH 私钥/密码的
+        //     ModelSettings。`rm -r ..` 更糟：路径是 `<root>/..` ≠ sandboxRoot，
+        //     rmCmd 里那句"禁止删除沙盒根"的守卫根本不触发 → 删掉整个 Documents/。
+        //  2) 绝对路径那句 `raw.hasPrefix(sandboxRoot)` 没有结尾斜杠，
+        //     `/…/shellboxEVIL` 会被误判成"在沙盒内"。
+        // 现在：先 standardizingPath 折叠 `..` 与多余分隔符，再用 `<root>/` 前缀判定。
+        let root = (sandboxRoot as NSString).standardizingPath
+        let normalized = (candidate as NSString).standardizingPath
+        if normalized == root { return root }
+        if normalized.hasPrefix(root + "/") { return normalized }
+        // 越界一律落回沙盒根（而不是"重映射"出一个形如 root+/etc/passwd 的怪路径）。
+        // 保留"不报错"的行为是为了不改动每个命令的签名；真正的拒绝语义（返回错误）
+        // 需要把 resolvePath 改成可失败，属于后续重构。
+        return root
     }
 
     /// `$FOO` 和 `$` 全部展开为 env 中的值(找不到则原样保留)
-    private static func expandEnvVars(_ s: String) -> String {
+    /// `env` 参数由调用方一次性取好快照传入(见 dispatch),保证同一条命令看到的是同一份环境
+    private static func expandEnvVars(_ s: String, env: [String: String]) -> String {
         var out = s
         // 先展开 $FOO
         let pattern = #"\$([A-Za-z_][A-Za-z0-9_]*)"#
@@ -384,7 +618,11 @@ enum ShellSandbox {
         var current = ""
         var inQuote: Character? = nil
         var i = s.startIndex
+        // 迭代步数闸(防御性):同 splitByChaining,防止以后引入不推进 i 的分支
+        var steps = 0
         while i < s.endIndex {
+            steps += 1
+            if steps > maxParseIterations { break }
             let ch = s[i]
             // 检测 `&&` 和 `||` 优先
             if inQuote == nil, i < s.index(s.endIndex, offsetBy: -1, limitedBy: s.startIndex) ?? s.endIndex {
@@ -577,12 +815,41 @@ enum ShellSandbox {
             return (stdin, stdin.isEmpty ? 1 : 0)
         }
         var out = ""
+        // 读取预算:原来对每个文件直接 `Data(contentsOf:)`,等于把整个文件读进内存
+        // —— `cat` 一个几百 MB 的日志会瞬间吃掉大量内存(iOS 上直接被 jetsam 杀进程),
+        // 而且它**不会报错**,只是让 App 消失。现在按剩余预算截断读取。
+        // 注:预算(4MB)故意大于输出上限(200k 字符),因为 `cat 大文件 | wc -l`
+        // 这类管道需要尽量完整的输入,而输出上限由 capOutput 单独负责。
+        // 副作用(如实说明):当被截断的内容本身又超过 maxOutputCharacters 时,
+        // 下面这句"仅显示前部"的提示会先被 capOutput 截掉,用户看到的只是
+        // capOutput 的统一截断提示(提示仍然存在,只是不区分是哪个文件)。
+        var budget = maxFileReadBytes
         for f in args {
             let p = resolvePath(f)
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: p)) else {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: p),
+                  let size = (attrs[.size] as? NSNumber)?.intValue else {
                 return ("cat: \(f): 无法读取\n", 1)
             }
-            out += String(data: data, encoding: .utf8) ?? ""
+            if size <= budget {
+                guard let data = try? Data(contentsOf: URL(fileURLWithPath: p)) else {
+                    return ("cat: \(f): 无法读取\n", 1)
+                }
+                budget -= data.count
+                out += String(data: data, encoding: .utf8) ?? ""
+            } else {
+                // 大文件:只读前 budget 字节(FileHandle 按需读,不会整文件进内存)
+                guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: p)) else {
+                    return ("cat: \(f): 无法读取\n", 1)
+                }
+                defer { try? handle.close() }
+                let data = (try? handle.read(upToCount: max(0, budget))) ?? Data()
+                budget -= data.count
+                // 截断点可能落在多字节 UTF-8 字符中间 → 用 lossy 解码,
+                // 而不是 String(data:encoding:) 失败后返回空字符串
+                out += String(decoding: data, as: UTF8.self)
+                out += "\n…(cat: \(f) 共 \(size) 字节，超过沙箱单次读取上限，仅显示前部)"
+            }
+            if budget <= 0 { break }
         }
         return (out, 0)
     }
@@ -609,8 +876,11 @@ enum ShellSandbox {
         let paths = args.filter { !($0.hasPrefix("-")) }.map { resolvePath($0) }
         let fm = FileManager.default
         for p in paths {
-            // 安全:禁止删除沙盒根
-            if p == sandboxRoot || p == NSHomeDirectory() {
+            // 安全:禁止删除沙盒根（以及沙盒根的父目录）。
+            // 注：`p` 已由 resolvePath 归一化，所以 `..` 这类写法不会再绕过这里；
+            // 额外补上"父目录"是因为沙盒根就在 Documents 下，删掉它等于删掉全部用户数据。
+            let parent = (p as NSString).deletingLastPathComponent
+            if p == sandboxRoot || p == NSHomeDirectory() || parent == NSHomeDirectory() {
                 return ("rm: 拒绝删除沙盒根目录 \(p)\n", 1)
             }
             do {
@@ -874,11 +1144,17 @@ enum ShellSandbox {
         }
         let fm = FileManager.default
         var results: [String] = []
-        // 递归遍历(限制深度 6 防止海量输出)
+        // 递归遍历(限制深度防止海量输出)。
+        // 追加"条目总数上限":原来只限深度,一棵又宽又深的树(或几十万个小文件)
+        // 依然能构造出巨大数组并占住线程很久 —— 深度有界 ≠ 工作量有界。
+        var visited = 0
+        var hitLimit = false
         func walk(_ path: String, depth: Int) {
-            guard depth <= 6 else { return }
+            guard depth <= maxWalkDepth, !hitLimit else { return }
             guard let entries = try? fm.contentsOfDirectory(atPath: path) else { return }
             for e in entries.sorted() {
+                if visited >= maxWalkEntries { hitLimit = true; return }
+                visited += 1
                 let full = (path as NSString).appendingPathComponent(e)
                 var isDir: ObjCBool = false
                 if fm.fileExists(atPath: full, isDirectory: &isDir) {
@@ -897,15 +1173,22 @@ enum ShellSandbox {
             }
         }
         walk(dir, depth: 0)
-        return (results.joined(separator: "\n") + (results.isEmpty ? "" : "\n"), 0)
+        var text = results.joined(separator: "\n") + (results.isEmpty ? "" : "\n")
+        if hitLimit {
+            text += "…(find: 遍历条目超过 \(maxWalkEntries) 上限，结果已截断)\n"
+        }
+        return (text, 0)
     }
 
     /// history 命令
     private static func historyCmd(_ args: [String]) -> (text: String, exitCode: Int) {
         let limit = args.first.flatMap { Int($0) } ?? 20
-        let recent = history.suffix(limit)
+        // 取一次快照:原来 suffix(limit) 与 count 是两次独立读,
+        // 中途被别人 append/裁剪会算出错误的起始编号
+        let snapshot = history
+        let recent = snapshot.suffix(limit)
         var out = ""
-        var idx = max(0, history.count - recent.count)
+        var idx = max(0, snapshot.count - recent.count)
         for h in recent {
             out += "\(idx)  \(h)\n"
             idx += 1
@@ -1040,14 +1323,21 @@ enum ShellSandbox {
         }
         let fm = FileManager.default
         var total: Int64 = 0
-        func sizeOf(_ path: String) -> Int64 {
+        // 遍历预算:原来 sizeOf 是**完全无界**的递归(既没有深度上限也没有条目上限),
+        // 在沙盒根上跑一次 `du` 会遍历整棵文档树;若里面存在符号链接形成的环,
+        // 或者只是文件极多,这一步会把调用线程占用很久且没有任何输出。
+        var budget = maxWalkEntries
+        func sizeOf(_ path: String, depth: Int) -> Int64 {
+            guard depth <= maxWalkDepth, budget > 0 else { return 0 }
+            budget -= 1
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: path, isDirectory: &isDir) else { return 0 }
             var size: Int64 = 0
             if isDir.boolValue {
                 if let entries = try? fm.contentsOfDirectory(atPath: path) {
                     for e in entries {
-                        size += sizeOf((path as NSString).appendingPathComponent(e))
+                        if budget <= 0 { break }
+                        size += sizeOf((path as NSString).appendingPathComponent(e), depth: depth + 1)
                     }
                 }
             } else {
@@ -1055,14 +1345,16 @@ enum ShellSandbox {
             }
             return size
         }
-        total = sizeOf(target)
+        total = sizeOf(target, depth: 0)
         let label: String
         if humanReadable {
             label = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
         } else {
             label = "\(total) bytes"
         }
-        return ("\(label)\t\(relativePath(target))\n", 0)
+        // 命中上限时明确说明"这是下限,不是全量",避免用户以为目录真的只有这么大
+        let suffix = budget <= 0 ? "(超过 \(maxWalkEntries) 条目上限，统计被截断)" : ""
+        return ("\(label)\t\(relativePath(target))\(suffix)\n", 0)
     }
 
     /// glob 匹配辅助
@@ -1170,7 +1462,8 @@ enum ShellSandbox {
             if let eq = a.firstIndex(of: "=") {
                 let k = String(a[..<eq])
                 let v = String(a[a.index(after: eq)...])
-                env[k] = v
+                // 用 setEnvVar:在锁内完成读-改-写(`env[k] = v` 会 get+set 两次加锁,并发下丢更新)
+                setEnvVar(k, v)
                 changed = true
             }
         }
@@ -1182,8 +1475,8 @@ enum ShellSandbox {
         let p = resolvePath(target)
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue {
-            cwd = p
-            env["PWD"] = p
+            // cwd 与 PWD 一起在锁内更新(见 updateCwd)
+            updateCwd(p)
             return ("", 0)
         } else {
             return ("cd: \(target): 不是目录\n", 1)
@@ -1203,9 +1496,11 @@ enum ShellSandbox {
         return ("文件: \(p)\n大小: \(size) 字节\n修改时间: \(mtime)\n类型: \(isDir ? "目录" : "文件")\n", 0)
     }
 
-    /// 重置沙箱(测试用):cwd 回 root、env 不动
+    /// 重置沙箱(测试用):cwd 回 root、env 只重置 PWD(其它 export 变量与命令历史保留)。
+    /// 新代码请用 `resetSession()`(它会把 export 变量与历史也一起清掉)。
     static func reset() {
-        cwd = sandboxRoot
-        env["PWD"] = sandboxRoot
+        stateLock.lock(); defer { stateLock.unlock() }
+        _cwd = sandboxRoot
+        _env["PWD"] = sandboxRoot
     }
 }

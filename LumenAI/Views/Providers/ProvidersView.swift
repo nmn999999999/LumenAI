@@ -721,7 +721,7 @@ private struct MCPServerRow: View {
                             .lineLimit(1)
                         Text(statusText)
                             .font(.caption2)
-                            .foregroundStyle(server.connected ? .green : .orange)
+                            .foregroundStyle(statusColor)
                     }
                     Spacer()
                     if isConnecting {
@@ -783,11 +783,29 @@ private struct MCPServerRow: View {
         }
     }
 
+    /// 三态：已连接 / 正常断开 / 真错误。
+    ///
+    /// 为什么要分三态：`MCPService` 那边刚把「状态」和「错误」拆开
+    /// （`statusNote` 承载"已断开""已连接但没有工具"这类**正常状态**，
+    /// `lastError` 只承载真正的失败），而这里原来只看 `connected/lastError`，
+    /// 于是用户主动点「断开」会被显示成橙色故障。
+    /// 最后那句 `t("未配置密钥").replacingOccurrences(of: "密钥", with: "连接")` 也是错的：
+    /// 英文词条是 "No API key"，不含「密钥」，替换不生效 —— 英文界面下会显示
+    /// 「No API key」这种与 MCP 无关的文案（MCP 没有密钥这个概念）。已改为直接词条。
     private var statusText: String {
         if isConnecting { return t("正在测试…") }
         if server.connected { return "已连接 · \(server.tools.count) 个工具" }
+        if let note = server.statusNote, !note.isEmpty { return note }
         if let err = server.lastError, !err.isEmpty { return "未连接 · \(err.prefix(40))" }
-        return t("未配置密钥").replacingOccurrences(of: "密钥", with: "连接")
+        return t("未连接")
+    }
+
+    /// 状态颜色：只有**真错误**才用警告色，正常断开用次要色。
+    /// 原来 `server.connected ? .green : .orange` 会把"用户主动断开"也染成橙色警报。
+    private var statusColor: Color {
+        if server.connected { return .green }
+        if let err = server.lastError, !err.isEmpty { return .orange }
+        return .secondary
     }
 }
 
