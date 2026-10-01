@@ -30,6 +30,8 @@ struct ChatView: View {
     @State private var selectedItems: [PhotosPickerItem] = []
     @State private var attachments: [ChatMessage.ImageData] = []
     @State private var showConversationList = false
+    /// 任务清单整页（工具栏入口）。见 toolbarContent 里那个 checklist 按钮的注释。
+    @State private var showTaskList = false
     @State private var errorMessage: String?
     @State private var isGenerating = false
     @State private var generationTask: Task<Void, Never>?
@@ -147,6 +149,9 @@ struct ChatView: View {
             }
             .sheet(isPresented: $showEditSheet) {
                 editMessageSheet
+            }
+            .sheet(isPresented: $showTaskList) {
+                TaskListSheet(store: todoStore)
             }
             .onChange(of: ttsService.isSpeaking) { _, speaking in
                 if !speaking { speakingMessageID = nil }
@@ -611,6 +616,32 @@ struct ChatView: View {
             } label: {
                 Image(systemName: "sidebar.left")
                     .accessibilityLabel(t("对话列表"))
+            }
+        }
+        // 任务清单入口。
+        //
+        // 为什么必须有一个**无条件存在**的入口：常驻面板只在"已经有清单"时才渲染，
+        // 所以一个还没触发过它的用户根本不知道这个功能存在 —— 没有清单就没有入口，
+        // 没有入口就更不会有清单，闭环锁死。这个按钮把环打开：有清单时直接看，
+        // 没有清单时解释它是什么、怎么让 AI 产生一份。
+        // 有清单时加一个数字角标，否则这个按钮和普通图标没有任何区别。
+        ToolbarItem(placement: .topBarLeading) {
+            Button {
+                showTaskList = true
+            } label: {
+                Image(systemName: "checklist")
+                    .accessibilityLabel("任务清单")
+                    .overlay(alignment: .topTrailing) {
+                        if todoStore.isActive {
+                            Text("\(todoStore.todos.count)")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 3)
+                                .padding(.vertical, 1)
+                                .background(Color.accentColor, in: .capsule)
+                                .offset(x: 7, y: -7)
+                        }
+                    }
             }
         }
         ToolbarItemGroup(placement: .topBarTrailing) {

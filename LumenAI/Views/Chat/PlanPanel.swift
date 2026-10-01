@@ -186,69 +186,10 @@ struct PlanPanel: View {
     }
 
     private func row(_ todo: TodoStore.Todo) -> some View {
-        let isCurrent = todo.status == .inProgress
-        let isDone = todo.status == .completed
-
-        return HStack(alignment: .top, spacing: 8) {
-            statusIcon(todo.status)
-                .font(.caption)
-                // 状态切换时图标是"换一个 symbol"（circle → checkmark.circle.fill），
-                // 默认是硬切；replace 过渡让它像被"替换"而不是闪一下，
-                // 配合外层 .animation(value: store.todos) 才能让人看出"这一项刚刚完成了"。
-                .contentTransition(.symbolEffect(.replace))
-                // 固定图标宽度：三种状态图标（circle / circle.dotted / checkmark.circle.fill）
-                // 宽度并不相同，不固定就会让每行文字的左边缘各自错开 1~2pt。
-                .frame(width: 16, alignment: .leading)
-                .padding(.top, 2)
-
-            Text(todo.content)
-                .font(isCurrent ? .footnote.weight(.semibold) : .footnote)
-                // 已完成的用 .secondary + 删除线，而不是 .tertiary：
-                // 用户要看到**全貌**（做了哪些、还剩哪些），淡到看不见等于把已完成的进度藏了；
-                // 删除线 + 次要色已经足够区分"这条翻篇了"。
-                .foregroundStyle(isDone ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-                .strikethrough(isDone, color: .secondary)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        // 当前项垫一层极浅的强调色底：在一堆同字号的行里，它是第一个被眼睛抓到的。
-        // 用 12% 透明度的色底而不是实心色块 —— 实心会和输入栏那几个彩色按钮抢注意力，
-        // 而面板本身应该是"背景信息"。
-        .background(
-            isCurrent ? AnyShapeStyle(Color.accentColor.opacity(0.12)) : AnyShapeStyle(Color.clear),
-            in: .rect(cornerRadius: 8)
-        )
-        // 整行合成一个无障碍元素：状态图标 + 文字一起读，不会读成"圆圈，检查解析分支"两段。
-        .accessibilityElement(children: .combine)
-    }
-
-    /// 状态图标 + 无障碍标签。
-    @ViewBuilder
-    private func statusIcon(_ status: TodoStore.Status) -> some View {
-        switch status {
-        case .pending:
-            Image(systemName: "circle")
-                .foregroundStyle(.secondary)
-                .accessibilityLabel(planText("待办", "Pending"))
-
-        case .inProgress:
-            // 为什么选 circle.dotted 而不是 arrow.triangle.2.circlepath：
-            // 前者和 pending 的 circle 是同一"形状族"，用户一眼看出这是"同一个圆圈、还没填实"；
-            // 后者是旋转箭头，容易被读成"重新加载 / 重试"，语义是错的。
-            // 动效用 pulse（轻微呼吸）而不是旋转：agent 任务可能跑几分钟，
-            // 一个持续旋转的图标会在几秒内变成视觉噪音。
-            Image(systemName: "circle.dotted")
-                .foregroundStyle(.tint)
-                .symbolEffect(.pulse, isActive: true)
-                .accessibilityLabel(planText("进行中", "In progress"))
-
-        case .completed:
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-                .accessibilityLabel(planText("已完成", "Completed"))
-        }
+        // 行本身抽成 `TodoRow`：任务清单现在有**两个**展示面（聊天页的常驻面板、
+        // 工具栏点开的完整清单页），两处必须长得一样 —— 状态图标/删除线/当前项底色
+        // 各写一份的话，早晚会出现"面板里是灰勾、清单页里是绿勾"这种不一致。
+        TodoRow(todo: todo, compact: true)
     }
 
     /// "当前正在做的那条"。
@@ -262,5 +203,211 @@ struct PlanPanel: View {
     private var currentTodo: TodoStore.Todo? {
         store.todos.first { $0.status == .inProgress }
             ?? store.todos.first { $0.status == .pending }
+    }
+}
+
+// MARK: - 单条任务（常驻面板与完整清单页共用）
+
+/// 一条任务。`compact` 用于聊天页的常驻面板（字号小、内边距紧）；
+/// 非 compact 用于完整清单页（正常字号、更舒展）。
+struct TodoRow: View {
+    let todo: TodoStore.Todo
+    var compact: Bool = false
+
+    /// 此组件内的少量文案。与 `planText` 同一个理由（`L10n` 的词条表是 private，
+    /// 新词条加不进去；未登记的 key 在英文界面会原样显示中文）。
+    private func rowText(_ zh: String, _ en: String) -> String {
+        L10n.current == "en" ? en : zh
+    }
+
+    var body: some View {
+        let isCurrent = todo.status == .inProgress
+        let isDone = todo.status == .completed
+
+        return HStack(alignment: .top, spacing: compact ? 8 : 10) {
+            statusIcon(todo.status)
+                .font(compact ? .caption : .footnote)
+                // 状态切换时图标是"换一个 symbol"（circle → checkmark.circle.fill），
+                // 默认是硬切；replace 过渡让它像被"替换"而不是闪一下，
+                // 配合外层 .animation(value: store.todos) 才能让人看出"这一项刚刚完成了"。
+                .contentTransition(.symbolEffect(.replace))
+                // 固定图标宽度：三种状态图标（circle / circle.dotted / checkmark.circle.fill）
+                // 宽度并不相同，不固定就会让每行文字的左边缘各自错开 1~2pt。
+                .frame(width: compact ? 16 : 18, alignment: .leading)
+                .padding(.top, compact ? 2 : 3)
+
+            Text(todo.content)
+                .font(compact ? (isCurrent ? .footnote.weight(.semibold) : .footnote)
+                              : (isCurrent ? .subheadline.weight(.semibold) : .subheadline))
+                // 已完成的用 .secondary + 删除线，而不是 .tertiary：
+                // 用户要看到**全貌**（做了哪些、还剩哪些），淡到看不见等于把已完成的进度藏了；
+                // 删除线 + 次要色已经足够区分"这条翻篇了"。
+                .foregroundStyle(isDone ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                .strikethrough(isDone, color: .secondary)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, compact ? 6 : 10)
+        .padding(.vertical, compact ? 4 : 7)
+        // 当前项垫一层极浅的强调色底：在一堆同字号的行里，它是第一个被眼睛抓到的。
+        // 用 12% 透明度的色底而不是实心色块 —— 实心会和输入栏那几个彩色按钮抢注意力，
+        // 而这块内容本身应该是"背景信息"。
+        .background(
+            isCurrent ? AnyShapeStyle(Color.accentColor.opacity(0.12)) : AnyShapeStyle(Color.clear),
+            in: .rect(cornerRadius: compact ? 8 : 10)
+        )
+        // 整行合成一个无障碍元素：状态图标 + 文字一起读，不会读成"圆圈，检查解析分支"两段。
+        .accessibilityElement(children: .combine)
+    }
+
+    /// 状态图标 + 无障碍标签。
+    @ViewBuilder
+    private func statusIcon(_ status: TodoStore.Status) -> some View {
+        switch status {
+        case .pending:
+            Image(systemName: "circle")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(rowText("待办", "Pending"))
+
+        case .inProgress:
+            // 为什么选 circle.dotted 而不是 arrow.triangle.2.circlepath：
+            // 前者和 pending 的 circle 是同一"形状族"，用户一眼看出这是"同一个圆圈、还没填实"；
+            // 后者是旋转箭头，容易被读成"重新加载 / 重试"，语义是错的。
+            // 动效用 pulse（轻微呼吸）而不是旋转：agent 任务可能跑几分钟，
+            // 一个持续旋转的图标会在几秒内变成视觉噪音。
+            Image(systemName: "circle.dotted")
+                .foregroundStyle(.tint)
+                .symbolEffect(.pulse, isActive: true)
+                .accessibilityLabel(rowText("进行中", "In progress"))
+
+        case .completed:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityLabel(rowText("已完成", "Completed"))
+        }
+    }
+}
+
+
+// MARK: - 完整任务清单页
+
+/// 从聊天页工具栏点开的「任务清单」整页。
+///
+/// 为什么需要它（**空的时候也需要**）：常驻面板只在"已经有清单"时才渲染，于是一个
+/// 从没用过这个功能的用户**永远看不到它存在** —— 他既不知道 agent 会拆任务，
+/// 也没有任何入口能发现这件事。这就是"功能做了但用户看不见"。
+/// 所以这里给一个无条件存在的入口：有清单时看清单；没有清单时解释它是什么、
+/// 以及怎么让 AI 产生一份（含"本地模型需要手动打开 todo"这个前提）。
+struct TaskListSheet: View {
+    @ObservedObject var store: TodoStore
+    @ObservedObject private var toolStore = ToolSettingsStore.shared
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var enableFailed = false
+
+    /// `todo` 工具是否已启用（只对本地模型有意义，云端模型始终拿全量工具）。
+    ///
+    /// 为什么这个页面要关心它：本地模型的工具目录是**训练契约**（12 个、固定顺序），
+    /// `todo` 刻意不在默认清单里，所以本地模型用户看不到任何清单 —— 而他们最容易
+    /// 以为"这功能坏了"。与其让他自己去设置里翻，不如在这里把原因和开关一起摆出来。
+    private var todoEnabled: Bool { toolStore.isEnabled("todo") }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if store.todos.isEmpty { emptyState } else { list }
+            }
+            .navigationTitle("任务清单")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+                if !store.todos.isEmpty {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("清空", role: .destructive) { store.clear() }
+                    }
+                }
+            }
+        }
+    }
+
+    private var list: some View {
+        List {
+            Section {
+                ForEach(store.todos) { todo in
+                    TodoRow(todo: todo)
+                        .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                }
+            } header: {
+                HStack {
+                    Text("当前对话的任务")
+                    Spacer()
+                    Text(store.progressText).monospacedDigit()
+                }
+            } footer: {
+                Text("这份清单只属于当前这段对话。换对话会自动切到那一段的清单；删除对话时它也会一起删掉。")
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                ContentUnavailableView(
+                    "还没有任务清单",
+                    systemImage: "checklist",
+                    description: Text("AI 在跑多步任务时会自己列出步骤，并把每一步的进度写在这里。")
+                )
+
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("怎么让它出现")
+                            .font(.subheadline.weight(.semibold))
+
+                        Label {
+                            Text("用云端模型不用做任何事：让它做一件多步的事（比如「把这几个文件的内容汇总成一张表」），它会自己用 todo 工具写出计划。清单会显示在输入栏上方，也能在这个页面看到。")
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "cloud").foregroundStyle(.tint)
+                        }
+
+                        Label {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("用本地模型需要手动打开 todo 工具。原因是本地模型只喂前 \(toolStore.limit) 个工具，而这份有序清单是它的**训练契约** —— 塞一个它没见过的工具名进去，会让已经训好的行为退化，所以 todo 默认不在里面。")
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if todoEnabled {
+                                    Label("已经打开了", systemImage: "checkmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.green)
+                                } else {
+                                    Button {
+                                        // 已达上限时 setEnabled 会拒绝并保持原状，
+                                        // 所以如实把结果说出来，而不是乐观地当成已打开。
+                                        if !toolStore.setEnabled("todo", true) {
+                                            enableFailed = true
+                                        }
+                                    } label: {
+                                        Text("现在打开 todo")
+                                    }
+                                    .font(.caption)
+                                    if enableFailed {
+                                        Text("没能打开：本地模型的工具名额已满（\(toolStore.limit) 个）。请到「设置 → 工具」里先关掉一个再开。")
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                            }
+                        } icon: {
+                            Image(systemName: "iphone").foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.horizontal, 4)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
+        }
     }
 }
