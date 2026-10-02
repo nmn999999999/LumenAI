@@ -23,6 +23,8 @@ struct ChatView: View {
     @ObservedObject private var chatSettings = SettingsStorage.shared
     @EnvironmentObject private var theme: LumenAIApp.ThemeObserver
     @Environment(\.colorScheme) private var colorScheme
+    /// 回到前台时要检查有没有被打断的 agent 任务需要续跑
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
 
     @State private var inputText = ""
@@ -173,12 +175,29 @@ struct ChatView: View {
             .onChange(of: chatStore.currentConversationID) { _, id in
                 todoStore.bind(conversationID: id)
             }
+            // 后台被打断的说明：接到既有的错误提示通道上，用户回来就能看到为什么停了。
+            .onChange(of: agentService.interruptionNote) { _, note in
+                guard let note, !note.isEmpty else { return }
+                errorMessage = note
+                agentService.interruptionNote = nil
+            }
             // 首次进入页面也要绑一次：onChange 只在值**变化**时触发，
             // 而冷启动直接落在某个已有对话上时 currentConversationID 从未"变过"，
             // 只挂 onChange 的话面板会一直停在未绑定槽位（空的）。
             // 重复调用是安全的：TodoStore.bind 对同一个 id 直接 return。
             .onAppear {
                 todoStore.bind(conversationID: chatStore.currentConversationID)
+                // 清掉上次残留的灵动岛卡片：App 被强杀时活动**不会自动消失**
+                // （它是系统的，不是我们的），用户会一直看到一张永远不动的旧卡片。
+                Task { await LiveActivityManager.shared.endAllStale() }
+                // 启动时先看有没有"上次被打断、还没续上"的 agent 任务。
+                // 放在 onAppear 而不是只在 scenePhase 变化里：冷启动时 scenePhase
+                // 本来就已经是 .active，**不会**触发 onChange —— 只挂 onChange 的话，
+                // "App 被系统回收后重新打开"这条最常见的路径永远不会续跑。
+                resumeInterruptedAgentRunIfNeeded()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { resumeInterruptedAgentRunIfNeeded() }
             }
             .alert("出错了", isPresented: .init(
                 get: { errorMessage != nil },
@@ -893,102 +912,228 @@ struct ChatView: View {
             }
             let history = agentHistory
             isGenerating = true
-            generationTask = Task {
+            // 申请后台保活：agent 任务可能跑几分钟，用户切出去是常态。
+            // 不申请的话进程被挂起、这一轮直接死掉，气泡永远停在「思考中…」且**没有任何报错**。
+            // 到期回调里主动取消 —— 体面地停，比被系统杀掉好得多（后者状态是"卡住"）。
+            // ⚠️ 两个编译错误都是这里犯的，记下来免得再犯：
+            //   1. `AgentService` **没有** `.shared` —— 它是 App 里 `@StateObject` 创建、
+            //      经 `environmentObject` 注入的，全局单例并不存在。用手上的 agentService 引用。
+            //   2. `generationTask` 是 `Task<Void, Never>`（**struct**，不是 class），
+            //      所以不能 `[weak generationTask]`。改用捕获 self 再读属性。
+            //      ChatView 是 struct，捕获的是那一刻的副本，而 agentService 是类引用，
+            //      副本里指向的还是同一个实例 —— 所以这句赋值确实会落到真实对象上。
+            BackgroundTaskKeeper.shared.begin(.generation) { [self] in
+                self.generationTask?.cancel()
+                self.agentService.interruptionNote =
+                    "切到后台的时间用尽，这一轮已暂停。回到 App 后重新发送即可继续。"
+            }
+            // ⚠️ 这里**不能**写 `[weak self]`：`ChatView` 是 struct 不是 class，
+            // weak 只对类生效（同一类错误我在这个文件里已经犯过一次 —— 给 Task 加 weak）。
+            // struct 的闭包捕获的是那一刻的副本，而副本里的 agentService / chatStore
+            // 都是类引用、指向同一实例，所以行为是对的。
+            // 代价是必须显式写 self.（逃逸闭包里的成员访问规则）。
+            generationTask = Task { [history, effectiveSettings] in
                 defer {
-                    isGenerating = false
-                    generationTask = nil
+                    self.isGenerating = false
+                    self.generationTask = nil
+                    BackgroundTaskKeeper.shared.end(.generation)
                 }
-                let bridge = AgentService.AgentDisplayBridge(
-                    beginIteration: {
-                        // 复用气泡：如果当前 agent run() 已有 bubble,直接复用 id;
-                        // 否则首次创建。这样多轮思考 + 工具调用 + 最终答案
-                        // 都渲染在同一个 assistant 气泡内,不分裂成多个 9:30 卡。
-                        if let existing = currentAgentMessageID {
-                            return existing
-                        }
-                        let m = ChatMessage(role: .assistant, content: "", isStreaming: true, isAgentRound: true)
-                        var c = chatStore.currentOrNew
-                        c.messages.append(m)
-                        chatStore.upsert(c)
-                        currentAgentMessageID = m.id
-                        return m.id
-                    },
-                    appendToken: { id, token in
-                        appendAssistantToken(id: id, token: token)
-                    },
-                    attachToolCall: { id, call in
-                        attachToolCallToMessage(id: id, call: call)
-                    },
-                    endIteration: { id in
-                        finalizeMessage(id: id)
-                    },
-                    requestApproval: { _, call in
-                        // 阻塞等用户在 chat 里点「允许 / 本会话内总是允许 / 拒绝」。
-                        // @MainActor self 才能写 @State。
-                        await withCheckedContinuation { (cont: CheckedContinuation<ApprovalDecision, Never>) in
-                            // setState 派发到 main；cont 只在用户点按钮时 resume 一次
-                            // （弹窗被系统关掉的情形走 alert 的 set(false) 分支，同样会 resume，不会泄漏）
-                            pendingApproval = PendingApproval(call: call, continuation: cont)
-                        }
-                    }
-                )
-                let bubbleId = currentAgentMessageID  // 备份气泡 id,run() 之后会用
-                let result = await agentService.run(
-                    history: history,
-                    settings: effectiveSettings,
-                    // 这里传**全部**内置工具（+ MCP / 插件）。
-                    // 按「设置 → 工具」勾选过滤的动作在 AgentService 里做，且只对本地模型生效 ——
-                    // 过滤放这里会让云端也只拿到 12 个（用户已反馈此 bug）。
-                    toolsEnabledTools: BuiltInTools.allTools
-                        + MCPService.shared.toolDefinitions
-                        + PluginManager.shared.installedToolDefinitions(),
-                    llm: llmService,
-                    bridge: bridge
-                )
-                // run() 退出后清空共享气泡 id,下次发送/agent 时重新创建
-                currentAgentMessageID = nil
-
-                // 保证 run() 返回的最终答案**一定能被用户看到**。
-                //
-                // 这里原来的判据是「剥离 think 之后 bubble 里还有没有可见文本」，为空才回填。
-                // 那个判据是错的，而且错得正好落在最常见的收尾形态上：
-                // **最后一轮是工具调用**时，bubble 里留着那一轮的原始 JSON 文本
-                //（`{"name":"todo","arguments":{...}}`）—— 它当然不是空的，于是回填被跳过；
-                // 可那段 JSON 在气泡里会被 `cleanDisplayText` 清掉，用户在界面上什么也看不到。
-                // 结果就是：模型这一轮**确实**产出了收尾文字（或 AgentService 明确给出了
-                // "达到轮数上限"的说明），而它被这段判据静默丢掉了，用户只看到气泡停在那里。
-                // 这和"宣布任务完成、实际没有产物"是同一个病。
-                //
-                // 现在的判据：拿**用户真正看得见的那段文本**（agent 轮次要走 cleanDisplayText，
-                // 因为工具 JSON / 结束暗号都会在那一步被去掉）去比对，并额外用 contains 兜一层，
-                // 避免正常流式路径（答案已经上屏）被重复追加一遍。
-                if !result.content.isEmpty, let bubbleId {
-                    var conv = chatStore.currentOrNew
-                    if let idx = conv.messages.firstIndex(where: { $0.id == bubbleId }) {
-                        let raw = conv.messages[idx].content
-                        let stripped = AgentService.stripThinkTags(raw)
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                        let visible = conv.messages[idx].isAgentRound
-                            ? AgentService.cleanDisplayText(stripped)
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                            : stripped
-                        let answer = result.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if visible.isEmpty || !visible.contains(answer) {
-                            conv.messages[idx].content = raw + "\n\n" + result.content
-                            chatStore.upsert(conv)
-                        }
-                    }
-                }
-
-                if !Task.isCancelled {
-                    maybeAutoTitle()
-                    maybeAutoExtractMemory()
-                }
+                await self.performAgentTurn(history: history, settings: effectiveSettings, resuming: nil)
             }
             return
         }
 
         startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage })
+    }
+
+    // MARK: - 断点续跑
+
+    /// 回到前台 / 冷启动时，检查有没有被打断的 agent 任务，有就自动接着跑。
+    ///
+    /// 触发点有两个且都必须有：
+    ///   · `scenePhase == .active` —— 覆盖"切后台被系统收走、又切回来"；
+    ///   · `onAppear` —— 覆盖"App 被回收后重新打开"。冷启动时 scenePhase 本来就是
+    ///     `.active`，不会产生 onChange 事件，所以只挂 onChange 会漏掉这条最常见的路径。
+    ///
+    /// 三种情况**不**续跑，各有理由：
+    ///   · 正有一个任务在跑（`isGenerating`）—— 续跑会和它抢同一段对话与同一条气泡；
+    ///   · 没有存档 —— 没什么可续的；
+    ///   · 续跑次数已达上限 —— 见 `AgentRunCheckpoint.maxAutoResume`。反复续跑会把一个
+    ///     在当前环境下根本跑不完的任务变成无限循环，每次都烧电、烧额度。
+    ///     到上限时**必须明确告诉用户**，而不是默默放弃（默默放弃正是要根除的那类行为）。
+    private func resumeInterruptedAgentRunIfNeeded() {
+        guard !isGenerating, generationTask == nil else { return }
+        guard let cp = AgentCheckpointStore.shared.load() else { return }
+
+        guard cp.canAutoResume else {
+            AgentCheckpointStore.shared.clear()
+            errorMessage = "上一轮 agent 任务自动续跑了 \(cp.resumeCount) 次仍被打断（原因：\(cp.reason)），已停止。"
+                + "可以重新发送，或把这个任务拆小一点。"
+            return
+        }
+
+        // 切回那段对话：存档属于哪段对话就写回哪段，
+        // 否则续跑的内容会跑到用户当前看的另一段对话里去（串味且极难察觉）。
+        if chatStore.currentConversationID != cp.conversationID {
+            chatStore.currentConversationID = cp.conversationID
+        }
+        // 复用原气泡：续跑应该接在同一条 assistant 气泡里，看起来是"接着写"，
+        // 而不是新冒出一条"又回答了一次"。
+        currentAgentMessageID = cp.bubbleID
+        isAgentMode = true
+
+        let modelName = providerStore.hasCloudSelection ? providerStore.currentModel : (llmService.loadedModelName ?? "")
+        let providerName = providerStore.currentProvider?.name ?? ""
+        let settings = effectiveSettings(from: chatSettings.settings,
+                                         modelName: modelName, providerName: providerName)
+
+        let resumed = AgentRunCheckpoint(
+            conversationID: cp.conversationID,
+            bubbleID: cp.bubbleID,
+            history: cp.history,
+            iteration: cp.iteration,
+            toolCalls: cp.toolCalls,
+            startedAt: cp.startedAt,
+            reason: cp.reason,
+            resumeCount: cp.resumeCount + 1
+        )
+        // 先把计数写回去：万一这次又被打断，下次读到的就是 +1 后的值，
+        // 否则上限永远到不了（每次都从 0 开始续）。
+        AgentCheckpointStore.shared.save(resumed)
+
+        isGenerating = true
+        BackgroundTaskKeeper.shared.begin(.generation) { [self] in
+            self.generationTask?.cancel()
+        }
+        generationTask = Task { [resumed, settings] in
+            defer {
+                self.isGenerating = false
+                self.generationTask = nil
+                BackgroundTaskKeeper.shared.end(.generation)
+            }
+            await self.performAgentTurn(history: resumed.history, settings: settings, resuming: resumed)
+        }
+    }
+
+    // MARK: - Agent 一轮任务（首次发送与断点续跑共用同一条路）
+
+    /// 跑完一轮 agent 任务，并把结果落进气泡。
+    ///
+    /// 为什么把它抽成方法：**断点续跑必须走完全相同的流程** —— 包括审批弹窗、
+    /// 后台保活、以及"最终答案一定要能被用户看到"那段回填。
+    /// 如果续跑另写一条简化路径，那它就会缺掉审批（敏感工具静默被拒）
+    /// 或缺掉回填（答案又被丢掉）—— 而这两件事恰恰都是我们已经踩过的坑。
+    /// 所以宁可在首次发送那里多一层调用，也不让两条路分叉。
+    private func performAgentTurn(history: [ChatMessage],
+                                  settings effectiveSettings: ModelSettings,
+                                  resuming: AgentRunCheckpoint?) async {
+        // 起一张灵动岛卡片。用户切出去之后**完全不知道 App 还在不在干活**，
+        // 只能反复切回来看 —— 这张卡片解决的就是这件事。
+        // 它不负责让任务活下去（那是 BackgroundTaskKeeper 与后台会话的事）。
+        let liveStartedAt = Date()
+        LiveActivityManager.shared.start(
+            conversationTitle: chatStore.currentOrNew.title,
+            state: .init(title: resuming == nil ? "正在处理你的请求" : "继续未完成的任务",
+                         phase: .thinking, step: 0, totalSteps: nil,
+                         detail: nil, progress: nil, startedAt: liveStartedAt))
+
+        let bridge = AgentService.AgentDisplayBridge(
+            beginIteration: {
+                // 复用气泡：如果当前 agent run() 已有 bubble,直接复用 id;
+                // 否则首次创建。这样多轮思考 + 工具调用 + 最终答案
+                // 都渲染在同一个 assistant 气泡内,不分裂成多个 9:30 卡。
+                if let existing = currentAgentMessageID {
+                    return existing
+                }
+                let m = ChatMessage(role: .assistant, content: "", isStreaming: true, isAgentRound: true)
+                var c = chatStore.currentOrNew
+                c.messages.append(m)
+                chatStore.upsert(c)
+                currentAgentMessageID = m.id
+                return m.id
+            },
+            appendToken: { id, token in
+                appendAssistantToken(id: id, token: token)
+            },
+            attachToolCall: { id, call in
+                attachToolCallToMessage(id: id, call: call)
+            },
+            endIteration: { id in
+                finalizeMessage(id: id)
+            },
+            requestApproval: { _, call in
+                // 阻塞等用户在 chat 里点「允许 / 本会话内总是允许 / 拒绝」。
+                // @MainActor self 才能写 @State。
+                await withCheckedContinuation { (cont: CheckedContinuation<ApprovalDecision, Never>) in
+                    pendingApproval = PendingApproval(call: call, continuation: cont)
+                }
+            }
+        )
+        let bubbleId = currentAgentMessageID  // 备份气泡 id,run() 之后会用
+        let result = await agentService.run(
+            history: history,
+            settings: effectiveSettings,
+            // 这里传**全部**内置工具（+ MCP / 插件）。
+            // 按「设置 → 工具」勾选过滤的动作在 AgentService 里做，且只对本地模型生效 ——
+            // 过滤放这里会让云端也只拿到 12 个（用户已反馈此 bug）。
+            toolsEnabledTools: BuiltInTools.allTools
+                + MCPService.shared.toolDefinitions
+                + PluginManager.shared.installedToolDefinitions(),
+            llm: llmService,
+            bridge: bridge,
+            // 断点存档要用：没有这两个 id，续跑时不知道该把内容写回哪条对话的哪条气泡
+            conversationID: chatStore.currentOrNew.id,
+            bubbleID: bubbleId,
+            resuming: resuming
+        )
+        // run() 退出后清空共享气泡 id,下次发送/agent 时重新创建
+        currentAgentMessageID = nil
+
+        // 保证 run() 返回的最终答案**一定能被用户看到**。
+        //
+        // 这里原来的判据是「剥离 think 之后 bubble 里还有没有可见文本」，为空才回填。
+        // 那个判据是错的，而且错得正好落在最常见的收尾形态上：**最后一轮是工具调用**时，
+        // bubble 里留着那一轮的原始 JSON 文本 —— 它当然不是空的，于是回填被跳过；
+        // 可那段 JSON 在气泡里会被 `cleanDisplayText` 清掉，用户在界面上什么也看不到。
+        // 结果就是模型**确实**产出了收尾文字，却被这段判据静默丢弃。
+        // 这和"宣布任务完成、实际没有产物"是同一个病。
+        if !result.content.isEmpty, let bubbleId {
+            var conv = chatStore.currentOrNew
+            if let idx = conv.messages.firstIndex(where: { $0.id == bubbleId }) {
+                let raw = conv.messages[idx].content
+                let stripped = AgentService.stripThinkTags(raw)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let visible = conv.messages[idx].isAgentRound
+                    ? AgentService.cleanDisplayText(stripped)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    : stripped
+                let answer = result.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if visible.isEmpty || !visible.contains(answer) {
+                    conv.messages[idx].content = raw + "\n\n" + result.content
+                    chatStore.upsert(conv)
+                }
+            }
+        }
+
+        if !Task.isCancelled {
+            maybeAutoTitle()
+            maybeAutoExtractMemory()
+        }
+
+        // 收卡片。三种收尾状态**必须区分**，因为对用户含义完全不同：
+        //   · 正常结束 → 已完成
+        //   · 被取消（多半是切后台超时 / 进程被回收）→ **已暂停**，而且回来自动续跑。
+        //     用红色"失败"去表示它，用户会以为任务废了然后手动重发 ——
+        //     而重发恰好会和自动续跑撞在同一段对话、同一条气泡上。
+        //   · 真出错 → 已中断
+        let phase: LumenAIActivityAttributes.Phase = Task.isCancelled ? .paused : .done
+        let title: String = Task.isCancelled
+            ? "已暂停，回到 App 会自动继续"
+            : (result.content.isEmpty ? "已完成" : String(result.content.prefix(60)))
+        LiveActivityManager.shared.end(state: .init(
+            title: title, phase: phase, step: 0, totalSteps: nil,
+            detail: Task.isCancelled ? "回到 App 后自动继续" : nil,
+            progress: nil, startedAt: liveStartedAt))
     }
 
     /// 解析助手绑定 + 提示词变量 + 人格注入 + 提示词策略 → 有效设置
@@ -1047,10 +1192,15 @@ struct ChatView: View {
     /// 核心生成流程：创建 assistant 气泡并流式渲染（云 / 本地自动路由）
     private func startGeneration(history: [ChatMessage], settings: ModelSettings, images: [CGImage]) {
         isGenerating = true
+        // 见上面 agent 那处的说明：切后台要能多活一会儿，到期则主动收尾。
+        BackgroundTaskKeeper.shared.begin(.generation) { [self] in
+            self.generationTask?.cancel()
+        }
         generationTask = Task {
             defer {
                 isGenerating = false
                 generationTask = nil
+                BackgroundTaskKeeper.shared.end(.generation)
             }
 
             let assistantMsg = ChatMessage(role: .assistant, content: "", isStreaming: true)
@@ -1456,10 +1606,15 @@ struct ChatView: View {
         chatStore.upsert(conv)
 
         isGenerating = true
+        // 云端生图是纯网络等待，切后台被挂起就会白等一场；同样申请保活。
+        BackgroundTaskKeeper.shared.begin(.generation) { [self] in
+            self.generationTask?.cancel()
+        }
         generationTask = Task {
             defer {
                 isGenerating = false
                 generationTask = nil
+                BackgroundTaskKeeper.shared.end(.generation)
             }
             let placeholder = ChatMessage(role: .assistant, content: "🎨 正在生成图片…", isStreaming: true)
             var c = chatStore.currentOrNew

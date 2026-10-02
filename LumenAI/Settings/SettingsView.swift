@@ -502,6 +502,16 @@ struct SettingsView: View {
         }
     }
 
+    /// 按 baseURL 片段找到用户已经配好的那家 Provider，用作预设的一键绑定。
+    /// 找不到就返回 nil —— 只填模型与音色，让用户自己选服务，
+    /// 而不是硬编一个 id（用户可能压根没配过那家）。
+    private func matchingProviderID(forBaseURL hint: String) -> String? {
+        guard !hint.isEmpty else { return nil }
+        return ProviderStore.shared.providers
+            .first { $0.baseURL.lowercased().contains(hint.lowercased()) }?
+            .id.uuidString
+    }
+
     private func toolToggleRow(_ name: String) -> some View {
         let def = BuiltInTools.allTools.first { $0.name == name }
         let enabled = toolStore.isEnabled(name)
@@ -590,6 +600,43 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
 
                 if storage.settings.ttsEngine == "network" {
+                    // 用哪家服务来合成 —— 这是这次新加的，之前只能"用当前对话的那家"。
+                    HStack {
+                        Text(t("语音服务")).font(.subheadline)
+                        Spacer()
+                        Picker(t("语音服务"), selection: $storage.settings.ttsProviderID) {
+                            Text(t("跟对话用同一家")).tag("")
+                            ForEach(Array(ProviderStore.shared.providers.enumerated()), id: \.offset) { _, p in
+                                Text(p.name).tag(p.id.uuidString)
+                            }
+                        }
+                        .frame(maxWidth: 220)
+                    }
+                    Text("跟对话用同一家时，如果那家不支持 /audio/speech（比如 DeepSeek），会自动回退系统 TTS 并提示。想用网络音色的话，在这里单独选一家支持 TTS 的。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    // 音色预设：省掉"手打模型名和音色名"这一步。
+                    // 这些名字（模型 + 音色）都是各家文档里的原文，打错一个字符就是 400，
+                    // 而错误提示通常只有一句"invalid request"，很难看出是名字写错。
+                    HStack {
+                        Text(t("快速预设")).font(.subheadline)
+                        Spacer()
+                        Menu(t("选择")) {
+                            ForEach(TTSPresets.all) { preset in
+                                Button("\(preset.providerHint) · \(preset.label)") {
+                                    storage.settings.ttsModel = preset.model
+                                    storage.settings.ttsVoiceName = preset.voice
+                                    // 预设里带服务地址时，顺手把 TTS 服务指到匹配的那家
+                                    if let pid = matchingProviderID(forBaseURL: preset.baseURLHint) {
+                                        storage.settings.ttsProviderID = pid
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     HStack {
                         Text(t("网络音色")).font(.subheadline)
                         Spacer()
@@ -598,9 +645,20 @@ struct SettingsView: View {
                             .multilineTextAlignment(.trailing)
                             .frame(width: 140)
                     }
-                    Text("使用当前云端 Provider 的 OpenAI 兼容 /audio/speech 接口；不可用时自动回退系统 TTS。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text(t("语音模型")).font(.subheadline)
+                        Spacer()
+                        TextField("tts-1", text: $storage.settings.ttsModel)
+                            .textFieldStyle(.plain)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 200)
+                    }
+                    if let err = TTSService.shared.lastTTSError {
+                        Text(err)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 } else if storage.settings.ttsEngine == "kokoro" {
                     kokoroTTSCard
                 } else {

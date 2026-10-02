@@ -1,7 +1,53 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+
+/// 只为两件系统级事件存在：**后台下载的回调**与**App 被系统唤起**。
+///
+/// 为什么必须有它：后台 URLSession 在传输完成时会把 App 拉起来，并调用
+/// `application(_:handleEventsForBackgroundURLSession:completionHandler:)` ——
+/// SwiftUI 的 App 生命周期没有对应的钩子，不接这个回调就等于
+/// "下载在后台完成了，但没人知道"。具体后果有两个：
+///   1. 系统给的那个 completionHandler 没有被调用 → 系统判定我们没处理完，
+///      **之后不再唤起这个 App**（表现：第一次切后台还能下，之后再也收不到完成通知）；
+///   2. 不知道该重建哪个会话 → 那些传输的结果永远拿不到。
+@MainActor
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        // 正常启动也要续传：上次退出时正在下的模型不应该被默默放弃。
+        ModelManager.shared.resumePendingDownloads()
+        return true
+    }
+
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        // identifier 必须与我们建会话时用的完全一致，否则说明这是别的会话的事件
+        // （或标识符被改过），此时**不要**接管：接错了会把回调安到错误的会话上。
+        guard identifier == ModelManager.backgroundSessionID else {
+            completionHandler()
+            return
+        }
+        ModelManager.backgroundCompletionHandler = completionHandler
+        ModelManager.shared.reattachBackgroundSession()
+        // 被系统唤起时进程是全新的，内存里没有任何进行中的下载状态 ——
+        // 从落盘的清单恢复，否则传完的文件不知道该存成哪个名字。
+        ModelManager.shared.resumePendingDownloads()
+    }
+}
 
 @main
 struct LumenAIApp: App {
+    #if canImport(UIKit)
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #endif
+
     @StateObject private var modelManager = ModelManager.shared
     @StateObject private var llmService = LLMService()
     @StateObject private var chatStore = ChatStore()

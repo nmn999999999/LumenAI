@@ -150,12 +150,30 @@ final class TTSService: NSObject, ObservableObject {
     // MARK: 网络 TTS（OpenAI 兼容 /audio/speech）
 
     private func speakNetwork(_ text: String, settings: ModelSettings) async {
-        guard let provider = ProviderStore.shared.currentProvider,
+        // Provider 的选取顺序：**专用的 TTS Provider 优先**，没设才回落到当前对话的。
+        //
+        // 为什么要有"专用"这一个概念：原来只有"当前对话的 Provider"，
+        // 于是能不能用语音取决于你对话时选的那家支不支持 `/audio/speech`。
+        // 主力模型 DeepSeek 没有这个接口 —— 结果网络 TTS **静默回退成系统 TTS**，
+        // 用户明明选了"网络 TTS"，听到的却是系统音色，而且界面上没有任何提示。
+        // 现在可以单独指定一家支持 TTS 的（比如硅基流动的 CosyVoice2），与对话解耦。
+        let dedicated = settings.ttsProviderID.isEmpty
+            ? nil
+            : ProviderStore.shared.providers.first { $0.id.uuidString == settings.ttsProviderID }
+        let provider = dedicated ?? ProviderStore.shared.currentProvider
+
+        guard let provider,
               provider.hasKey,
               provider.type != .claude && provider.type != .gemini, // 仅 OpenAI 兼容端点
               let url = URL(string: provider.cleanBaseURL + "/audio/speech")
         else {
-            // 网络 TTS 不可用时回退系统 TTS
+            // 网络 TTS 不可用时回退系统 TTS。
+            // ⚠️ 回退是必要的（不能因为没配好就一个字都不读），但**不能静默** ——
+            // 用户选的是网络音色、听到的是系统音色，如果连一句提示都没有，
+            // 他只会觉得"这个音色听起来不对"，而不会想到是配置问题。
+            lastTTSError = settings.ttsProviderID.isEmpty
+                ? "网络 TTS 不可用（当前对话的 Provider 不支持 /audio/speech），已回退系统 TTS。可在「设置 → 语音」里单独指定一家支持 TTS 的服务。"
+                : "指定的 TTS 服务不可用（缺 Key 或地址不对），已回退系统 TTS。"
             speakSystem(text, settings: settings)
             return
         }

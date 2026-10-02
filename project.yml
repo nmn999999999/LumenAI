@@ -26,6 +26,20 @@ targets:
       # SherpaOnnxC 是动态框架（主二进制 @rpath 引用），必须 embed 进 app/Frameworks
       - framework: SherpaOnnxC.xcframework
         embed: true
+      # Widget 扩展必须 embed 进 App 的 PlugIns/，否则 ipa 里根本没有它 ——
+      # 而表现是"代码都写了、装上去灵动岛就是不出来"，最难查的那类问题。
+      - target: LumenAIWidget
+        embed: true
+    # URL scheme 必须走 info.properties：`INFOPLIST_KEY_*` 只能表达字符串，
+    # 而 CFBundleURLTypes 是一个**数组套字典**的结构，用那种写法会静默丢掉。
+    # 不注册它的后果：灵动岛/锁屏卡片上的 widgetURL("lumenai://chat") 点了没反应，
+    # 而且不报任何错 —— 表现是"点了没动静"。
+    info:
+      path: LumenAI/Info.plist
+      properties:
+        CFBundleURLTypes:
+          - CFBundleURLName: com.lumenai.app
+            CFBundleURLSchemes: [lumenai]
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
@@ -34,9 +48,15 @@ targets:
         # iOS 26 App 图标：Icon Composer 工程（appicon.icon）作为官方 AppIcon 源，
         # 由 actool 用 Icon Composer 渲染管线生成含液态玻璃效果的全部变体
         ASSETCATALOG_COMPILER_APPICON_NAME: appicon
-        MARKETING_VERSION: 0.3.60
-        CURRENT_PROJECT_VERSION: 60
+        MARKETING_VERSION: 0.3.61
+        CURRENT_PROJECT_VERSION: 61
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        # 实时活动（灵动岛 / 锁屏）的开关。**缺了它 Activity.request 会直接抛异常**，
+        # 而错误信息只说请求失败，不会告诉你"是 Info.plist 少了个 key"。
+        INFOPLIST_KEY_NSSupportsLiveActivities: YES
+        # 允许较高频更新：agent 循环里阶段切换（思考→执行工具→完成）可能几秒一次，
+        # 不开这个的话系统会把更新合并/延后，观感变成"卡住不动"。
+        INFOPLIST_KEY_NSSupportsLiveActivitiesFrequentUpdates: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         # iPad 必须**四个方向全支持**，否则打包校验会报
@@ -63,6 +83,38 @@ targets:
         ENABLE_BITCODE: NO
         # 链接后端框架
         OTHER_LDFLAGS: $(inherited) -framework Metal -framework Accelerate -framework Foundation
+
+  # 灵动岛 / 锁屏实时活动扩展。
+  LumenAIWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: LumenAIWidget
+      # ⚠️ 共享的数据契约要**同时**编进扩展：ActivityAttributes 必须两个 target
+      # 各有一份（它没有独立的框架可共享）。漏了它，扩展那边会报"找不到类型"，
+      # 而报错位置指向灵动岛的布局代码，看起来像 UI 写错了。
+      - path: LumenAI/LiveActivity/LumenAIActivityAttributes.swift
+    info:
+      path: LumenAIWidget/Info.plist
+      properties:
+        CFBundleDisplayName: LumenAI
+        # ⚠️ 扩展的版本必须与主 App **完全一致**：不一致是 App Store 上传会被直接拒的
+        # 那类问题（"The bundle version of the extension does not match the app"）。
+        # 不写这两个键时 XcodeGen 用默认值 1.0 —— 而它不会报错，只是静静地对不上。
+        # 用 $(MARKETING_VERSION) 引用构建设置，这样以后升版本只改一处。
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          # 这个 identifier 决定扩展的类型，写错的话系统根本不认它（不会报错，只是不出现）
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lumenai.app.widget
+        MARKETING_VERSION: 0.3.61
+        CURRENT_PROJECT_VERSION: 61
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # 扩展不单独安装进 /Applications
+        SKIP_INSTALL: YES
 
 schemes:
   LumenAI:

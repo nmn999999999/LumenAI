@@ -56,6 +56,13 @@ final class AgentService: ObservableObject {
     @Published private(set) var steps: [Step] = []
     @Published private(set) var isRunning = false
 
+    /// 被系统打断时的说明（目前只有一种来源：切到后台的时间用尽、我们主动取消了这一轮）。
+    ///
+    /// 为什么需要一句话而不是静默取消：取消的表现是气泡停在半句话上、界面回到可输入状态，
+    /// 而用户刚才是主动切出去的 —— 他回来看到"没反应"，唯一合理的猜测是"App 坏了"。
+    /// 说清楚"是系统回收、不是出错、回来重发即可"，用户才知道下一步该干什么。
+    @Published var interruptionNote: String?
+
     /// 循环不设硬性轮数上限：正常终止条件是模型输出结束暗号（或生成失败/任务取消）。
     /// 但设一个很大的「软上限」兜底：防止模型永远不输出暗号导致死循环烧电。
     /// 到达软上限前一轮会先通知模型强制收尾；若仍无暗号则优雅退出并返回最后一轮内容。
@@ -180,11 +187,25 @@ final class AgentService: ObservableObject {
         settings: ModelSettings,
         toolsEnabledTools: [AgentToolDefinition] = BuiltInTools.defaultEnabledTools,
         llm: LLMService,
-        bridge: AgentDisplayBridge? = nil
+        bridge: AgentDisplayBridge? = nil,
+        /// 本次任务属于哪段对话、写回哪条气泡。断点存档要用它们 ——
+        /// 没有这两个 id，续跑时不知道该把内容接到哪里去（只能新建一条气泡，看起来像"又发了一轮"）。
+        conversationID: UUID? = nil,
+        bubbleID: UUID? = nil,
+        /// 断点续跑：传入存档时，从它记录的轮次与历史上接着跑，而不是从零开始。
+        /// 调用方（ChatView）负责把对话切回去、并把内容接在同一条气泡上 ——
+        /// 这两件事需要 UI 状态，AgentService 自己做不到。
+        resuming checkpoint: AgentRunCheckpoint? = nil
     ) async -> (content: String, toolCalls: [ChatMessage.ToolCall]) {
 
         steps.removeAll()
         isRunning = true
+        // 续跑计数与对话/气泡归属：从存档里带过来，正常跑完时清档
+        // 续跑时用存档里的归属；首次运行时用调用方给的
+        let checkpointConversationID = checkpoint?.conversationID ?? conversationID
+        let checkpointBubbleID = checkpoint?.bubbleID ?? bubbleID
+        let checkpointResumeCount = (checkpoint?.resumeCount ?? 0)
+        let checkpointStartedAt = checkpoint?.startedAt ?? Date()
         defer { isRunning = false }
 
         var workingHistory = history
@@ -219,9 +240,48 @@ final class AgentService: ObservableObject {
         //    而不是在弹窗里隐式升级成永久信任 —— 用户点「总是允许」时的心理预期就是"这个任务别再问了"。
         var runApprovedTools: Set<String> = []
 
+        // 续跑时先补一条**明确交代**：告诉模型"上一轮被系统中断了，接着来"。
+        //
+        // 为什么必须补：工作历史的结尾通常是一条工具结果（role=tool），
+        // 模型看到它会自然地"继续指挥"，但完全不知道中间断过 —— 于是它可能把已经做完的
+        // 步骤重做一遍（重复调用、重复写入），这在有副作用的工具上是要出事的。
+        // 一句"已完成的部分不要重做"能挡住绝大多数重复。
+        if checkpoint != nil {
+            workingHistory.append(ChatMessage(role: .tool, content: """
+            上一轮因为「\(checkpoint?.reason ?? "系统中断")」被打断，现在继续。
+            已经完成的步骤不要重做，直接从下一步接着进行；若已经可以给出结论，就直接给结论。
+            """))
+        }
+
+        /// 连续瞬时失败计数（成功一轮就清零，见循环末尾）
+        var retryStreak = 0
         while true {
-            guard !Task.isCancelled else { break }
+            if Task.isCancelled {
+                // 取消不是"用户放弃了"，而多半是系统把我们从后台收走了 —— 存档，等回来续。
+                saveCheckpoint(history: workingHistory, iteration: iteration,
+                               toolCalls: allToolCalls, conversationID: checkpointConversationID,
+                               bubbleID: checkpointBubbleID, startedAt: checkpointStartedAt,
+                               resumeCount: checkpointResumeCount,
+                               reason: interruptionNote ?? "App 被切到后台、系统回收了进程")
+                break
+            }
             iteration += 1
+            liveIteration = iteration
+
+            // 每轮**开始**时存一次档。
+            //
+            // 为什么必须有这一步，而不只在"被取消/生成失败"时存：
+            // **App 被系统直接杀掉时没有任何回调** —— 内存压力下 iOS 可以直接终止进程，
+            // 我们没有任何机会执行收尾代码。那种情况下唯一能救回来的，就是"上一次
+            // 定期写下的存档"。粒度取"每轮一次"是权衡：轮与轮之间可能隔着多次工具调用，
+            // 存得太密是白写盘，太稀则被杀掉时丢的进度太多。
+            // 存在**轮首**而不是轮尾：轮首的快照正好是"这一轮还没开始"的状态，
+            // 续跑时重发这一轮即可，不会重复执行已经做过的工具调用（副作用安全）。
+            saveCheckpoint(history: workingHistory, iteration: iteration,
+                           toolCalls: allToolCalls, conversationID: checkpointConversationID,
+                           bubbleID: checkpointBubbleID, startedAt: checkpointStartedAt,
+                           resumeCount: checkpointResumeCount,
+                           reason: "App 在上一轮进行中被系统回收")
 
             // 软上限前一轮：通知模型这是最后一轮，必须收尾
             if iteration == Self.softIterationLimit {
@@ -258,11 +318,39 @@ final class AgentService: ObservableObject {
                     raw = try await llm.complete(messages: promptMessages, settings: settings)
                 }
             } catch {
-                let msg = "生成失败: \(error.localizedDescription)"
                 if let id = iterationID { bridge?.endIteration(id) }
+
+                // 瞬时网络错误（超时、连接重置、断网、5xx/429）**不该终结整场任务**。
+                //
+                // 原来的行为是：任何一次生成失败都直接 return，整场 agent 任务就此结束 ——
+                // 而用户看到的是一句"生成失败"，前面跑过的十几轮全部作废。
+                // 而实测里最常见的失败恰恰是瞬时的：切了下网络、Wi-Fi 换了频段、
+                // 对面抖了一下。这类失败等一两秒重来一次就过了。
+                let transient = RetryPolicy.isTransient(error)
+                if transient, retryStreak < 2 {
+                    retryStreak += 1
+                    let wait = RetryPolicy.delay(attempt: retryStreak)
+                    appendStep(.thinking, "本轮生成中断（\(shortReason(error))），"
+                              + "\(String(format: "%.1f", wait))s 后自动重试")
+                    try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                    // 轮次回退一格：这一次没算数，不应该占用软上限、也不应该推进 iteration
+                    iteration -= 1
+                    continue
+                }
+
+                let msg = "生成失败: \(error.localizedDescription)"
                 appendStep(.finalAnswer, msg)
+                // 非瞬时失败也要存档：用户可能只是网络暂时不通，回头网络好了还能续。
+                saveCheckpoint(history: workingHistory, iteration: iteration,
+                               toolCalls: allToolCalls, conversationID: checkpointConversationID,
+                               bubbleID: checkpointBubbleID, startedAt: checkpointStartedAt,
+                               resumeCount: checkpointResumeCount,
+                               reason: "生成失败：\(shortReason(error))")
                 return (msg, allToolCalls)
             }
+
+            // 这一轮生成成功——把连续失败计数清零（否则三次零散失败会被误判成"连续失败"）
+            retryStreak = 0
 
             // 1) 结束暗号优先：在【原始文本】上检测，避免答案被裹在 <think> 内时
             //    被提前剥离思考块而连暗号一起丢失。命中后再对最终答案单独剥离思考块，
@@ -696,6 +784,12 @@ final class AgentService: ObservableObject {
             }
         }
 
+        // 走到这里说明是正常结束（出了结束暗号 / 软上限 / 取消）——
+        // 正常结束就把存档清掉，否则下次启动会去"续"一个早就完成的任务。
+        if !Task.isCancelled {
+            AgentCheckpointStore.shared.clear()
+        }
+
         // 循环只在「取消」或「软上限耗尽」时到达这里。
         //
         // 兜底的第一条判据是「最后一次思考**就是上一轮**写的」。只判 `lastThinking` 非空
@@ -724,6 +818,50 @@ final class AgentService: ObservableObject {
         """
         appendStep(.finalAnswer, fallback)
         return (fallback, allToolCalls)
+    }
+
+    // MARK: - 断点存档
+
+    /// 写一份断点存档。
+    ///
+    /// 没有对话 id 时不写：那种存档续不回来（不知道该写进哪条对话/哪条气泡），
+    /// 留着只会让下次启动去做一件做不到的事 —— 与其留下一个必然失败的存档，不如不写。
+    private func saveCheckpoint(history: [ChatMessage],
+                                iteration: Int,
+                                toolCalls: [ChatMessage.ToolCall],
+                                conversationID: UUID?,
+                                bubbleID: UUID?,
+                                startedAt: Date,
+                                resumeCount: Int,
+                                reason: String) {
+        guard let conversationID, let bubbleID else { return }
+        AgentCheckpointStore.shared.save(AgentRunCheckpoint(
+            conversationID: conversationID,
+            bubbleID: bubbleID,
+            history: history,
+            iteration: iteration,
+            toolCalls: toolCalls,
+            startedAt: startedAt,
+            reason: reason,
+            resumeCount: resumeCount
+        ))
+    }
+
+    /// 把错误压成一句人能读的短说明（存进存档、显示在步骤条上）。
+    /// 直接用 `localizedDescription` 会带出很长的系统文案，存档里和提示里都嫌吵。
+    private func shortReason(_ error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorTimedOut:                 return "网络超时"
+            case NSURLErrorNetworkConnectionLost:    return "连接中断"
+            case NSURLErrorNotConnectedToInternet:   return "当前无网络"
+            case NSURLErrorCannotConnectToHost:      return "连不上服务器"
+            case NSURLErrorCancelled:                return "已取消"
+            default:                                 return "网络错误(\(ns.code))"
+            }
+        }
+        return String(ns.localizedDescription.prefix(40))
     }
 
     func reset() {
@@ -1287,6 +1425,35 @@ final class AgentService: ObservableObject {
         return String(data: data, encoding: .utf8) ?? "\(dict)"
     }
 
+    /// 当前轮次。给灵动岛用 —— `appendStep` 是个普通方法，拿不到 `run()` 里的局部变量，
+    /// 所以把轮次存在属性上。每个 run 开始时重置。
+    private var liveIteration = 0
+
+    /// 把当前进度推给灵动岛 / 锁屏卡片。
+    ///
+    /// 放在 `appendStep` 里而不是散在各处调用点：agent 循环里"有进展"这件事
+    /// 无一例外都会经过 appendStep（思考、执行工具、工具结果、最终答案），
+    /// 所以这里是唯一一个**不会漏**的位置。散着写的话，将来新加一条分支就会漏掉更新，
+    /// 而漏掉的表现是灵动岛停在旧状态 —— 用户以为卡死了。
+    private func pushLiveActivity(_ kind: Step.Kind, _ detail: String) {
+        let phase: LumenAIActivityAttributes.Phase
+        switch kind {
+        case .thinking:   phase = .thinking
+        case .executing:  phase = .tool
+        case .result:     phase = .tool
+        case .finalAnswer: phase = .done
+        }
+        LiveActivityManager.shared.update(.init(
+            title: Self.brief(detail, maxLength: 40),
+            phase: phase,
+            step: liveIteration,
+            totalSteps: Self.softIterationLimit,
+            detail: nil,
+            progress: nil,
+            startedAt: Date()
+        ))
+    }
+
     private func appendStep(_ kind: Step.Kind, _ detail: String) {
         // 步骤条是**横向胶囊条**，每一条都会渲染成一个 glassEffect 胶囊。
         // 这里原来塞的是 `"\(name) → \(limited)"`，而 limitResult 的上限是 2000 字 ——
@@ -1297,6 +1464,7 @@ final class AgentService: ObservableObject {
         // 工具 chip 里可以展开看。所以这里统一截到 brief 的长度。
         // 注意 thinking 本来就走了 brief，所以这条改动只是把 result 拉齐到同一口径。
         steps.append(Step(kind: kind, detail: Self.briefStep(detail)))
+        pushLiveActivity(kind, detail)
         // 上限兜底：一个长任务可以产生几十条步骤，而横条不是懒加载的
         // （`ForEach` 直接在 HStack 里，全部实例化）。只保留最近的一段。
         if steps.count > Self.maxSteps {

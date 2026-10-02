@@ -19,11 +19,38 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
         case alpaca
     }
 
-    /// 下载地址。使用国内可直连的 HuggingFace 镜像（hf-mirror.com），
-    /// 避免 huggingface.co 在国内网络环境下拉不动/被墙。
-    var downloadURL: URL? {
-        URL(string: "https://hf-mirror.com/\(repo)/resolve/main/\(fileName)")
+    /// **候选**下载源，按实测速度与稳定性排序。下载失败时会依次往下试。
+    ///
+    /// 为什么要多个源，而不是继续只用一个 hf-mirror：
+    /// 用户反馈"本地模型下载不了、还极其不稳定"。实测过同一个文件（Qwen3-1.7B 的
+    /// Q4_K_M GGUF，1.1GB）在两个源上的表现：
+    ///   · hf-mirror.com    1.50 MB/s，且会超时中断
+    ///   · modelscope.cn    4.97 MB/s，稳定
+    /// 差 3.3 倍。**1.1GB 在这个量级上的差别是"能下完"和"下不完"的区别** ——
+    /// 慢到一定程度，中断概率会随耗时线性上升，而每一次中断都要从头再来
+    ///（旧实现既不续传也不重试）。所以这里把快的源放前面。
+    ///
+    /// 顺序不是"哪个都行"，是**实测优先**：魔搭先试，失败再退到 hf-mirror。
+    /// 注意并非所有仓库魔搭都有镜像（我们自己训的那个 `luozx16/lumen-local` 就没有），
+    /// 那时第一个源会 404 —— 这不算"重试"，而是**换源**，见 ModelManager 里的处理。
+    var downloadSources: [URL] {
+        var out: [URL] = []
+        if let ms = URL(string: "https://modelscope.cn/models/\(repo)/resolve/master/\(fileName)") {
+            out.append(ms)
+        }
+        if let hf = URL(string: "https://hf-mirror.com/\(repo)/resolve/main/\(fileName)") {
+            out.append(hf)
+        }
+        // 最后兜一个直连 HuggingFace：国内多数时候不通，但通了就是最快的，
+        // 而且它排在最后，不通也只是多花一次握手的时间。
+        if let direct = URL(string: "https://huggingface.co/\(repo)/resolve/main/\(fileName)") {
+            out.append(direct)
+        }
+        return out
     }
+
+    /// 首选下载地址（兼容旧调用点）
+    var downloadURL: URL? { downloadSources.first }
 
     /// 是不是**本项目自己训出来的**权重（而不是通用底座）。
     ///
@@ -271,6 +298,16 @@ struct ModelSettings: Codable, Sendable {
     /// 系统 TTS 语音标识（如 zh-CN / en-US）
     var ttsVoice: String
     /// 网络 TTS 音色名（如 alloy / echo）
+    /// 网络 TTS 专用 Provider 的 id（空 = 沿用当前对话的 Provider）。
+    ///
+    /// 为什么要独立出来：原来网络 TTS 直接拿"当前对话用的 Provider"去调 `/audio/speech`，
+    /// 于是**能不能用语音取决于你对话时选的那家支不支持 TTS**。
+    /// 而主力模型 DeepSeek 根本没有这个接口 —— 结果就是网络 TTS 静默回退到系统 TTS，
+    /// 用户以为自己选的是"网络 TTS"，听到的却是系统音色，而且没有任何提示。
+    /// 现在可以单独指定一家支持 TTS 的（比如硅基流动的 CosyVoice2），
+    /// 和对话用哪家彻底解耦。
+    var ttsProviderID: String
+
     var ttsVoiceName: String
     /// 网络 TTS 模型名
     var ttsModel: String
@@ -347,6 +384,7 @@ struct ModelSettings: Codable, Sendable {
         cloudWebSearch: Bool = false,
         ttsEngine: String = "system",
         ttsVoice: String = "",
+        ttsProviderID: String = "",
         ttsVoiceName: String = "alloy",
         ttsModel: String = "tts-1",
         ttsKokoroVoice: String = "zf_xiaoxiao",
@@ -397,6 +435,7 @@ struct ModelSettings: Codable, Sendable {
         self.ttsEngine = ttsEngine
         self.ttsVoice = ttsVoice
         self.ttsVoiceName = ttsVoiceName
+        self.ttsProviderID = ttsProviderID
         self.ttsModel = ttsModel
         self.ttsKokoroVoice = ttsKokoroVoice
         self.ttsSpeed = ttsSpeed
@@ -432,7 +471,7 @@ struct ModelSettings: Codable, Sendable {
         case temperature, topP, topK, maxTokens, contextLength, systemPrompt,
              gpuLayers, searchEngine, searxngURL, showThinking, showToolCalls, useMmap,
              apiEnabled, apiEndpoint, apiKey, apiModel, apiTemperature, apiMaxTokens,
-             cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsKokoroVoice, ttsSpeed, language,
+             cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsProviderID, ttsKokoroVoice, ttsSpeed, language,
              keepScreenOn, memoryEnabled, worldBookEnabled, instructionEnabled,
              promptStrategy, useMetalAuto, kvCacheQuantize, autoCheckUpdate, grayOptIn, autoExtractMemory,
              s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region,
@@ -468,6 +507,8 @@ struct ModelSettings: Codable, Sendable {
         ttsEngine = try c.decodeIfPresent(String.self, forKey: .ttsEngine) ?? "system"
         ttsVoice = try c.decodeIfPresent(String.self, forKey: .ttsVoice) ?? ""
         ttsVoiceName = try c.decodeIfPresent(String.self, forKey: .ttsVoiceName) ?? "alloy"
+        // 旧存档没有这个键 → 空串 → 沿用当前对话的 Provider，与旧版行为完全一致
+        ttsProviderID = try c.decodeIfPresent(String.self, forKey: .ttsProviderID) ?? ""
         ttsModel = try c.decodeIfPresent(String.self, forKey: .ttsModel) ?? "tts-1"
         ttsKokoroVoice = try c.decodeIfPresent(String.self, forKey: .ttsKokoroVoice) ?? "zf_xiaoxiao"
         ttsSpeed = try c.decodeIfPresent(Double.self, forKey: .ttsSpeed) ?? 1.0
@@ -520,6 +561,7 @@ struct ModelSettings: Codable, Sendable {
         try c.encode(ttsEngine, forKey: .ttsEngine)
         try c.encode(ttsVoice, forKey: .ttsVoice)
         try c.encode(ttsVoiceName, forKey: .ttsVoiceName)
+        try c.encode(ttsProviderID, forKey: .ttsProviderID)
         try c.encode(ttsModel, forKey: .ttsModel)
         try c.encode(ttsKokoroVoice, forKey: .ttsKokoroVoice)
         try c.encode(ttsSpeed, forKey: .ttsSpeed)
