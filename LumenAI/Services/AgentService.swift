@@ -1517,19 +1517,43 @@ final class AgentService: ObservableObject {
     }
 
     /// 粗略提取顶层平衡的 {...} 子串（快速路径：无花括号直接返回空）
+    ///
+    /// ⚠️ 这里的 `depth` 必须**感知字符串字面量**，否则有一类错会静默发生：
+    /// 参数值里出现花括号时（比如让模型写一段代码 `{"code":"if (x) { y() }"}`），
+    /// 或者值里就是孤立的 `}`（`{"pattern":"}"}`），裸计数会提前把对象判为配平，
+    /// 截出一个**非法 JSON 片段**，解析失败 → 这一轮被当成"中间思考"白费。
+    /// 所以字符串内外要分开处理，并正确处理 `\"` 转义。
+    ///
+    /// 另外，结尾仍有**未闭合**的对象时不再直接丢弃，而是修补后一并返回 ——
+    /// 见 `repairTruncatedJSON` 的说明，这是本地模型最常见的失败形态。
     fileprivate static func extractJSONObjects(in text: String) -> [String] {
         guard text.contains("{") else { return [] }
-        
+
         var results: [String] = []
         var depth = 0
         var start: String.Index?
+        var inString = false
+        var escaped = false
 
         for i in text.indices {
             let ch = text[i]
-            if ch == "{" {
+
+            if inString {
+                if escaped { escaped = false }
+                else if ch == "\\" { escaped = true }   // 反斜杠转义下一个字符
+                else if ch == "\"" { inString = false }
+                continue
+            }
+
+            switch ch {
+            case "\"":
+                // 只有已经进入某个对象之后，引号才开始字符串语义；
+                // 对象外的引号（散文里的引号）不参与配对，否则会把括号吃掉。
+                if depth > 0 { inString = true }
+            case "{":
                 if depth == 0 { start = i }
                 depth += 1
-            } else if ch == "}" {
+            case "}":
                 if depth > 0 {
                     depth -= 1
                     if depth == 0, let s = start {
@@ -1537,9 +1561,67 @@ final class AgentService: ObservableObject {
                         start = nil
                     }
                 }
+            default:
+                break
             }
         }
+
+        // 结尾还有没闭合的对象 = 模型输出被截断（本地模型撞 maxTokens、或自己停顿了）。
+        // 这是本地模型最高的失败形态，能救回来就少浪费一整轮。
+        if depth > 0, let s = start, let fixed = repairTruncatedJSON(String(text[s...])) {
+            results.append(fixed)
+        }
+
         return results
+    }
+
+    /// 修补**被截断的** JSON：补上未闭合的字符串、去掉悬空的尾随逗号、按栈闭合括号。
+    ///
+    /// 为什么值得单独修：本地模型的工具调用常常在参数值中间断掉，例如
+    /// `{"name":"web_search","arguments":{"query":"上海天气` —— 单个引号没闭合，
+    /// 严格解析必然失败，于是整轮被当作散文丢弃、模型得不到任何工具反馈，
+    /// 下一轮它很可能**换个说法再试一次**，如此反复。
+    /// 补成 `{"name":"web_search","arguments":{"query":"上海天气"}}` 之后，
+    /// 至少能真的执行（哪怕参数是截断的），模型也就拿到了可用反馈。
+    ///
+    /// 这里**不校验结果是否合法 JSON**，因为校验由调用方做（它们本来就要
+    /// `JSONSerialization` + 工具名白名单双重把关）—— 补坏了不会被执行，
+    /// 而补对了却能救回一轮。返回 nil 表示"连一个引号都没有"，不值得当候选。
+    static func repairTruncatedJSON(_ s: String) -> String? {
+        guard s.contains("\"") else { return nil }
+
+        var out = ""
+        var stack: [Character] = []      // 待闭合的括号，逆序
+        var inString = false
+        var escaped = false
+
+        for ch in s {
+            if inString {
+                out.append(ch)
+                if escaped { escaped = false }
+                else if ch == "\\" { escaped = true }
+                else if ch == "\"" { inString = false }
+                continue
+            }
+            switch ch {
+            case "\"": inString = true; out.append(ch)
+            case "{": stack.append("}"); out.append(ch)
+            case "[": stack.append("]"); out.append(ch)
+            case "}", "]":
+                if let top = stack.last, ch == top { stack.removeLast() }
+                out.append(ch)
+            default: out.append(ch)
+            }
+        }
+
+        if inString { out.append("\"") }   // 补上被截断的字符串
+
+        // 去掉悬空的尾随逗号：`{"a":1,` → `{"a":1`
+        while let last = out.last, last.isWhitespace { out.removeLast() }
+        if out.last == "," as Character { out.removeLast() }
+
+        for closer in stack.reversed() { out.append(closer) }
+        return out
     }
 
 

@@ -31,11 +31,11 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
     ///（旧实现既不续传也不重试）。所以这里把快的源放前面。
     ///
     /// 顺序不是"哪个都行"，是**实测优先**：魔搭先试，失败再退到 hf-mirror。
-    /// 注意并非所有仓库魔搭都有镜像（我们自己训的那个 `luozx16/lumen-local` 就没有），
-    /// 那时第一个源会 404 —— 这不算"重试"，而是**换源**，见 ModelManager 里的处理。
+    /// 万一某个仓库魔搭确实没有镜像，第一个源会 404 —— 这不算"重试"，而是**换源**，
+    /// 见 ModelManager 里的处理（404 直接换源且不退避，实测只花 0.2 秒）。
     var downloadSources: [URL] {
         var out: [URL] = []
-        if let ms = URL(string: "https://modelscope.cn/models/\(repo)/resolve/master/\(fileName)") {
+        if let ms = URL(string: "https://modelscope.cn/models/\(modelscopeRepo)/resolve/master/\(fileName)") {
             out.append(ms)
         }
         if let hf = URL(string: "https://hf-mirror.com/\(repo)/resolve/main/\(fileName)") {
@@ -51,6 +51,21 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
 
     /// 首选下载地址（兼容旧调用点）
     var downloadURL: URL? { downloadSources.first }
+
+    /// 魔搭上的对应仓库名 —— **不能直接用 `repo` 拼**。
+    ///
+    /// 原因是属主不同名：我们在 HuggingFace 上的账号是 `luozx16`，
+    /// 在魔搭上叫 `luozx123`（魔搭的 `luozx16` 不是我们，抢注或占用都无法预知）。
+    /// 原先那句注释写着"我们自训的那个仓库魔搭没有镜像" —— 那是当时的事实，
+    /// 现在两个自训权重都已经镜像到魔搭了，可仓库名仍不是同一个字符串。
+    ///
+    /// 这里写成**通用映射**（自家账号前缀替换）而不是给某个仓库名做特判，
+    /// 这样以后再加自训权重不用回来改这一处 —— 特判正是那种"下次必忘"的写法。
+    var modelscopeRepo: String {
+        let hfOwner = "luozx16/"
+        guard repo.hasPrefix(hfOwner) else { return repo }
+        return "luozx123/" + repo.dropFirst(hfOwner.count)
+    }
 
     /// 是不是**本项目自己训出来的**权重（而不是通用底座）。
     ///
@@ -94,6 +109,28 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
             fileName: "LumenAI-s200-Q4_K_M.gguf",
             sizeDescription: "~1.1 GB",
             description: "本项目的自训模型（Qwen3-1.7B + 陪伴/记忆 LoRA 合并后量化）。相比原版底座，它会主动把值得记住的事写进长期记忆、需要时再读回来，说话也更短、更少说教。工具调用与代码能力与底座同级。",
+            templateType: .chatML,
+            supportsMultimodal: false,
+            supportsToolCalling: true
+        ),
+        // 4B 版自训权重。和上面那条是**同一份训练数据、同一套配方**，只有底座规模不同
+        //（Qwen3-1.7B → Qwen3-4B-Instruct-2507），所以两者可以直接对比出"容量"的作用。
+        //
+        // 为什么值得单列一条，而不是把 1.7B 换掉：实测评测的结果很干脆 ——
+        // 同样的数据、同样的步骤，1.7B 的"主动存记忆"只有 0.40，4B 是 **1.00**；
+        // 而 4B 上零说教词、零逐字复读、零冷拒绝，1.7B 那一代这三个毛病都还在。
+        // 也就是说瓶颈一直是**容量**，不是数据；但 4B 要 2.4GB 内存和更长的下载时间，
+        // 所以两条都留着，让用户按机型和网络自己选，而不是替他决定。
+        //
+        // 已核对：GGUF 元数据与 1.7B 逐项比对，分词器、BOS/EOS/PAD（151643/151645/151643）、
+        // 是否自动加减特殊 token 全部一致，所以桥接层的参数**原样复用**，接入是纯目录改动。
+        AIModelInfo(
+            id: "lumen-4b-companion-q4km",
+            name: "LumenAI 4B（陪伴 · 记忆 · 强力）",
+            repo: "luozx16/lumen-local",
+            fileName: "LumenAI-companion-lora-lumen9b-Q4_K_M.gguf",
+            sizeDescription: "~2.4 GB",
+            description: "本项目的自训模型（Qwen3-4B-Instruct-2507 + 陪伴/记忆 LoRA 合并后量化），与 1.7B 版同一份数据、同一套配方。实测「主动把值得记住的事写进长期记忆」的成功率由 1.7B 的 0.40 提升到 1.00，自主读回记忆 0.83，说教词、逐字复读、冷拒绝均为 0。简单说：1.7B 记得住但不总想起来记，4B 会稳定地记、并且回答更自然。需要设备有 6GB 以上可用内存。",
             templateType: .chatML,
             supportsMultimodal: false,
             supportsToolCalling: true
