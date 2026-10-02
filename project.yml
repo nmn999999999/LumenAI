@@ -51,8 +51,8 @@ targets:
         # iOS 26 App 图标：Icon Composer 工程（appicon.icon）作为官方 AppIcon 源，
         # 由 actool 用 Icon Composer 渲染管线生成含液态玻璃效果的全部变体
         ASSETCATALOG_COMPILER_APPICON_NAME: appicon
-        MARKETING_VERSION: 0.3.67
-        CURRENT_PROJECT_VERSION: 67
+        MARKETING_VERSION: 0.3.68
+        CURRENT_PROJECT_VERSION: 68
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         # 实时活动（灵动岛 / 锁屏）的开关。**缺了它 Activity.request 会直接抛异常**，
         # 而错误信息只说请求失败，不会告诉你"是 Info.plist 少了个 key"。
@@ -117,8 +117,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lumenai.app.widget
-        MARKETING_VERSION: 0.3.67
-        CURRENT_PROJECT_VERSION: 67
+        MARKETING_VERSION: 0.3.68
+        CURRENT_PROJECT_VERSION: 68
         TARGETED_DEVICE_FAMILY: "1,2"
         # 扩展不单独安装进 /Applications
         SKIP_INSTALL: YES

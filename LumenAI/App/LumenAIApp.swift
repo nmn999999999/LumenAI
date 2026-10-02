@@ -105,6 +105,31 @@ struct LumenAIApp: App {
                         chatStore.flushSave()
                     }
                 }
+                // ⚠️ 内存告警：CosyVoice3 的引擎常驻约 1.2GB，机器本来就紧。
+                // 用户反馈「有一次还卡退了」—— 大概率就是系统在内存压力下
+                // 把 App 杀掉。这里收到告警就把引擎卸掉，让它在后台不占内存，
+                // 下次朗读时会重新加载（几十秒，但至少不会被杀）。
+                // 这不是"优化"，是"别在内存告急时还死守着 1GB"。
+                .onReceive(NotificationCenter.default.publisher(
+                    for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
+                    if ProcessInfo.processInfo.thermalState == .serious
+                        || ProcessInfo.processInfo.thermalState == .critical {
+                        Task { @MainActor in
+                            CosyVoiceTTSManager.shared.unload()
+                            TTSService.shared.stop()
+                        }
+                    }
+                }
+                // 用原始字符串常量而不是 `UIApplication.lowMemoryNotification`：
+                // 后者在某些 SDK 版本里会被重命名成别的名字，而通知名本身是
+                // 不变的 "UIApplicationLowMemoryNotification"，用字符串最稳。
+                .onReceive(NotificationCenter.default.publisher(
+                    for: Notification.Name("UIApplicationLowMemoryNotification"))) { _ in
+                    Task { @MainActor in
+                        CosyVoiceTTSManager.shared.unload()
+                        TTSService.shared.stop()
+                    }
+                }
         }
     }
 

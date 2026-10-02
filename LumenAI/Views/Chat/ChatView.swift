@@ -1470,7 +1470,16 @@ struct ChatView: View {
             if isThisOne { return }
             // 点的是别的条 → 停掉旧的，继续往下把这一条读出来。
         }
-        let text = message.visibleContent
+        // ⚠️ 必须用**和气泡显示同一份**文本。
+        //
+        // 气泡渲染走的是 `AgentService.cleanDisplayText(visibleContent)`
+        // （剔除工具调用 JSON、结束暗号、代码围栏标记），而这里原来直接读
+        // `visibleContent` —— 于是屏幕上明明看不到工具调用，朗读却把那段
+        // JSON 念了出来。朗读和显示不是同一份文本，是这类"念出奇怪东西"
+        // 的通用根因，所以这里直接复用显示用的同一个函数，而不是再写一套清理。
+        let text = message.isAgentRound
+            ? AgentService.cleanDisplayText(message.visibleContent)
+            : message.visibleContent
         guard !text.isEmpty else { return }
         speakingMessageID = message.id
         ttsService.speak(text)
