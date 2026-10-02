@@ -51,8 +51,8 @@ targets:
         # iOS 26 App 图标：Icon Composer 工程（appicon.icon）作为官方 AppIcon 源，
         # 由 actool 用 Icon Composer 渲染管线生成含液态玻璃效果的全部变体
         ASSETCATALOG_COMPILER_APPICON_NAME: appicon
-        MARKETING_VERSION: 0.3.64
-        CURRENT_PROJECT_VERSION: 64
+        MARKETING_VERSION: 0.3.65
+        CURRENT_PROJECT_VERSION: 65
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         # 实时活动（灵动岛 / 锁屏）的开关。**缺了它 Activity.request 会直接抛异常**，
         # 而错误信息只说请求失败，不会告诉你"是 Info.plist 少了个 key"。
@@ -117,8 +117,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lumenai.app.widget
-        MARKETING_VERSION: 0.3.64
-        CURRENT_PROJECT_VERSION: 64
+        MARKETING_VERSION: 0.3.65
+        CURRENT_PROJECT_VERSION: 65
         TARGETED_DEVICE_FAMILY: "1,2"
         # 扩展不单独安装进 /Applications
         SKIP_INSTALL: YES
@@ -128,6 +128,14 @@ schemes:
     build:
       targets:
         LumenAI: all
+      # SPM 的 checkout 是只读的，而且重新解析依赖会把它重置回上游原样。
+      # 上游 v0.0.28 的 CosyVoice 加载器不认 4-bit 权重（详见脚本注释），
+      # 所以每次构建前都把补丁重新打一遍 —— 脚本幂等，已打过就跳过。
+      preActions:
+        - name: 修补 speech-swift（放行 4-bit CosyVoice3 权重）
+          script: |
+            /usr/bin/env python3 "$SRCROOT/scripts/patch-speech-swift.py" || true
+          settingsTarget: LumenAI
     run:
       config: Debug
     archive:

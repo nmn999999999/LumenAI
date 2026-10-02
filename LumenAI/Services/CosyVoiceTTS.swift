@@ -346,6 +346,15 @@ enum CosyVoiceManifest {
 
     /// 必需文件合计 740.5 MiB。
     ///
+    /// 上游 speech-swift 只放行 8-bit 与 bf16 两种权重布局，遇到 4-bit
+    /// 会在加载时直接抛错（"must be 8-bit quantized or 16-bit/bf16 plain Linear"）。
+    /// 但 MLX 本身原生支持 4-bit 的 `QuantizedLinear`，这条限制只是加载器
+    /// 读 `config.json` 的 `quantization.bits` 时写得过死；而 4-bit 包的
+    /// `config.json` 又**只声明了 LLM**、没有 `dit_quantization`，DiT 会被
+    /// 按 8-bit 默认值去校验 4-bit 张量。所以本项目改的是加载器：
+    /// **从 `(weight, scales)` 的形状反推真实位宽**，让声明值不再是唯一依据。
+    /// 这样用户已经下好的 4-bit 包无需重下即可使用。
+    ///
     /// `flow_noise.bin` 值得单独说明：4bit 仓库里**没有**这个文件（只有 bf16 仓库有）。
     /// 缺了它，模型不会报错，而是退化成"确定性键控噪声"—— 也就是能出声、但音质与上游
     /// 不一致。这种"能用但不对"的差异最难发现，所以镜像时把它一并取来补齐。

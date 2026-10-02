@@ -60,3 +60,7 @@ build-lumen3/
 build-mlx/
 build-*/
 *.xcworkspace/xcuserdata/
+
+# Python
+__pycache__/
+*.pyc
