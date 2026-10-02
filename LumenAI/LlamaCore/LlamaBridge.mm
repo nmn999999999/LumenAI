@@ -43,6 +43,15 @@ struct llama_bridge {
 
     llama_batch batch = {};
 
+    /// 上一轮 prompt 的 token 序列，用于**跨轮复用 KV cache**。
+    ///
+    /// 为什么需要：原来每次 `llama_bridge_chat` 开头都 `llama_memory_clear` ——
+    /// 于是 agent 循环（一轮调一次）每一轮都把「system + 工具目录 + 整段历史」
+    /// 从头重新编码一遍。第 N 轮要重算前 N-1 轮的全部 token，是 O(n²)，
+    /// 手机上表现为"每一轮都比上一轮更慢"，长任务跑到后面几乎不可用。
+    /// 有了它就能只解码"这次和上次不一样"的那一段。
+    std::vector<llama_token> cached_tokens;
+
     // 采样随机数生成器（跨 token 复用，避免每 token 重置种子导致采样可预测）
     std::mt19937 rng{std::random_device{}()};
 
@@ -254,6 +263,26 @@ static int eval_tokens(llama_bridge * b, const std::vector<llama_token> & toks, 
     return llama_decode(b->ctx, b->batch);
 }
 
+/// 与 `eval_tokens` 相同，但只解码 `toks[start_idx...]`，并把它们的**绝对位置**
+/// 从 `start_pos` 开始编号。
+///
+/// 为什么不复用 `eval_tokens`：那个函数把位置硬编码成从 0 开始（`(llama_pos)i`），
+/// 只能用于"从头解码整个 prompt"。前缀复用必须能指定"从第几个位置接着写"，
+/// 否则新解码的 token 位置会和 KV 里已复用的部分重叠 → 报
+/// "inconsistent sequence positions"（这正是原来那句注释里担心的失败）。
+static int eval_tokens_from(llama_bridge * b, const std::vector<llama_token> & toks,
+                            size_t start_idx, llama_pos start_pos) {
+    common_batch_clear(b->batch);
+    size_t n = 0;
+    for (size_t i = start_idx; i < toks.size(); i++) {
+        common_batch_add(b->batch, toks[i], start_pos + (llama_pos)n, {0},
+                         i + 1 == toks.size());
+        n++;
+    }
+    if (n == 0) return 0;
+    return llama_decode(b->ctx, b->batch);
+}
+
 static int generate(llama_bridge * b, int n_past_start, void (*cb)(const char *, void *), void * ud) {
     int n_past = n_past_start;
     int max_tokens = b->max_tokens > 0 ? b->max_tokens : 512;
@@ -313,9 +342,14 @@ int llama_bridge_chat(llama_bridge * b,
         return 1;
     }
     b->stop = false; // 新一轮生成，重置停止标志
-    // 桥接为无状态：每轮都重新编码完整历史，因此必须清空 KV cache，
-    // 否则多轮对话时位置不连续会触发 "inconsistent sequence positions" 解码失败。
-    llama_memory_clear(llama_get_memory(b->ctx), true);
+    // ⚠️ 这里**不再无条件清空 KV cache**。
+    //
+    // 原来清空的理由是"桥接无状态、每轮重编码完整历史，位置才对得上"——
+    // 那个理由是在"每轮全量重编码"的前提下成立的。现在下半部分会算出
+    // 与上一轮的**最长公共前缀**并只补解码增量，所以这里的清空是多余的，
+    // 而且正是它让长任务每一轮都要重算全部历史（O(n²)）。
+    // 清理动作改由各路径自己决定：多模态一律清空（图像块使 token 流不可简单比较），
+    // 纯文本按前缀复用，且带"对不上就整体重来"的安全阀。
     if (!b->tmpls) {
         set_error(b, "chat template 未初始化");
         return 1;
@@ -387,6 +421,11 @@ int llama_bridge_chat(llama_bridge * b,
 
     // ----- multimodal path -----
     if (b->mctx) {
+        // 多模态一律全量重来：图像会被 mtmd 变成若干个 chunk，
+        // 其 token 流与上一轮不能按"逐 token 比较"来求公共前缀，
+        // 硬做前缀复用会把图像特征的位置算错。这里求稳。
+        llama_memory_clear(llama_get_memory(b->ctx), true);
+        b->cached_tokens.clear();
         mtmd::bitmaps bitmaps;
         for (auto & p : img_paths) {
             auto res = mtmd_helper_bitmap_init_from_file(b->mctx, p.c_str(), false);
@@ -455,11 +494,57 @@ int llama_bridge_chat(llama_bridge * b,
     if (b->n_ctx > 0 && (int)toks.size() > b->n_ctx) {
         toks.erase(toks.begin(), toks.end() - b->n_ctx);
     }
-    int rc = eval_tokens(b, toks, true);
+    // ── 跨轮复用 KV cache（前缀缓存）──
+    //
+    // 做法：求"这次 prompt"与"上次 prompt"的最长公共前缀 L，删掉 KV 里 L 之后的部分，
+    // 只解码 `toks[L...]`（位置从 L 开始编号）。system 提示词 + 工具目录 + 已经
+    // 对话过的历史都属于公共前缀 —— 它们**一次都不会被重算**。
+    size_t lcp = 0;
+    {
+        llama_memory_t mem = llama_get_memory(b->ctx);
+        const llama_pos kv_len = llama_memory_seq_pos_max(mem, 0) + 1;
+        while (lcp < b->cached_tokens.size() && lcp < toks.size()
+               && b->cached_tokens[lcp] == toks[lcp]) {
+            lcp++;
+        }
+        // ── 安全阀 ──
+        // 两个必须挡住的情况：
+        //   1. KV 里实际保存的位置数比 L 还少（比如上一轮生成时被 n_ctx 护栏截断过、
+        //      或者中途 stop 掉了）—— 那时"复用的前缀"其实并不存在，接着写会错位；
+        //   2. 前缀算出来是 0（这一轮的开头就变了，例如走的是不同的人格/工具集）。
+        // 两者都退化成**全量重编码**，也就是改动前的行为。
+        // 这个安全阀是刻意的：前缀复用如果出错，表现会是"回答变得莫名其妙"，
+        // 而不是报错 —— 那种错极难归因。宁可慢，也绝不能错位。
+        if (kv_len <= 0 || (llama_pos)lcp > kv_len) lcp = 0;
+        if (lcp > 0) {
+            llama_memory_seq_rm(mem, 0, (llama_pos)lcp, -1);
+        } else {
+            llama_memory_clear(mem, true);
+        }
+    }
+    // ⚠️ 必须加锁：log_lines 会被另一个线程（取日志的 UI 路径）读取，
+    // 裸 push_back 是数据竞争（本工程用 ThreadSanitizer 跑过，不留这种）。
+    {
+        std::lock_guard<std::mutex> lock(b->log_mutex);
+        if (lcp > 0) {
+            b->log_lines.push_back("[Bridge] KV 前缀复用 " + std::to_string(lcp) + "/"
+                                   + std::to_string(toks.size()) + " token，只解码 "
+                                   + std::to_string(toks.size() - lcp) + " 个");
+        } else {
+            b->log_lines.push_back("[Bridge] KV 全量重编码 " + std::to_string(toks.size()) + " token");
+        }
+    }
+
+    int rc = (lcp > 0) ? eval_tokens_from(b, toks, lcp, (llama_pos)lcp)
+                       : eval_tokens(b, toks, true);
     if (rc != 0) {
         set_error(b, with_log(b, "prompt 解码失败 (ret=" + std::to_string(rc) + ")"));
         return 5;
     }
+    // 记下这一轮的 prompt：下一轮求公共前缀要用它。
+    // 注意只记 prompt、不记生成出来的 token —— 生成的正文本来就会作为 assistant
+    // 消息出现在下一轮 prompt 里，公共前缀自然会延伸到那里，不需要额外维护。
+    b->cached_tokens = toks;
     int gret = generate(b, (int)toks.size(), token_cb, userdata);
     if (gret != 0) return 6;
     return 0;

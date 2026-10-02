@@ -66,11 +66,22 @@ final class AgentService: ObservableObject {
     /// 循环不设硬性轮数上限：正常终止条件是模型输出结束暗号（或生成失败/任务取消）。
     /// 但设一个很大的「软上限」兜底：防止模型永远不输出暗号导致死循环烧电。
     /// 到达软上限前一轮会先通知模型强制收尾；若仍无暗号则优雅退出并返回最后一轮内容。
-    static let softIterationLimit = 50
+    static let softIterationLimit = 150
+    // ↑ 为什么从 50 提到 150：50 对**长任务**是够不着天花板的 —— 一个真实的
+    // 「读几个文件 → 逐个改 → 跑验证」很容易用掉三四十轮，跑到一半被强制收尾，
+    // 用户看到的是"它明明还在干活、突然就说结束了"。
+    // 而软上限的**本来目的只是防死循环**，不是控制任务长度 ——
+    // 把它压到接近真实任务长度，等于用防死循环的机制去砍正常任务。
+    // 150 是权衡：足够长（按每轮 1~2 次工具调用算，约 150~300 次调用），
+    // 又不至于让"模型真的卡死"烧掉太多电费。而且真正防死循环的是**重复调用检测**
+    //（同参数连续 3 次即中止），它在轮数之前就会触发，所以放宽它不会放大风险。
 
     /// 工作历史上限（条数）。超过后丢弃最旧的对话消息（保留 system 工具说明），
     /// 防止超长 Agent 会话把 prompt 撑爆上下文、并降低反复重编码的开销。
-    static let maxWorkingMessages = 48
+    static let maxWorkingMessages = 120
+    // ↑ 从 48 提到 120，同样是配合更长的任务：48 条大约只够 12~16 轮
+    //（一轮 = 思考 + 调用 + 结果，再加一条续跑提示），长任务会**反复裁掉刚做过的事**，
+    // 于是模型下几轮就开始重做已经完成的步骤 —— 这就是"掉队"最直接的表现。
 
     /// Agent 循环结束「暗号」：模型给出最终回答前必须先输出它，
     /// 循环据此判定"模型已收集够信息，可以结束"。
@@ -465,6 +476,7 @@ final class AgentService: ObservableObject {
                                 appendStep(.thinking, "\(call.name) 已在本会话内授权，直接执行")
                             } else {
                                 appendStep(.thinking, "等待用户授权 \(call.name)…")
+                                pushLiveActivityAwaitingApproval(toolName: call.name)
                                 let decision: ApprovalDecision
                                 if let bridge {
                                     // 第一个参数是气泡 id（ChatView 当前忽略，仅透传 call）
@@ -675,6 +687,7 @@ final class AgentService: ObservableObject {
                         appendStep(.thinking, "\(call.name) 已在本会话内授权，直接执行")
                     } else {
                         appendStep(.thinking, "等待用户授权 \(call.name)…")
+                        pushLiveActivityAwaitingApproval(toolName: call.name)
                         let decision: ApprovalDecision
                         if let bridge {
                             // 第一个参数是气泡 id（ChatView 当前忽略，仅透传 call）
@@ -896,18 +909,41 @@ final class AgentService: ObservableObject {
 
         let pinned = (system != nil ? 1 : 0) + (firstUser != nil ? 1 : 0)
         let keep = max(0, maxWorkingMessages - pinned - 1)   // -1：给裁剪提示留一格
-        let dropped = max(0, rest.count - keep)
+        let rawStart = max(0, rest.count - keep)
+
+        // ⚠️ 裁剪必须**成对**，否则会切出一段模型无法理解、有的服务端甚至直接拒收的历史。
+        //
+        // 具体两种坏法，都源于"起点随便取后缀"：
+        //   1. 切点正好落在工具结果上 → 留下一条**没有对应调用的 tool 消息**。
+        //      OpenAI 兼容端点会认为消息序列不合法（tool 必须紧跟带 tool_calls 的 assistant），
+        //      轻则报 400，重则被服务端"顺手"纠正成别的语义，而模型据此得出错误结论。
+        //   2. 切点落在 `assistant(带 tool_calls)` 与其结果之间 → 调用没了、结果还在，
+        //      模型会以为这些结果是自己凭空产生的。
+        // 所以起点要**往后推**到安全边界：跳过开头的孤儿 tool 消息。
+        var start = rawStart
+        while start < rest.count, rest[start].role == .tool {
+            start += 1
+        }
+        let slice = Array(rest[start...])
+        // 提示里的数字要如实：被跳过的那些同样属于"已省略"
+        let actualDropped = droppedCount(rest, rawStart: rawStart, start: start)
 
         var out: [ChatMessage] = []
         if let system { out.append(system) }
         if let firstUser { out.append(firstUser) }
-        if dropped > 0 {
+        if actualDropped > 0 {
             out.append(ChatMessage(role: .tool, content:
-                "[上下文提示] 为控制长度，中间有 " + String(dropped)
+                "[上下文提示] 为控制长度，中间有 " + String(actualDropped)
                 + " 条较早的消息被省略（用户最初的诉求与最近的对话已保留）。"
-                + "如需早先的信息，请用工具重新获取，不要凭印象作答。"))
+                + "如需早先的信息，请用工具重新获取，不要凭印象作答。"
+                + "另外：已经完成的步骤不要重做，直接从下一步继续。"))
         }
-        return out + Array(rest.suffix(keep))
+        return out + slice
+    }
+
+    /// 被省略的消息条数（含为了让裁剪"成对"而额外跳过的那些）
+    private static func droppedCount(_ rest: [ChatMessage], rawStart: Int, start: Int) -> Int {
+        start
     }
 
     // MARK: - 工具说明注入
@@ -1443,15 +1479,45 @@ final class AgentService: ObservableObject {
         case .result:     phase = .tool
         case .finalAnswer: phase = .done
         }
+        // ⚠️ 这里**不能**拿 `softIterationLimit`（50）当分母。
+        //
+        // 那是我犯过的一个错，而且是用户一眼就看出来的：软上限是**内部的安全兜底**
+        //（防止模型永远不输出结束暗号导致死循环烧电），不是"这个任务有 50 步"。
+        // 把它当分母显示成 `1/50`，等于告诉用户"任务才完成 2%"——
+        // 而一个典型的 agent 任务只跑 3~8 轮就结束了。显示一个凭空的进度，
+        // 比不显示进度更糟：用户会据此判断"这要等很久"，然后放弃一个其实快完成的任务。
+        //
+        // 正确做法是**有真实计划才显示分数**：`todo` 工具产生的清单就是真的分步计划，
+        // 它的 已完成/总数 才是用户理解的那个"进度"。没有清单时只显示轮次、不带分母。
+        let plan = TodoStore.shared.todos
+        let doneInPlan = plan.filter { $0.status == .completed }.count
         LiveActivityManager.shared.update(.init(
             title: Self.brief(detail, maxLength: 40),
             phase: phase,
-            step: liveIteration,
-            totalSteps: Self.softIterationLimit,
+            // 有清单：用清单的完成数；没有：用轮次（UI 那边在没有分母时不会显示成分数）
+            step: plan.isEmpty ? liveIteration : doneInPlan,
+            totalSteps: plan.isEmpty ? nil : plan.count,
             detail: nil,
             progress: nil,
             startedAt: Date()
         ))
+    }
+
+    /// 等待用户授权时的灵动岛状态。
+    ///
+    /// 为什么不复用 `pushLiveActivity`：那一个是从步骤文案反推阶段的，而"等待授权"
+    /// 还需要带上**工具名**（卡片上要显示"它想干什么"，用户才敢决定允不允许），
+    /// 并且要出现按钮。靠解析文案字符串去拿这些信息太脆 —— 改一个字就静默失效。
+    private func pushLiveActivityAwaitingApproval(toolName: String) {
+        LiveActivityManager.shared.update(.init(
+            title: "需要授权：\(toolName)",
+            phase: .awaitingApproval,
+            step: liveIteration,
+            totalSteps: nil,
+            detail: "点下面的按钮即可，不用切回 App",
+            progress: nil,
+            pendingToolName: toolName,
+            startedAt: Date()), force: true)
     }
 
     private func appendStep(_ kind: Step.Kind, _ detail: String) {

@@ -20,6 +20,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         // 正常启动也要续传：上次退出时正在下的模型不应该被默默放弃。
         ModelManager.shared.resumePendingDownloads()
+
+        // 注册灵动岛授权按钮的处理：App 启动（含被系统在后台拉起）时挂上。
+        // 必须在**启动时**注册，而不是等用户进到聊天页 —— 因为用户按下灵动岛按钮时
+        // App 很可能刚被系统拉起来，那一刻还没有任何界面存在。
+        // 允许 = .once（只这一次），不升级成"本会话总是允许"：
+        // 隔着一块小卡片、看不到参数细节，不适合做"以后都别再问我"这种长期决定。
+        Task { @MainActor in
+            ApprovalBridge.resolver = { approve in
+                // 扩展进程里这个闭包不会被执行（意图只在 App 进程跑），
+                // 但真要是在扩展里被调到，这里也只是安全地什么都不做：
+                // resolve 找不到等待中的请求就返回 false。
+                AgentApprovalCenter.shared.resolve(approve ? .once : .deny)
+            }
+        }
         return true
     }
 

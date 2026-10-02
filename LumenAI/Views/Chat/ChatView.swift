@@ -19,6 +19,8 @@ struct ChatView: View {
     /// 面板不需要自己再持有一个 shared 引用（两个 @ObservedObject 指同一对象也不会坏事，
     /// 但会让"谁负责绑定对话"这件事变模糊 —— 绑定的责任在下面 onAppear/onChange 这一处）。
     @ObservedObject private var todoStore = TodoStore.shared
+    /// 待授权请求现在由它统一持有（灵动岛上的按钮也要能恢复同一个请求）。
+    @ObservedObject private var approvalCenter = AgentApprovalCenter.shared
     /// 聊天页要直接读写设置里的「联网搜索」开关（与设置页共用同一份值）。
     @ObservedObject private var chatSettings = SettingsStorage.shared
     @EnvironmentObject private var theme: LumenAIApp.ThemeObserver
@@ -210,16 +212,21 @@ struct ChatView: View {
             .alert(
                 "需要执行「\(pendingApproval?.call.title ?? pendingApproval?.call.name ?? "工具")」吗?",
                 isPresented: .init(
-                    get: { pendingApproval != nil },
+                    // 同时看中心：用户在**灵动岛**上按了按钮时，弹窗这边没有直接改
+                    // `pendingApproval`，而它必须自己消失 —— 否则 App 里会留着一个
+                    // "还在问你要不要执行"的弹窗，而那个请求早就被答复过了。
+                    get: { pendingApproval != nil && approvalCenter.isWaiting },
                     set: { if !$0 {
                         // 自动关闭（如返回上一级）= 拒绝，避免 AgentService 永久阻塞
-                        pendingApproval?.continuation.resume(returning: .deny)
+                        // 走中心恢复：它保证只生效一次 ——
+                        // 用户可能在弹窗和灵动岛按钮之间"两个都点到"。
+                        AgentApprovalCenter.shared.resolve(.deny)
                         pendingApproval = nil
                     } }
                 )
             ) {
                 Button("拒绝", role: .destructive) {
-                    pendingApproval?.continuation.resume(returning: .deny)
+                    AgentApprovalCenter.shared.resolve(.deny)
                     pendingApproval = nil
                 }
                 // 本会话内总是允许：消掉「同一个工具在循环里被反复弹窗」造成的审批疲劳。
@@ -227,11 +234,11 @@ struct ChatView: View {
                 // 理由见 AgentService.run 里 runApprovedTools 的注释（对话级授权会让
                 // 被注入污染过的上下文拥有静默触发副作用工具的能力）。
                 Button("本会话内总是允许") {
-                    pendingApproval?.continuation.resume(returning: .alwaysForSession)
+                    AgentApprovalCenter.shared.resolve(.alwaysForSession)
                     pendingApproval = nil
                 }
                 Button("允许") {
-                    pendingApproval?.continuation.resume(returning: .once)
+                    AgentApprovalCenter.shared.resolve(.once)
                     pendingApproval = nil
                 }
             } message: {
@@ -1065,6 +1072,9 @@ struct ChatView: View {
                 // 阻塞等用户在 chat 里点「允许 / 本会话内总是允许 / 拒绝」。
                 // @MainActor self 才能写 @State。
                 await withCheckedContinuation { (cont: CheckedContinuation<ApprovalDecision, Never>) in
+                    // 交给中心持有：灵动岛的按钮是**另一个进程**渲染、由系统拉起 App 执行的，
+                    // 它拿不到这个视图的 @State，只能通过中心找到这个等待中的请求。
+                    AgentApprovalCenter.shared.park(callName: call.title ?? call.name, cont)
                     pendingApproval = PendingApproval(call: call, continuation: cont)
                 }
             }
@@ -1134,6 +1144,9 @@ struct ChatView: View {
             title: title, phase: phase, step: 0, totalSteps: nil,
             detail: Task.isCancelled ? "回到 App 后自动继续" : nil,
             progress: nil, startedAt: liveStartedAt))
+        // 兜底：别把一个"永远等不到答复"的授权请求留在中心里，
+        // 那会让下一次授权直接卡死（park 时会把旧的按拒绝收掉，但更干净的是这里主动收）。
+        AgentApprovalCenter.shared.cancelIfWaiting()
     }
 
     /// 解析助手绑定 + 提示词变量 + 人格注入 + 提示词策略 → 有效设置

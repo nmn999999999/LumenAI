@@ -45,6 +45,29 @@ struct LumenAILiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     VStack(alignment: .leading, spacing: 6) {
+                        // 只有"等待授权"这一阶段出现按钮。
+                        //
+                        // 为什么别的阶段不给按钮：其它阶段（思考中/执行工具/下载中）都是
+                        // "它自己在干活"，这时露出按钮会让人以为**必须点一下才会继续**，
+                        // 于是本该自动跑完的任务被人工打断。
+                        // 而"等待授权"是唯一一个**不给答复就不会继续**的阶段。
+                        if context.state.phase == .awaitingApproval {
+                            HStack(spacing: 8) {
+                                Button(intent: ApproveToolIntent()) {
+                                    Label("允许", systemImage: "checkmark")
+                                        .font(.caption.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .tint(.green)
+                                Button(intent: DenyToolIntent()) {
+                                    Label("拒绝", systemImage: "xmark")
+                                        .font(.caption.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .tint(.red)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
                         if let progress = context.state.progress {
                             ProgressView(value: min(max(progress, 0), 1))
                                 .tint(tint(for: context.state.phase))
@@ -85,23 +108,30 @@ struct LumenAILiveActivity: Widget {
         case .done:        return .green
         case .failed:      return .red
         case .paused:      return .orange
+        case .awaitingApproval: return .yellow
         }
     }
 
     private func compactText(_ s: LumenAIActivityAttributes.ContentState) -> String {
-        // 下载有明确百分比就显示数字；其余阶段显示轮次，没有轮次就显示一个点。
+        // 下载有明确百分比就显示百分比。
         if s.phase == .downloading, let p = s.progress { return "\(Int(p * 100))%" }
+        // **只有在有真实计划时才显示分数**（x/y）。
+        // 没有分母时显示成 "3/50" 之类是错的：那个 50 是内部轮数软上限，
+        // 不是任务步数 —— 用户会以为"才完成 6%"而放弃一个其实快结束的任务。
+        // 没有计划时只显示轮数，不带斜杠、不带分母。
         if let total = s.totalSteps, total > 0 { return "\(s.step)/\(total)" }
-        if s.step > 0 { return "\(s.step)" }
+        if s.step > 0 { return "第\(s.step)轮" }
         return "•"
     }
 
     private func subtitle(_ c: ActivityViewContext<LumenAIActivityAttributes>) -> String {
         var parts: [String] = []
+        // 有真实计划 → "已完成 x/y 步"（这是用户理解的进度）；
+        // 没有 → "第 N 轮"（只说事实，不编分母）。
         if let total = c.state.totalSteps, total > 0 {
-            parts.append("第 \(c.state.step)/\(total) 步")
+            parts.append("已完成 \(c.state.step)/\(total) 步")
         } else if c.state.step > 0 {
-            parts.append("第 \(c.state.step) 步")
+            parts.append("第 \(c.state.step) 轮")
         }
         if let d = c.state.detail, !d.isEmpty { parts.append(d) }
         if parts.isEmpty { parts.append(c.attributes.conversationTitle) }
@@ -144,6 +174,26 @@ private struct LockScreenView: View {
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.75))
                     .lineLimit(2)
+            }
+            // 锁屏上同样给按钮：很多人是锁屏状态下看到卡片提示的，
+            // 这时为了"允许一次 ssh"还要解锁、开 App、再找到弹窗，
+            // 等于这个功能白做。
+            if context.state.phase == .awaitingApproval {
+                HStack(spacing: 8) {
+                    Button(intent: ApproveToolIntent()) {
+                        Label("允许", systemImage: "checkmark")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .tint(.green)
+                    Button(intent: DenyToolIntent()) {
+                        Label("拒绝", systemImage: "xmark")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .tint(.red)
+                }
+                .buttonStyle(.borderedProminent)
             }
         }
         .padding(14)

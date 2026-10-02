@@ -26,6 +26,9 @@ struct LumenAIActivityAttributes: ActivityAttributes {
         var detail: String?
         /// 进度（0...1）。仅下载/生成这类有明确进度的阶段才有
         var progress: Double?
+        /// 正在等待授权的工具名（仅 `awaitingApproval` 阶段有意义）。
+        /// 卡片上要显示"它想干什么"，用户才敢决定允不允许。
+        var pendingToolName: String?
         /// 本轮开始时间，用于在岛上显示"已经跑了多久"
         var startedAt: Date
     }
@@ -43,6 +46,12 @@ struct LumenAIActivityAttributes: ActivityAttributes {
         /// 用同一个红色失败态去表示"暂停"，用户会以为任务废了，然后手动重发，
         /// 而重发恰恰会和自动续跑撞在一起（同一段对话、同一条气泡）。
         case paused
+        /// 等待用户授权某个有副作用的工具调用（ssh / 网络 / MCP…）。
+        ///
+        /// 单独一个阶段而不是复用 `tool`：这一阶段**需要用户操作**，
+        /// 卡片上要出现按钮。而"用户需要做点什么"和"它正在自己干活"
+        /// 在灵动岛上是两种完全不同的呈现，混在一起会让按钮出现在不该出现的时刻。
+        case awaitingApproval
     }
 
     /// 不变的属性：这场活动属于哪段对话。
@@ -61,6 +70,7 @@ extension LumenAIActivityAttributes.ContentState {
         case .done:        return "已完成"
         case .failed:      return "已中断"
         case .paused:      return "已暂停"
+        case .awaitingApproval: return "等待授权"
         }
     }
 
@@ -73,6 +83,7 @@ extension LumenAIActivityAttributes.ContentState {
         case .done:        return "checkmark.circle.fill"
         case .failed:      return "exclamationmark.triangle.fill"
         case .paused:      return "pause.circle.fill"
+        case .awaitingApproval: return "hand.raised.fill"
         }
     }
 }

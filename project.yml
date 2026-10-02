@@ -48,8 +48,8 @@ targets:
         # iOS 26 App 图标：Icon Composer 工程（appicon.icon）作为官方 AppIcon 源，
         # 由 actool 用 Icon Composer 渲染管线生成含液态玻璃效果的全部变体
         ASSETCATALOG_COMPILER_APPICON_NAME: appicon
-        MARKETING_VERSION: 0.3.61
-        CURRENT_PROJECT_VERSION: 61
+        MARKETING_VERSION: 0.3.62
+        CURRENT_PROJECT_VERSION: 62
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         # 实时活动（灵动岛 / 锁屏）的开关。**缺了它 Activity.request 会直接抛异常**，
         # 而错误信息只说请求失败，不会告诉你"是 Info.plist 少了个 key"。
@@ -94,6 +94,10 @@ targets:
       # 各有一份（它没有独立的框架可共享）。漏了它，扩展那边会报"找不到类型"，
       # 而报错位置指向灵动岛的布局代码，看起来像 UI 写错了。
       - path: LumenAI/LiveActivity/LumenAIActivityAttributes.swift
+      # 意图类型也要同时编进扩展：灵动岛上的按钮**由扩展渲染**，
+      # 它必须能构造出这两个 AppIntent 才能把按钮画出来（执行仍在 App 进程）。
+      # 漏了它，扩展那边会报"找不到类型"，而报错位置指向按钮代码，看着像 UI 写错。
+      - path: LumenAI/LiveActivity/ApprovalIntents.swift
     info:
       path: LumenAIWidget/Info.plist
       properties:
@@ -110,8 +114,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lumenai.app.widget
-        MARKETING_VERSION: 0.3.61
-        CURRENT_PROJECT_VERSION: 61
+        MARKETING_VERSION: 0.3.62
+        CURRENT_PROJECT_VERSION: 62
         TARGETED_DEVICE_FAMILY: "1,2"
         # 扩展不单独安装进 /Applications
         SKIP_INSTALL: YES

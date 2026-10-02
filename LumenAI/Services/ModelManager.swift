@@ -206,6 +206,10 @@ final class ModelManager: ObservableObject {
             let value = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
             Task { @MainActor in
                 ModelManager.shared.progress[key] = value
+                // 同步到灵动岛 / 锁屏。用户不必守着 App 看百分比 ——
+                // 而"下载极不稳定"这件事本身，锁屏上能看到进度在动就已经缓解了一半焦虑。
+                // 节流由 LiveActivityManager 内部做（1 秒），这里不重复判断。
+                ModelManager.shared.updateLiveActivityProgress(id: key, value: value)
             }
         }
 
@@ -298,6 +302,16 @@ final class ModelManager: ObservableObject {
         // 后台 URLSession 本身由系统托管、挂起后仍会继续；但"把结果搬进沙盒并写索引"
         // 是我们的代码，需要一个短窗口 —— 这里申请保活。
         BackgroundTaskKeeper.shared.begin(.download)
+        // 起卡片。放在这里而不是 startDownload：startDownload 可能因为"文件已存在"
+        // 直接返回、或者只是在排队，那时并没有真的在下载 —— 提前显示卡片会是假进度。
+        LiveActivityManager.shared.start(
+            conversationTitle: item.name,
+            state: .init(title: "正在下载模型 \(item.name)",
+                         phase: .downloading, step: 0, totalSteps: nil,
+                         detail: item.fileName, progress: progress[id] ?? 0,
+                         startedAt: Date()),
+            kind: .download)
+
         let session = backgroundSessionHandle
         guard let target = item.currentURL else {
             lastError = "所有下载源都不可用"
@@ -317,6 +331,16 @@ final class ModelManager: ObservableObject {
         activeTasks[id] = Task { task.resume() }
     }
 
+    /// 把下载进度推给灵动岛（只有当前卡片确实是这次下载时才推）
+    fileprivate func updateLiveActivityProgress(id: String, value: Double) {
+        guard let item = pending[id] else { return }
+        LiveActivityManager.shared.update(.init(
+            title: "正在下载模型 \(item.name)",
+            phase: .downloading, step: 0, totalSteps: nil,
+            detail: "\(Int(value * 100))% · \(item.fileName)",
+            progress: value, startedAt: Date()))
+    }
+
     fileprivate func deliverDownloadedFile(id: String, from location: URL) {
         guard let item = pending[id] else { return }
         let destination = localFileURL(fileName: item.fileName)
@@ -332,6 +356,11 @@ final class ModelManager: ObservableObject {
             lastCompletedDownloadID = id
             clearPending(id: id)
             finishDownload(id: id)
+            LiveActivityManager.shared.end(state: .init(
+                title: "模型已下载，可以去「本地模型」里加载",
+                phase: .done, step: 0, totalSteps: nil,
+                detail: item.name, progress: 1, startedAt: Date()),
+                kind: .download)
         } catch {
             lastError = "保存文件失败: \(error.localizedDescription)"
             clearPending(id: id)
@@ -388,6 +417,10 @@ final class ModelManager: ObservableObject {
             + (error.map { ($0 as NSError).localizedDescription } ?? "未知错误")
         clearPending(id: id)
         finishDownload(id: id)
+        LiveActivityManager.shared.end(state: .init(
+            title: "模型下载失败", phase: .failed, step: 0, totalSteps: nil,
+            detail: lastError, progress: nil, startedAt: Date()),
+            kind: .download)
     }
 
     /// App 启动时把上次没下完的接着下。

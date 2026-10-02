@@ -19,6 +19,15 @@ import ActivityKit
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
 
+    /// 当前活动的种类。
+    ///
+    /// 为什么需要它：同一时刻系统只允许一张卡片，而**下载和 agent 任务是两件独立的事**。
+    /// 没有这个标记的话，用户一边跑 agent 一边下模型，后启动的那个会把前一个的卡片顶掉 ——
+    /// 表现是灵动岛的内容突然变成另一个任务的，用户以为串了。
+    /// 现在下载只在"没有 agent 任务在跑"时才起卡片。
+    enum Kind { case agent, download }
+
+    private var currentKind: Kind?
     private var activity: Activity<LumenAIActivityAttributes>?
     /// 上次真正推送更新的时刻（节流用）
     private var lastPush = Date.distantPast
@@ -37,8 +46,12 @@ final class LiveActivityManager {
 
     /// 开始一场活动。重复调用是安全的（会把上一场结束掉）。
     func start(conversationTitle: String,
-               state: LumenAIActivityAttributes.ContentState) {
+               state: LumenAIActivityAttributes.ContentState,
+               kind: Kind = .agent) {
         guard isAvailable else { return }
+        // 下载不抢 agent 的卡片：agent 任务是用户主动发起的、正在等的，
+        // 而下载是背景活，谁在等谁优先。
+        if kind == .download, currentKind == .agent { return }
         Task {
             // 先结束旧的：同屏两张卡片会把内容糊在一起
             await endAllStale()
@@ -48,6 +61,7 @@ final class LiveActivityManager {
                     attributes: attributes,
                     content: ActivityContent(state: state, staleDate: nil)
                 )
+                currentKind = kind
                 lastPush = Date()
             } catch {
                 // 不弹错给用户：灵动岛只是"锦上添花"，申请不到不该打断任何正在做的事。
@@ -70,9 +84,14 @@ final class LiveActivityManager {
 
     /// 结束（带一个"结果状态"再收：直接消失会让用户来不及看到结论）
     func end(state: LumenAIActivityAttributes.ContentState? = nil,
-             dismissAfter: TimeInterval = 4) {
+             dismissAfter: TimeInterval = 4,
+             kind: Kind? = nil) {
+        // 指定 kind 时只有"当前卡片就是这一类"才收 —— 否则下载结束会把
+        // 正在跑的 agent 卡片一起收掉，而 agent 那边还在等用户看进度。
+        if let kind, currentKind != kind { return }
         guard let activity else { return }
         self.activity = nil
+        currentKind = nil
         Task {
             let content = state.map { ActivityContent(state: $0, staleDate: nil) }
             await activity.end(content, dismissalPolicy: .after(Date().addingTimeInterval(dismissAfter)))
@@ -87,5 +106,6 @@ final class LiveActivityManager {
             await a.end(nil, dismissalPolicy: .immediate)
         }
         activity = nil
+        currentKind = nil
     }
 }
