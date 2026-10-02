@@ -67,6 +67,9 @@ struct LumenAILiveActivity: Widget {
                                 .tint(.red)
                             }
                             .buttonStyle(.borderedProminent)
+                            // 加大点击区域：灵动岛上的默认可点区域很小，
+                            // 而这是"点不中就没法继续"的按钮。
+                            .controlSize(.large)
                         }
                         if let progress = context.state.progress {
                             ProgressView(value: min(max(progress, 0), 1))
@@ -112,15 +115,20 @@ struct LumenAILiveActivity: Widget {
         }
     }
 
+    /// 紧凑态右侧的短标记。
+    ///
+    /// 这块物理宽度只有二十几 pt，**多两个字就截断成省略号**，而省略号的信息量是零。
+    /// 所以这里只放"最短但最有信息量"的东西，每种阶段一个：
+    /// 下载 → 百分比；有真实清单 → x/y；只有轮次 → 纯数字（不带"第…轮"三个字）；
+    /// 等待授权 → 感叹号（最需要被注意到的一种，用符号而不是文字）。
     private func compactText(_ s: LumenAIActivityAttributes.ContentState) -> String {
-        // 下载有明确百分比就显示百分比。
+        if s.phase == .awaitingApproval { return "!" }
         if s.phase == .downloading, let p = s.progress { return "\(Int(p * 100))%" }
         // **只有在有真实计划时才显示分数**（x/y）。
-        // 没有分母时显示成 "3/50" 之类是错的：那个 50 是内部轮数软上限，
-        // 不是任务步数 —— 用户会以为"才完成 6%"而放弃一个其实快结束的任务。
-        // 没有计划时只显示轮数，不带斜杠、不带分母。
+        // 没有分母时显示成 "3/50" 是错的：那个 50 是内部轮数软上限，不是任务步数 ——
+        // 用户会以为"才完成 6%"而放弃一个其实快结束的任务。
         if let total = s.totalSteps, total > 0 { return "\(s.step)/\(total)" }
-        if s.step > 0 { return "第\(s.step)轮" }
+        if s.step > 0 { return "\(s.step)" }
         return "•"
     }
 
@@ -194,6 +202,7 @@ private struct LockScreenView: View {
                     .tint(.red)
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
             }
         }
         .padding(14)

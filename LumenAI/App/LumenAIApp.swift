@@ -22,16 +22,15 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         ModelManager.shared.resumePendingDownloads()
 
         // 注册灵动岛授权按钮的处理：App 启动（含被系统在后台拉起）时挂上。
-        // 必须在**启动时**注册，而不是等用户进到聊天页 —— 因为用户按下灵动岛按钮时
-        // App 很可能刚被系统拉起来，那一刻还没有任何界面存在。
-        // 允许 = .once（只这一次），不升级成"本会话总是允许"：
-        // 隔着一块小卡片、看不到参数细节，不适合做"以后都别再问我"这种长期决定。
-        Task { @MainActor in
-            ApprovalBridge.resolver = { approve in
-                // 扩展进程里这个闭包不会被执行（意图只在 App 进程跑），
-                // 但真要是在扩展里被调到，这里也只是安全地什么都不做：
-                // resolve 找不到等待中的请求就返回 false。
-                AgentApprovalCenter.shared.resolve(approve ? .once : .deny)
+        // 必须在**启动时**注册，而且必须**同步** —— 这里原来写的是
+        // `Task { @MainActor in ApprovalBridge.resolver = ... }`，那是异步的：
+        // 用户按下灵动岛按钮时系统才把 App 拉起来，如果意图执行得比这个 Task 早，
+        // resolver 还是 nil，那次点击就**静默失效**了；而用户切回 App 后弹窗关闭
+        // 又会被当成"拒绝"—— 于是"我点了允许，回去看到被拒绝了"。
+        // didFinishLaunchingWithOptions 本身就在主线程上，直接同步注册即可。
+        ApprovalBridge.resolver = { approve in
+            Task { @MainActor in
+                AgentApprovalCenter.shared.resolveFromLiveActivity(approve: approve)
             }
         }
         return true

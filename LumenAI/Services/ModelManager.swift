@@ -190,10 +190,31 @@ final class ModelManager: ObservableObject {
                         downloadTask: URLSessionDownloadTask,
                         didFinishDownloadingTo location: URL) {
             guard let key = downloadTask.taskDescription else { return }
-            // ⚠️ location 只在**这个回调返回之前**有效：系统随后就会删掉这个临时文件。
-            // 所以拿到 id 之后立刻交给主 actor 搬运；这里不做耗时的事。
+
+            // ⚠️⚠️ 必须**同步**把文件搬走，不能丢进 Task 里异步做。
+            //
+            // 这是实测踩到的崩溃（用户报的原文）：
+            //   "CFNetworkDownload_xxx.tmp" couldn't be moved to "Models" because
+            //    either the former doesn't exist, or the folder containing the latter doesn't exist.
+            // 原因：`location` 指向系统临时文件，**这个回调一返回系统就把它删掉**。
+            // 我之前把它写成 `Task { @MainActor in ... 搬 ... }` —— 等那个 Task 真正跑起来，
+            // 临时文件早就没了，于是 moveItem 报"前者不存在"。
+            // （更讽刺的是我当时的注释里写着"必须同步搬"，代码却写成异步，注释和实现相反。）
+            //
+            // 拆成两步是为了绕开 actor 隔离：第一步只做纯文件操作、不碰任何 @MainActor 状态，
+            // 所以能在委托线程上同步完成；第二步（改文件名 + 写索引）才回主 actor。
+            guard let staged = ModelManager.stageDownloadedFile(id: key, from: location) else {
+                Task { @MainActor in
+                    ModelManager.shared.lastError = "下载完成但无法保存临时文件（系统临时文件已失效）"
+                    ModelManager.shared.downloadFailed(
+                        id: key,
+                        error: URLError(.cannotCreateFile),
+                        resumeData: nil)
+                }
+                return
+            }
             Task { @MainActor in
-                ModelManager.shared.deliverDownloadedFile(id: key, from: location)
+                ModelManager.shared.deliverStagedFile(id: key, stagedURL: staged)
             }
         }
 
@@ -331,24 +352,53 @@ final class ModelManager: ObservableObject {
         activeTasks[id] = Task { task.resume() }
     }
 
-    /// 把下载进度推给灵动岛（只有当前卡片确实是这次下载时才推）
-    fileprivate func updateLiveActivityProgress(id: String, value: Double) {
-        guard let item = pending[id] else { return }
-        LiveActivityManager.shared.update(.init(
-            title: "正在下载模型 \(item.name)",
-            phase: .downloading, step: 0, totalSteps: nil,
-            detail: "\(Int(value * 100))% · \(item.fileName)",
-            progress: value, startedAt: Date()))
+    /// 计算 Models 目录并确保它存在（**非隔离**版本）。
+    ///
+    /// 为什么要单独一个：`modelsDirectory` 是 `@MainActor` 上的静态属性，
+    /// 而"搬运系统临时文件"必须在委托线程上**同步**完成，碰不到主 actor。
+    /// 两个版本共用同一套路径规则，只是隔离域不同 —— 路径只写一份，避免漂移。
+    nonisolated static func modelsDirectoryPath() -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("Models", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
-    fileprivate func deliverDownloadedFile(id: String, from location: URL) {
-        guard let item = pending[id] else { return }
+    /// 把系统给的临时文件同步搬到我们的暂存区。**必须由下载委托在回调内同步调用。**
+    ///
+    /// 为什么先搬到暂存区而不是直接搬到最终文件名：最终文件名要从 `pending` 表里查
+    /// （那是 @MainActor 状态），而这一步不能跨 actor。暂存区只按 id 命名，纯文件操作。
+    nonisolated static func stageDownloadedFile(id: String, from location: URL) -> URL? {
+        let fm = FileManager.default
+        let staging = modelsDirectoryPath().appendingPathComponent(".staging", isDirectory: true)
+        try? fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        // id 可能是自定义下载拼出来的，含 "/" 会跑到目录外面去
+        let safe = id.replacingOccurrences(of: "/", with: "_")
+        let dst = staging.appendingPathComponent(safe)
+        try? fm.removeItem(at: dst)   // 同 id 的残留（上次失败留下的）
+        do {
+            try fm.moveItem(at: location, to: dst)
+            return dst
+        } catch {
+            return nil
+        }
+    }
+
+    /// 把暂存文件挪到最终文件名，并写索引（主 actor 上做）
+    fileprivate func deliverStagedFile(id: String, stagedURL: URL) {
+        guard let item = pending[id] else {
+            try? FileManager.default.removeItem(at: stagedURL)
+            return
+        }
         let destination = localFileURL(fileName: item.fileName)
         do {
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
+            let fm = FileManager.default
+            try? fm.createDirectory(at: destination.deletingLastPathComponent(),
+                                    withIntermediateDirectories: true)
+            if fm.fileExists(atPath: destination.path) {
+                try fm.removeItem(at: destination)
             }
-            try FileManager.default.moveItem(at: location, to: destination)
+            try fm.moveItem(at: stagedURL, to: destination)
             addOrUpdate(stored: StoredModel(
                 id: id, name: item.name, fileName: item.fileName,
                 sizeBytes: fileSize(at: destination), addedAt: Date()
@@ -367,6 +417,17 @@ final class ModelManager: ObservableObject {
             finishDownload(id: id)
         }
     }
+
+    /// 把下载进度推给灵动岛（只有当前卡片确实是这次下载时才推）
+    fileprivate func updateLiveActivityProgress(id: String, value: Double) {
+        guard let item = pending[id] else { return }
+        LiveActivityManager.shared.update(.init(
+            title: "正在下载模型 \(item.name)",
+            phase: .downloading, step: 0, totalSteps: nil,
+            detail: "\(Int(value * 100))% · \(item.fileName)",
+            progress: value, startedAt: Date()))
+    }
+
 
     fileprivate func downloadFailed(id: String, error: Error?, resumeData: Data?) {
         // 用户主动取消：不是失败，不重试 —— 重试等于把用户的取消操作撤销

@@ -72,13 +72,27 @@ final class LiveActivityManager {
 
     /// 更新状态。默认受 `minInterval` 节流；`force: true` 用于阶段切换这类
     /// 必须立刻可见的时刻（例如"完成 / 失败"）。
-    func update(_ state: LumenAIActivityAttributes.ContentState, force: Bool = false) {
+    func update(_ state: LumenAIActivityAttributes.ContentState,
+                force: Bool = false,
+                alert: (title: String, body: String)? = nil) {
         guard isAvailable, let activity else { return }
         let now = Date()
-        if !force, now.timeIntervalSince(lastPush) < minInterval { return }
+        // 带 alert 的更新**不受节流限制**：节流是为了少打扰，而 alert 恰恰是
+        // "这一刻必须被看到"的语义，因为被节流延后它就失去意义了。
+        if alert == nil, !force, now.timeIntervalSince(lastPush) < minInterval { return }
         lastPush = now
         Task {
-            await activity.update(ActivityContent(state: state, staleDate: nil))
+            let config = alert.map {
+                AlertConfiguration(title: LocalizedStringResource(stringLiteral: $0.title),
+                                   body: LocalizedStringResource(stringLiteral: $0.body),
+                                   sound: .default)
+            }
+            // ⚠️ `alertConfiguration` 是 **update() 的参数**，不是 ActivityContent 的 ——
+            // 我一开始按后者写，编译报 "extra argument 'alertConfiguration' in call"。
+            // 记下来是因为这个 API 形状反直觉：state 用 ActivityContent 包，
+            // 而 alert 单独作为 update 的第二个参数。
+            await activity.update(ActivityContent(state: state, staleDate: nil),
+                                  alertConfiguration: config)
         }
     }
 

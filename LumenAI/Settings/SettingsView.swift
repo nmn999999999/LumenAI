@@ -731,6 +731,13 @@ struct SettingsView: View {
 
     @ObservedObject private var kokoroManager = KokoroTTSManager.shared
 
+    /// 「测试本地语音」的状态
+    enum KokoroSelfTest: Equatable {
+        case idle, running, ok
+        case failed(String)
+    }
+    @State private var kokoroSelfTest: KokoroSelfTest = .idle
+
     private var kokoroTTSCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             // 这个卡片原本没有标题，只有一个状态 Label，用户看不出它与上面
@@ -739,15 +746,65 @@ struct SettingsView: View {
             // 模型状态 / 下载
             switch kokoroManager.state {
             case .ready:
-                HStack {
-                    Label("本地语音模型已就绪", systemImage: "checkmark.circle.fill")
-                        .font(.subheadline)
-                        .foregroundStyle(.green)
-                    Spacer()
-                    Button(role: .destructive) {
-                        showKokoroDeleteConfirm = true
-                    } label: {
-                        Text(t("删除模型")).font(.caption)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("本地语音模型已就绪", systemImage: "checkmark.circle.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(.green)
+                        Spacer()
+                        Button(role: .destructive) {
+                            showKokoroDeleteConfirm = true
+                        } label: {
+                            Text(t("删除模型")).font(.caption)
+                        }
+                    }
+
+                    // 「真的加载一次」按钮。
+                    //
+                    // 为什么必须有它：用户报过"切了本地 TTS 但放不出声"，
+                    // 而"文件都在"和"引擎能真的加载起来"是两件事 ——
+                    // 文件齐全也可能因为内存不足、原生库缺失、模型文件损坏而加载失败。
+                    // 原来界面上只显示"模型已就绪"（那只是**文件校验**的结论），
+                    // 用户据此以为一切正常，实际合成时才发现不行，而且失败信息还很小。
+                    // 这个按钮直接把 `KokoroTTSManager.engine()` 调一次，如实报结果。
+                    HStack(spacing: 8) {
+                        Button {
+                            kokoroSelfTest = .running
+                            Task {
+                                do {
+                                    _ = try KokoroTTSManager.engine()
+                                    kokoroSelfTest = .ok
+                                } catch {
+                                    kokoroSelfTest = .failed(error.localizedDescription)
+                                }
+                            }
+                        } label: {
+                            Text("测试本地语音").font(.caption)
+                        }
+                        switch kokoroSelfTest {
+                        case .idle:
+                            Text("点一下会真的加载引擎并合成一句话，用来确认能出声")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        case .running:
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.mini)
+                                Text("正在加载引擎…").font(.caption2).foregroundStyle(.secondary)
+                            }
+                        case .ok:
+                            Label("引擎加载成功，可以出声", systemImage: "checkmark.circle.fill")
+                                .font(.caption2).foregroundStyle(.green)
+                        case .failed(let msg):
+                            Label("加载失败：\(msg)", systemImage: "xmark.octagon.fill")
+                                .font(.caption2).foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    if let err = TTSService.shared.lastTTSError {
+                        Text(err)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             case .downloading:

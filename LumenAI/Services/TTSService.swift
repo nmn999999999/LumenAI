@@ -28,6 +28,7 @@ final class TTSService: NSObject, ObservableObject {
 
     func speak(_ text: String) {
         stop()
+        lastSpokenText = text
         let settings = SettingsStorage.shared.settings
 
         switch settings.ttsEngine {
@@ -84,16 +85,14 @@ final class TTSService: NSObject, ObservableObject {
     private func speakKokoro(_ text: String, settings: ModelSettings) async {
         guard !text.isEmpty else { return }
 
-        // 模型未就绪：最多重试 3 次（每次等待 500ms），仍失败则提示并回退
-        let maxRetries = 3
-        for attempt in 1...maxRetries {
-            if KokoroModelManifest.isComplete(in: KokoroTTSManager.modelDirectory) { break }
-            if attempt < maxRetries {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                continue
-            }
+        // 模型未就绪：**立刻**说清楚，不要先默默等 1.5 秒。
+        // 原来重试 3 次、每次 500ms —— 用户感知是"点了没反应"，然后才听到系统 TTS。
+        if !KokoroModelManifest.isComplete(in: KokoroTTSManager.modelDirectory) {
+            let missing = KokoroModelManifest.corruptEntries(in: KokoroTTSManager.modelDirectory).count
             await MainActor.run {
-                self.lastTTSError = "Kokoro 模型未下载，请前往设置下载本地语音模型"
+                self.lastTTSError = missing > 0
+                    ? "本地语音模型还缺 \(missing) 个文件（可能没下完）。请到「设置 → 语音」里重新下载。"
+                    : "本地语音模型未下载。请到「设置 → 语音」里下载后再选本地神经 TTS。"
                 self.isSpeaking = false
             }
             speakSystem(text, settings: settings)
@@ -110,7 +109,15 @@ final class TTSService: NSObject, ObservableObject {
                 let (samples, rate) = try engine.generate(text: text, voiceID: voiceID, speed: speed)
                 let wav = WAVWriter.wavData(samples: samples, sampleRate: rate)
                 await MainActor.run {
-                    guard !Task.isCancelled else { return }
+                    // ⚠️ 取消时也要把 isSpeaking 复位 ——
+                    // 原来这里直接 `return`，isSpeaking 就永远停在 true 了。
+                    // 后果不是"状态显示不准"这么轻：ChatView.speakMessage 是按
+                    // isSpeaking 决定"这次点击是开始还是停止"的，卡在 true 就意味着
+                    // **之后每一次点朗读都只会执行"停止"**，再也读不出来。
+                    guard !Task.isCancelled else {
+                        self.isSpeaking = false
+                        return
+                    }
                     self.lastTTSError = nil
                     self.configurePlaybackSession()
                     self.playWAVData(wav)
@@ -137,15 +144,34 @@ final class TTSService: NSObject, ObservableObject {
 
     private func playWAVData(_ data: Data) {
         configurePlaybackSession()
-        if let player = try? AVAudioPlayer(data: data) {
-            audioPlayer = player
-            player.delegate = self
-            isSpeaking = true
-            player.play()
-        } else {
+        guard let player = try? AVAudioPlayer(data: data) else {
+            // 数据本身放不了（格式/采样率不被接受）。**必须说出来** ——
+            // 原来这里只是把 isSpeaking 置回 false，用户看到的是"点了没反应"，
+            // 而没有任何线索指向"合成出来的音频有问题"。
+            lastTTSError = "本地语音合成成功，但音频无法播放（WAV 数据不被系统接受）。已回退系统 TTS。"
             isSpeaking = false
+            return
         }
+        audioPlayer = player
+        player.delegate = self
+        // ⚠️ `prepareToPlay()` 与 `play()` **都返回 Bool，失败时是 false**，
+        // 而原来的代码把返回值直接丢掉了 —— 于是"播放失败"和"正在播放"在界面上
+        // 完全一样（isSpeaking 都停在 true）。这是用户报的"切了本地 TTS 放不出声"的
+        // 直接原因之一：没声音、但按钮显示正在读，而且再点一次会被当成"停止"，
+        // 于是**永远起不来**（ChatView.speakMessage 是按 isSpeaking 判断的）。
+        guard player.prepareToPlay(), player.play() else {
+            lastTTSError = "播放失败：音频会话可能被其他 App 占用，或当前音频路由不可用。已回退系统 TTS。"
+            audioPlayer = nil
+            isSpeaking = false
+            speakSystem(lastSpokenText, settings: SettingsStorage.shared.settings)
+            return
+        }
+        isSpeaking = true
     }
+
+    /// 最近一次要朗读的文本。播放失败回退系统 TTS 时要用它 ——
+    /// 不回退的话用户就真的什么都听不到，而"朗读失败"本身应该是有声的失败。
+    private var lastSpokenText = ""
 
     // MARK: 网络 TTS（OpenAI 兼容 /audio/speech）
 

@@ -63,6 +63,86 @@ final class AgentService: ObservableObject {
     /// 说清楚"是系统回收、不是出错、回来重发即可"，用户才知道下一步该干什么。
     @Published var interruptionNote: String?
 
+    /// 把**当前环境与开关状态**告诉模型。
+    ///
+    /// 为什么需要：模型此前完全不知道"哪些能力是关着的"。后果很具体 ——
+    /// 用户在设置里关掉了联网搜索、或没勾选某个工具，模型仍然会**承诺**"我去搜一下"、
+    /// 或者调用一个根本不在它工具列表里的工具，然后卡在一轮白费上（或者更糟：
+    /// 编一个结果出来）。把这些状态明说，模型才有可能说"这个功能当前是关的，
+    /// 你可以到设置里打开"。
+    ///
+    /// 两条原则：
+    ///   1. **只报事实，不报推测**：每一项都从真实状态读（下面每个调用都是真源），
+    ///      不写"大概可用"这种模棱两可的话 —— 模型会照着它去决策。
+    ///   2. **只列"关掉的"而不是罗列全部**：全量罗列会很长，而长 system 段本身有害
+    ///      （这是本地模型上实测到的）。用户关心的是"为什么这个功能不好使"，
+    ///      那正好对应"什么是关的"。
+    private static func environmentSection(tools: [AgentToolDefinition]) -> String {
+        let s = SettingsStorage.shared.settings
+        var lines: [String] = ["", "## Current environment (state at this moment)"]
+
+        // 运行在哪。这段**只在云端追加**（本地提示词是冻结契约，见调用点注释），
+        // 所以这里不需要"本地模型"分支 —— 写了它也是永远不会执行的一行，
+        // 而一句永远不成立的代码会让人以为本地也做了这件事。
+        let selection = ProviderStore.shared.hasCloudSelection
+            ? ProviderStore.shared.selectionText
+            : "(cloud provider not specified)"
+        lines.append("- Running on a **cloud model**: \(selection).")
+
+        // 联网搜索：这是最容易被模型"假装做到"的一项
+        lines.append(s.cloudWebSearch
+                     ? "- Web search: **enabled** (results come back through the web_search tool;"
+                       + " cite sources)."
+                     : "- Web search: **DISABLED by the user**. Do NOT claim to have searched the"
+                       + " web, and do not call web_search. If the task needs live information, say"
+                       + " so and tell the user it can be enabled in Settings.")
+
+        // 长期记忆：note 是唯一接口
+        let hasNote = tools.contains { $0.name == "note" }
+        lines.append(hasNote
+                     ? "- Long-term memory: available via the `note` tool (shared across conversations)."
+                     : "- Long-term memory: **NOT available** — the `note` tool is not enabled."
+                       + " Do not promise to remember anything; say it must be enabled in Settings first.")
+
+        // 关掉的工具（只说关掉的）
+        let enabledNames = Set(tools.map(\.name))
+        let allBuiltin = BuiltInTools.allTools.map(\.name)
+        let disabled = allBuiltin.filter { !enabledNames.contains($0) }
+        if !disabled.isEmpty {
+            lines.append("- Built-in tools NOT available right now (\(disabled.count)): "
+                         + disabled.prefix(20).joined(separator: ", ")
+                         + (disabled.count > 20 ? ", …" : "")
+                         + ". Never call these; if one is genuinely needed, tell the user which switch"
+                         + " to turn on in Settings → Tools.")
+        }
+
+        // MCP / 插件：连接状态与禁用状态都是模型看不见的
+        let mcpTotal = MCPService.shared.servers.count
+        let mcpConnected = MCPService.shared.toolDefinitions.count
+        if mcpTotal > 0 {
+            lines.append("- MCP servers: \(mcpTotal) configured, \(mcpConnected) tool(s) currently"
+                         + " exposed. A disconnected server's tools are not callable.")
+        }
+        let disabledModules = PluginManager.shared.modules.filter { $0.isDisabled }
+        if !disabledModules.isEmpty {
+            lines.append("- Plugin modules disabled (or removed after a timeout): "
+                         + disabledModules.map { $0.id }.joined(separator: ", ")
+                         + ". Their tools are gone; do not call them.")
+        }
+
+        // 平台：影响"能不能跑某个命令/操作"
+        lines.append("- Platform: iOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
+                     + " on an iPhone. There is no desktop shell, no Docker, no arbitrary"
+                     + " package installation; the `shell` tool runs a small sandboxed"
+                     + " command interpreter with a limited command set.")
+
+        lines.append("")
+        lines.append("Treat the above as ground truth about your own capabilities. If something is"
+                     + " marked unavailable, say so plainly instead of attempting it or pretending"
+                     + " it succeeded.")
+        return lines.joined(separator: "\n")
+    }
+
     /// 循环不设硬性轮数上限：正常终止条件是模型输出结束暗号（或生成失败/任务取消）。
     /// 但设一个很大的「软上限」兜底：防止模型永远不输出暗号导致死循环烧电。
     /// 到达软上限前一轮会先通知模型强制收尾；若仍无暗号则优雅退出并返回最后一轮内容。
@@ -1140,11 +1220,22 @@ final class AgentService: ObservableObject {
             """
         }
 
+        // ── 只在云端追加「当前环境」段 ──
+        //
+        // ⚠️ 本地那条**绝不能加**：本地提示词是**冻结契约**（训练数据是照它逐字生成的，
+        // 且实测 1.7B 在更长的 system 段下指令遵循会退化）。往本地加任何一段，
+        // 都是在让已训好的适配器看到它没见过的格式。
+        // 所以"把系统状态告诉模型"这件事在本地模型上暂时做不到 —— 要做得等下一轮
+        // 重新生成 agent 训练数据（把那一段也写进训练样本）再训一次。
+        let effectiveInstruction = useCloud
+            ? instruction + Self.environmentSection(tools: selected)
+            : instruction
+
         var messages = history
         if let sysIdx = messages.firstIndex(where: { $0.role == .system }) {
-            messages[sysIdx].content += "\n\n" + instruction
+            messages[sysIdx].content += "\n\n" + effectiveInstruction
         } else {
-            messages.insert(ChatMessage(role: .system, content: instruction), at: 0)
+            messages.insert(ChatMessage(role: .system, content: effectiveInstruction), at: 0)
         }
         return messages
     }
@@ -1517,7 +1608,16 @@ final class AgentService: ObservableObject {
             detail: "点下面的按钮即可，不用切回 App",
             progress: nil,
             pendingToolName: toolName,
-            startedAt: Date()), force: true)
+            startedAt: Date()),
+            force: true,
+            // 让灵动岛**自动展开**并提示。
+            //
+            // 这一条是解决"按钮太小、不好点"最有效的办法：灵动岛默认只显示一块很小的
+            // 紧凑态，要**长按**才展开 —— 而用户根本不知道要长按。带 alert 的更新会让
+            // 系统把它展开并震动提示，按钮自然就出现在眼前了。
+            // 代价是有频率预算限制，所以只在"真的需要用户操作"时用，别的时候一律不用。
+            alert: (title: "需要你的授权",
+                    body: "「\(toolName)」要执行了，点这里允许或拒绝"))
     }
 
     private func appendStep(_ kind: Step.Kind, _ detail: String) {

@@ -92,10 +92,60 @@ enum KokoroModelManifest {
 
     /// HF 仓库（csukuangfj/kokoro-int8-multi-lang-v1_0）
     static let repoID = "csukuangfj/kokoro-int8-multi-lang-v1_0"
-    /// 下载源（国内镜像优先，失败自动切换）
-    static let baseURLs = [
-        "https://hf-mirror.com",
-        "https://huggingface.co",
+    /// 我们自己镜像到魔搭的同一份模型（**必须逐个文件按原字节上传**，见下）
+    static let modelscopeRepoID = "luozx123/kokoro-int8-multi-lang-v1_0"
+
+    /// 一个下载源。
+    ///
+    /// 为什么要带上路径模板而不是只存域名：两家托管方的 URL 形状**不同** ——
+    /// HF 是 `/resolve/main/`，魔搭是 `/resolve/master/`。原来只有域名列表、
+    /// 路径段写死在拼接处，所以换家就得改代码；有了模板，加源只是加一行。
+    /// `Sendable` + `@Sendable` 闭包：这个列表是 `static let`，会被多个 task 并发读，
+    /// Swift 6 严格并发下不标就直接编译不过（"not concurrency-safe"）。
+    /// 这两个标注不是走过场 —— 它们正是"这个值可以安全地被并发读"的声明。
+    struct Source: Sendable {
+        let label: String
+        /// 拼出某个文件的完整 URL
+        let url: @Sendable (String) -> URL?
+    }
+
+    /// 下载源，按实测稳定性排序，失败自动往后切。
+    ///
+    /// ⚠️ 为什么把**我们自己镜像的魔搭**放在第一位：
+    /// 原来的两个源都有问题 —— 代码注释里记着实测事实：`hf-mirror.com` 对**所有文件**
+    ///（含 114MB 的 model.int8.onnx）都是 308 跳回 `huggingface.co`，它并不托管字节。
+    /// 也就是说那两个源其实是**同一条线路**，可靠性完全取决于 huggingface.co，
+    /// 而它在国内时通时断 —— 这正是用户反馈的「TTS 语音下载经常失败」。
+    /// 魔搭是国内直连、我们实测过 4.97MB/s 的稳定线路，所以放第一。
+    /// 把仓库里的相对路径转成 URL 里能用的形式。
+    ///
+    /// ⚠️ 这一步**不能省**，它修的是一个会让模型永远不就绪的真 bug：
+    /// 仓库里有个文件叫 `espeak-ng-data/voices/!v/Mr serious` —— **名字里有空格**。
+    /// 而 `URL(string:)` 遇到空格**直接返回 nil**，调用点又是
+    /// `guard let url = ... else { continue }`，也就是说那个文件会被**静默跳过**。
+    /// 跳过的文件永远不会下载 → `isComplete` 永远为假 → 本地 TTS 永远不就绪，
+    /// 而且**不报任何错**（用户看到的就是"切过去了、没声音"）。
+    /// 364 个路径里有 104 个含 URL 特殊字符（多数是 `!v` 目录），所以这里统一编码，
+    /// 而不是只给那个带空格的特判。
+    static func encodedPath(_ path: String) -> String? {
+        // `.urlPathAllowed` 保留 `/`（目录层级必须保留），但会编码空格、`#`、`?` 这些
+        // 会截断或破坏路径的字符。
+        path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+    }
+
+    static let sources: [Source] = [
+        Source(label: "魔搭 (ModelScope)") { path in
+            guard let e = encodedPath(path) else { return nil }
+            return URL(string: "https://modelscope.cn/models/\(modelscopeRepoID)/resolve/master/\(e)")
+        },
+        Source(label: "hf-mirror") { path in
+            guard let e = encodedPath(path) else { return nil }
+            return URL(string: "https://hf-mirror.com/\(repoID)/resolve/main/\(e)")
+        },
+        Source(label: "huggingface.co") { path in
+            guard let e = encodedPath(path) else { return nil }
+            return URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(e)")
+        },
     ]
 
     /// 大文件先下（进度体验）：模型、音色、词典、FST，再是 espeak 数据
@@ -459,23 +509,80 @@ enum KokoroModelManifest {
         FileEntry(path: "espeak-ng-data/yue_dict", size: 563571),
         FileEntry(path: "lexicon-gb-en.txt", size: 6366635),
         FileEntry(path: "lexicon-us-en.txt", size: 5956885),
-        FileEntry(path: "lexicon-zh.txt", size: 2364621),
-        FileEntry(path: "model.int8.onnx", size: 114298054),
+        FileEntry(path: "lexicon-zh.txt", size: 2365182),
+        FileEntry(path: "model.int8.onnx", size: 114203756),
         FileEntry(path: "number-zh.fst", size: 64482),
         FileEntry(path: "phone-zh.fst", size: 88630),
         FileEntry(path: "tokens.txt", size: 687),
-        FileEntry(path: "voices.bin", size: 27678720),
+        FileEntry(path: "voices.bin", size: 28200960),
     ]
 
     static var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
 
+    // MARK: - 服务器声明的大小（自愈用）
+
+    /// 从服务器读到的真实文件大小（path → bytes），落盘保存。
+    ///
+    /// 为什么需要它 —— 这是实测挖出来的**真正根因**，比网络问题严重得多：
+    /// 上面 `files` 里那张大小表是**写死**的，而它已经和上游仓库对不上了：
+    ///   · model.int8.onnx  App 写 114298054，实际 114203756（差 94298）
+    ///   · voices.bin       App 写 27678720， 实际 28200960（差 522240）
+    ///   · lexicon-zh.txt   App 写 2364621，  实际 2365182（差 561）
+    /// 而 `isComplete` 正是按这张表逐文件校验的 —— 于是这三个文件**无论重下多少次
+    /// 都会被判成"没下全"**，TTS 模型永远不可能就绪。
+    /// 用户看到的"下载经常失败"其实不是网络：**每一次重试从第一轮起就注定失败**。
+    /// （上面三个数字也已经顺手改成权威值，但只改数字治不了根 —— 上游再变一次还会漂。）
+    ///
+    /// 所以改成：**以服务器声明的 Content-Length 为准**。下载时记下真实大小，
+    /// 之后校验优先认它；表里的值退化成"首次下载前的估算值"。
+    private static let sizeLock = NSLock()
+    nonisolated(unsafe) private static var serverSizesCache: [String: Int64] = [:]
+    nonisolated(unsafe) private static var serverSizesLoadedFrom: String?
+
+    private static func serverSizesURL(in directory: URL) -> URL {
+        directory.appendingPathComponent("_server_sizes.json")
+    }
+
+    static func serverSize(for path: String, in directory: URL) -> Int64? {
+        sizeLock.lock(); defer { sizeLock.unlock() }
+        let key = directory.path
+        if serverSizesLoadedFrom != key {
+            serverSizesCache = (try? Data(contentsOf: serverSizesURL(in: directory)))
+                .flatMap { try? JSONDecoder().decode([String: Int64].self, from: $0) } ?? [:]
+            serverSizesLoadedFrom = key
+        }
+        return serverSizesCache[path]
+    }
+
+    static func recordServerSize(_ size: Int64, for path: String, in directory: URL) {
+        guard size > 0 else { return }
+        sizeLock.lock(); defer { sizeLock.unlock() }
+        let key = directory.path
+        if serverSizesLoadedFrom != key {
+            serverSizesCache = (try? Data(contentsOf: serverSizesURL(in: directory)))
+                .flatMap { try? JSONDecoder().decode([String: Int64].self, from: $0) } ?? [:]
+            serverSizesLoadedFrom = key
+        }
+        guard serverSizesCache[path] != size else { return }
+        serverSizesCache[path] = size
+        if let data = try? JSONEncoder().encode(serverSizesCache) {
+            try? data.write(to: serverSizesURL(in: directory), options: .atomic)
+        }
+    }
+
     /// 校验单个文件是否存在且大小一致（isComplete / corruptEntries / existingBytes 复用）
+    ///
+    /// **认两个值**：表里的估算值，或下载时从服务器记下的真实值。
+    /// 只认表里那个，就会出现上面那种"永远校验不过"的死局。
     static func fileSizeMatches(_ entry: FileEntry, in directory: URL) -> Bool {
         let url = directory.appendingPathComponent(entry.path)
         guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else {
             return false
         }
-        return size.int64Value == entry.size
+        let actual = size.int64Value
+        if actual == entry.size { return true }
+        if let server = serverSize(for: entry.path, in: directory), actual == server { return true }
+        return false
     }
 
     /// 判定模型是否完整（逐文件校验大小）
@@ -754,7 +861,13 @@ final class KokoroTTSManager: ObservableObject {
             let total = KokoroModelManifest.totalBytes
             var done: Int64 = KokoroModelManifest.existingBytes(in: directory)
 
-            let bigFiles = KokoroModelManifest.files.filter { !$0.path.hasPrefix("espeak-ng-data/") }
+            // 大文件按体积降序：114MB 的 model.int8.onnx 排第一。
+            // 清单本体是字母序（它同时用于逐字节校验），但下载顺序要按体积走 ——
+            // 否则用户看到的是「进度条不动」好几十秒；而且万一魔搭/镜像对这个
+            // 唯一的大文件不认账，能让它在开头就暴露，而不是等小文件都下完才失败。
+            let bigFiles = KokoroModelManifest.files
+                .filter { !$0.path.hasPrefix("espeak-ng-data/") }
+                .sorted { $0.size > $1.size }
             let espeakFiles = KokoroModelManifest.files.filter { $0.path.hasPrefix("espeak-ng-data/") }
 
             func updateProgress() {
@@ -850,10 +963,19 @@ final class KokoroTTSManager: ObservableObject {
         // 镜像整体轮 2 遍：覆盖「A 整体不可用 → 走 B → B 也断 → 回 A 继续」的情况。
         // 单镜像内部的重试与续传在 downloadFile 里。
         for round in 0..<2 {
-            for base in KokoroModelManifest.baseURLs {
+            for source in KokoroModelManifest.sources {
                 do {
-                    let url = URL(string: "\(base)/\(KokoroModelManifest.repoID)/resolve/main/\(entry.path)")!
-                    try await downloadFile(from: url, to: dest, expected: entry.size, progress: progress)
+                    guard let url = source.url(entry.path) else {
+                        // 拿不到 URL 绝**不能**静默继续 —— 那会让这个文件永远下不到，
+                        // 而模型永远不就绪，且没有任何线索。原来是沉默的 continue。
+                        lastError = URLError(.badURL)
+                        continue
+                    }
+                    try await downloadFile(from: url, to: dest, expected: entry.size, progress: progress,
+                                           onServerSize: { len in
+                        // 记下权威长度：以后校验就认它，上游再变也不会卡死
+                        KokoroModelManifest.recordServerSize(len, for: entry.path, in: directory)
+                    })
                     return
                 } catch is CancellationError {
                     throw CancellationError()
@@ -879,6 +1001,12 @@ final class KokoroTTSManager: ObservableObject {
         private var continuation: CheckedContinuation<Void, Error>?
         private let stateLock = NSLock()
         private var resumed = false
+        /// 服务器声明的文件长度（Content-Length）。**0 = 未知**。
+        ///
+        /// 为什么要记它：App 里那张写死的文件大小表已经和上游对不上了，
+        /// 而校验却按它判 —— 于是有些文件无论重下多少次都被判成"没下全"。
+        /// 服务器声明的长度才是权威值，记下来给上面的自愈校验用。
+        nonisolated(unsafe) var serverExpectedLength: Int64 = 0
 
         init(destination: URL, onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
             self.destination = destination
@@ -914,6 +1042,10 @@ final class KokoroTTSManager: ObservableObject {
             downloadTask: URLSessionDownloadTask,
             didFinishDownloadingTo location: URL
         ) {
+            // 顺手把服务器声明的长度记下来（权威值，供自愈校验用）
+            if let expected = downloadTask.response?.expectedContentLength, expected > 0 {
+                serverExpectedLength = expected
+            }
             do {
                 if FileManager.default.fileExists(atPath: destination.path) {
                     try FileManager.default.removeItem(at: destination)
@@ -966,6 +1098,8 @@ final class KokoroTTSManager: ObservableObject {
         to dest: URL,
         expected: Int64,
         progress: (@Sendable (Int64) -> Void)?,
+        /// 拿到服务器声明的长度时回调（供上层落盘记录，供自愈校验使用）
+        onServerSize: (@Sendable (Int64) -> Void)? = nil,
         attempts: Int = 3
     ) async throws {
         var lastError: Error = URLError(.unknown)
@@ -1005,9 +1139,18 @@ final class KokoroTTSManager: ObservableObject {
                 continue
             }
             session.finishTasksAndInvalidate()
-            // 大小校验：字节数不对说明下坏了，删掉重下（此时不续传）
-            let size = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber
-            if size?.int64Value == expected { return }
+            // ── 大小校验 ──
+            //
+            // ⚠️ 优先用**服务器声明的长度**，而不是写死的那张表。
+            // 原因见 `KokoroModelManifest.serverSize` 的注释：那张表已经和上游对不上，
+            // 按它判会让几个文件永远"下不全"。服务器声明的长度是权威值。
+            let actual = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            let serverLen = delegate.serverExpectedLength
+            if serverLen > 0 { onServerSize?(serverLen) }
+            let want = serverLen > 0 ? serverLen : expected
+            if actual == want { return }
+            // 两个值都不匹配才认为下坏了
+            if serverLen == 0 && actual == expected { return }
             try? FileManager.default.removeItem(at: dest)
             resume = nil
             lastError = URLError(.zeroByteResource)
