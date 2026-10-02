@@ -171,13 +171,31 @@ final class TTSService: NSObject, ObservableObject {
         }
 
         isSpeaking = true
+
+        // 音色克隆：有参考音频就带上。
+        // 读失败（文件被清理掉、格式损坏）**不当作致命错误** —— 退回模型自带音色仍然能出声，
+        // 只是音色不是用户想要的；这种情况值得在上面的 lastTTSError 里留一句提示。
+        var reference: (samples: [Float], rate: Int)?
+        do {
+            if let loaded = try CosyVoiceVoiceStore.shared.loadReferenceSamples() {
+                reference = (loaded.0, loaded.1)
+            }
+        } catch {
+            await MainActor.run {
+                self.lastTTSError = "参考音频读取失败，这次会用模型自带音色朗读：\(error.localizedDescription)"
+            }
+        }
+
         // CosyVoice3 的合成接口没有语速参数（上游是把语速编进提示文本的），
         // 所以这里不传——留个死变量只会让人以为语速对它是生效的。
         kokoroTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
                 let samples = try await CosyVoiceTTSManager.shared.synthesize(
-                    text: text, language: Self.cosyVoiceLanguage(for: settings))
+                    text: text,
+                    language: Self.cosyVoiceLanguage(for: settings),
+                    referenceAudio: reference?.samples,
+                    referenceSampleRate: reference?.rate ?? 24000)
                 guard !Task.isCancelled else {
                     await MainActor.run { self.isSpeaking = false }
                     return

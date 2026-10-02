@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @EnvironmentObject private var llmService: LLMService
@@ -737,6 +738,8 @@ struct SettingsView: View {
     /// 是否一并下载可选的 461MB 克隆增强包
     @State private var cosyIncludeOptional = false
     @State private var cosySelfTest: KokoroSelfTest = .idle
+    @ObservedObject private var cosyVoiceStore = CosyVoiceVoiceStore.shared
+    @State private var showVoiceImporter = false
 
     /// 「测试本地语音」的状态
     enum KokoroSelfTest: Equatable {
@@ -812,6 +815,72 @@ struct SettingsView: View {
                         } label: {
                             Label("下载 CosyVoice3 模型", systemImage: "arrow.down.circle")
                                 .font(.caption)
+                        }
+                    }
+                }
+
+                // ── 音色克隆 ──
+                Divider().padding(.vertical, 2)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("音色克隆").font(.subheadline).fontWeight(.medium)
+                    Text("给一段 5~20 秒的清晰人声，之后朗读就用这个音色。不设置则用模型自带音色。")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if cosyVoiceStore.hasReference {
+                        HStack(spacing: 8) {
+                            Label(String(format: "已设置参考音频（%.1f 秒）", cosyVoiceStore.referenceSeconds),
+                                  systemImage: "waveform.circle.fill")
+                                .font(.caption).foregroundStyle(.green)
+                            Spacer()
+                            Button(role: .destructive) {
+                                cosyVoiceStore.clear()
+                            } label: { Text("移除").font(.caption) }
+                        }
+                        if let hint = cosyVoiceStore.durationHint {
+                            Text(hint).font(.caption2).foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        Text("尚未设置参考音频，当前使用模型自带音色。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+
+                    if let err = cosyVoiceStore.lastImportError {
+                        Text(err).font(.caption2).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button {
+                            showVoiceImporter = true
+                        } label: {
+                            Label(cosyVoiceStore.hasReference ? "更换参考音频" : "选择参考音频",
+                                  systemImage: "waveform.badge.plus")
+                                .font(.caption)
+                        }
+                        Button {
+                            // 直接合成一句让用户当场听到克隆效果 ——
+                            // 「设置完了却不知道像不像」是这类功能最常见的挫败点
+                            Task { TTSService.shared.speak("你好，这是克隆后的声音，听起来像吗？") }
+                        } label: {
+                            Label("试听", systemImage: "play.circle")
+                                .font(.caption)
+                        }
+                        .disabled(missingCount > 0)
+                    }
+                }
+                .fileImporter(isPresented: $showVoiceImporter,
+                              allowedContentTypes: [.audio],
+                              allowsMultipleSelection: false) { result in
+                    switch result {
+                    case .success(let urls):
+                        if let url = urls.first { cosyVoiceStore.importReference(from: url) }
+                    case .failure(let error):
+                        // 用户取消不算错误，只有真正的失败才提示
+                        let ns = error as NSError
+                        if ns.code != NSUserCancelledError {
+                            cosyVoiceStore.setImportError("选择文件失败：\(error.localizedDescription)")
                         }
                     }
                 }
