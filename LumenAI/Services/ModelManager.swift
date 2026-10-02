@@ -384,6 +384,46 @@ final class ModelManager: ObservableObject {
         }
     }
 
+    /// 校验刚下好的文件是否真的是模型文件。返回 `nil` = 通过；否则是给用户看的原因。
+    ///
+    /// 只认 llama.cpp 吃的几种魔数（GGUF / GGML 系列）。**刻意不看扩展名就放行** ——
+    /// 扩展名是我们自己按 URL 尾段取的，源站给什么内容都改变不了它，
+    /// 所以它是"我们希望它是什么"，不是"它实际是什么"。
+    ///
+    /// `nonisolated static`：要在委托线程/主 actor 两处都能调，且不碰任何共享状态。
+    nonisolated static func rejectReason(forStagedFile url: URL, fileName: String) -> String? {
+        let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        guard size > 0 else { return "下载到的文件是空的，请换个源重试。" }
+
+        guard let fh = try? FileHandle(forReadingFrom: url) else {
+            return "下载的文件读不出来（可能已被系统清理），请重试。"
+        }
+        defer { try? fh.close() }
+        let head = (try? fh.read(upToCount: 4)) ?? Data()
+
+        // 网页 / JSON 错误页：这类内容经常是以 200 返回的，所以状态码拦不住它们。
+        let firstByte = head.first.map { Int($0) }
+        if firstByte == 0x3C /* < */ || firstByte == 0x7B /* { */ || firstByte == 0x5B /* [ */ {
+            return "下载到的不是模型文件，而是一个网页或 JSON 错误内容（通常是登录页或限流提示）。请换一个下载源重试，或先在浏览器里确认该地址能直接下载。"
+        }
+
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        guard ext == "gguf" || ext == "ggml" || ext == "bin" else { return nil }   // 不认识的类型不拦
+
+        let magic = String(data: head, encoding: .ascii)?.lowercased() ?? ""
+        let known = ["gguf", "ggml", "ggmf", "ggjt", "ggla"]
+        guard known.contains(magic) else {
+            let shown = magic.allSatisfy { $0.isLetter || $0.isNumber } && !magic.isEmpty ? magic : "二进制内容"
+            return "下载到的文件不是有效的模型格式（文件头是「\(shown)」）。多半是下载被中断、或源站返回了错误内容，请换个源重试。"
+        }
+
+        // 一个真实的 GGUF 不可能只有几百 KB —— 这是"页面/片段被存成模型"的兜底判断。
+        if ext == "gguf" && size < 1_048_576 {
+            return "模型文件只有 \(size) 字节，明显不完整，请换个源重试。"
+        }
+        return nil
+    }
+
     /// 把暂存文件挪到最终文件名，并写索引（主 actor 上做）
     fileprivate func deliverStagedFile(id: String, stagedURL: URL) {
         guard let item = pending[id] else {
@@ -391,6 +431,27 @@ final class ModelManager: ObservableObject {
             return
         }
         let destination = localFileURL(fileName: item.fileName)
+
+        // 先把"这到底是不是一个模型文件"验掉，再往正式目录搬。
+        //
+        // 为什么这一步不能省：源站完全可能**以 200 返回一个网页**——私有仓库的登录页、
+        // 限流的提示页、或"文件不存在"的 HTML 页都是这样。它会被原样存成 .gguf，
+        // 之后用户看到的是**加载阶段**报的"未知模型格式 / 文件头不合法"，也就是
+        // 在最不相关的地方、用最看不懂的话，报一个其实是下载环节的错。
+        // 拦在这里就能直接说清原因，也让「换源重试」这件事变得有的放矢。
+        if let why = Self.rejectReason(forStagedFile: stagedURL, fileName: item.fileName) {
+            try? FileManager.default.removeItem(at: stagedURL)
+            lastError = why
+            clearPending(id: id)
+            finishDownload(id: id)
+            LiveActivityManager.shared.end(state: .init(
+                title: "下载的文件不可用",
+                phase: .failed, step: 0, totalSteps: nil,
+                detail: item.name, progress: nil, startedAt: Date()),
+                kind: .download)
+            return
+        }
+
         do {
             let fm = FileManager.default
             try? fm.createDirectory(at: destination.deletingLastPathComponent(),
