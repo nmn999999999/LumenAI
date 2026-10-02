@@ -593,9 +593,10 @@ struct SettingsView: View {
 
                 // 朗读引擎
                 Picker(t("朗读引擎"), selection: $storage.settings.ttsEngine) {
-                    Text(t("系统 TTS")).tag("system")
-                    Text(t("本地神经 TTS")).tag("kokoro")
-                    Text(t("网络 TTS")).tag("network")
+                    Text(t("系统")).tag("system")
+                    Text(t("本地·轻量")).tag("kokoro")
+                    Text(t("本地·高音质")).tag("cosyvoice")
+                    Text(t("网络")).tag("network")
                 }
                 .pickerStyle(.segmented)
 
@@ -661,6 +662,8 @@ struct SettingsView: View {
                     }
                 } else if storage.settings.ttsEngine == "kokoro" {
                     kokoroTTSCard
+                } else if storage.settings.ttsEngine == "cosyvoice" {
+                    cosyVoiceTTSCard
                 } else {
                     HStack {
                         Text(t("系统语音")).font(.subheadline)
@@ -730,6 +733,10 @@ struct SettingsView: View {
     // MARK: - Kokoro 本地神经 TTS
 
     @ObservedObject private var kokoroManager = KokoroTTSManager.shared
+    @ObservedObject private var cosyManager = CosyVoiceTTSManager.shared
+    /// 是否一并下载可选的 461MB 克隆增强包
+    @State private var cosyIncludeOptional = false
+    @State private var cosySelfTest: KokoroSelfTest = .idle
 
     /// 「测试本地语音」的状态
     enum KokoroSelfTest: Equatable {
@@ -737,6 +744,119 @@ struct SettingsView: View {
         case failed(String)
     }
     @State private var kokoroSelfTest: KokoroSelfTest = .idle
+
+    /// CosyVoice3 卡片。与 Kokoro 卡片的区别不在样式，而在**必须先说清能不能跑**：
+    /// 这是 0.5B 的 MLX 模型，内存不足时会「下完却加载不起来」，
+    /// 所以设备判定放在最上面，不满足时连下载按钮都不给。
+    private var cosyVoiceTTSCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionHeader(title: "CosyVoice3 本地语音", systemImage: "waveform.badge.mic")
+
+            // ── 设备能力 ──
+            let verdict = LocalVoiceCapability.verdict(for: .cosyVoice)
+            HStack(spacing: 8) {
+                Image(systemName: verdict.canUse ? "checkmark.seal.fill" : "xmark.octagon.fill")
+                    .foregroundStyle(verdict.canUse ? .green : .red)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verdict.canUse ? "你的设备可以运行" : "你的设备无法运行")
+                        .font(.subheadline)
+                    Text(LocalVoiceCapability.summary)
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            if let msg = verdict.message {
+                Text(msg).font(.caption2)
+                    .foregroundStyle(verdict.canUse ? .orange : .red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if verdict.canUse {
+                // ── 状态 / 下载 ──
+                switch cosyManager.state {
+                case .ready:
+                    Label("CosyVoice3 模型已就绪", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline).foregroundStyle(.green)
+                case .loading:
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini)
+                        Text("正在加载引擎（首次较慢，需要编译 Metal 着色器）…")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                case .downloading(let p, let file):
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: p)
+                        Text("\(Int(p * 100))% · \(file)").font(.caption2).foregroundStyle(.secondary)
+                    }
+                case .failed(let msg):
+                    Text(msg).font(.caption2).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .idle:
+                    Text("尚未下载。模型约 740MB（必需）+ 461MB（可选）。")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+
+                let missingCount = CosyVoiceTTSManager.missingFiles().count
+                if case .downloading = cosyManager.state {
+                    EmptyView()
+                } else if missingCount > 0 {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle(isOn: $cosyIncludeOptional) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("一并下载音色克隆增强包（+461MB）").font(.caption)
+                                Text("没有它也能克隆，但相似度上限约 0.83；有了它换情绪也不丢音色。")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        Button {
+                            cosyManager.download(includeOptional: cosyIncludeOptional)
+                        } label: {
+                            Label("下载 CosyVoice3 模型", systemImage: "arrow.down.circle")
+                                .font(.caption)
+                        }
+                    }
+                }
+
+                // ── 真机自检 ──
+                // 与 Kokoro 那个按钮同样的理由：文件齐全 ≠ 引擎能加载。
+                // CosyVoice3 还多一层风险（MLX 需要真实 Metal 设备），所以更需要它。
+                HStack(spacing: 8) {
+                    Button {
+                        cosySelfTest = .running
+                        Task {
+                            do {
+                                _ = try await CosyVoiceTTSManager.shared.loadEngine()
+                                cosySelfTest = .ok
+                            } catch {
+                                cosySelfTest = .failed(error.localizedDescription)
+                            }
+                        }
+                    } label: {
+                        Text("测试 CosyVoice3").font(.caption)
+                    }
+                    .disabled(missingCount > 0)
+                    switch cosySelfTest {
+                    case .idle:
+                        Text("会真的加载引擎并合成一句话").font(.caption2).foregroundStyle(.secondary)
+                    case .running:
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text("加载中…").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    case .ok:
+                        Label("引擎加载成功", systemImage: "checkmark.circle.fill")
+                            .font(.caption2).foregroundStyle(.green)
+                    case .failed(let msg):
+                        Text(msg).font(.caption2).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            } else {
+                Text("这台设备上建议改用「本地·轻量」（Kokoro）或系统语音 —— 它们对内存的要求低得多。")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
 
     private var kokoroTTSCard: some View {
         VStack(alignment: .leading, spacing: 10) {

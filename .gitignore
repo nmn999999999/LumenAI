@@ -55,3 +55,8 @@ ipa_final/
 
 # 本次会话的构建目录
 build-lumen3/
+
+# SPM 依赖与临时构建目录（不要提交，SourcePackages 里是别人的仓库）
+build-mlx/
+build-*/
+*.xcworkspace/xcuserdata/

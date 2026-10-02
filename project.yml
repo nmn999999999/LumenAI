@@ -30,6 +30,9 @@ targets:
       # 而表现是"代码都写了、装上去灵动岛就是不出来"，最难查的那类问题。
       - target: LumenAIWidget
         embed: true
+      # CosyVoice3 引擎（MLX）—— 只引入这一个 product，不拉其它模型库
+      - package: SpeechSwift
+        product: CosyVoiceTTS
     # URL scheme 必须走 info.properties：`INFOPLIST_KEY_*` 只能表达字符串，
     # 而 CFBundleURLTypes 是一个**数组套字典**的结构，用那种写法会静默丢掉。
     # 不注册它的后果：灵动岛/锁屏卡片上的 widgetURL("lumenai://chat") 点了没反应，
@@ -129,3 +132,12 @@ schemes:
       config: Debug
     archive:
       config: Release
+
+# ── SPM 依赖 ─────────────────────────────────────────────
+# speech-swift：Apple Silicon 上的本地语音引擎集合（MLX Swift + Core ML）。
+# 我们要的是 CosyVoiceTTS —— 它是**另一套引擎**，与现有的 sherpa-onnx 无关：
+# sherpa 走 CPU/ONNX，它走 MLX（Metal GPU），模型也是新一代端到端架构。
+packages:
+  SpeechSwift:
+    url: https://github.com/soniqo/speech-swift.git
+    exactVersion: 0.0.28

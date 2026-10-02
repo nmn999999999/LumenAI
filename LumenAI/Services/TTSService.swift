@@ -36,6 +36,8 @@ final class TTSService: NSObject, ObservableObject {
             networkTask = Task { await speakNetwork(text, settings: settings) }
         case "kokoro":
             Task { await speakKokoro(text, settings: settings) }
+        case "cosyvoice":
+            Task { await speakCosyVoice(text, settings: settings) }
         default:
             speakSystem(text, settings: settings)
         }
@@ -133,6 +135,73 @@ final class TTSService: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: 本地神经 TTS（CosyVoice3，MLX/Metal）
+
+    /// 与 `speakKokoro` 同构的三段式：先判可行性 → 再合成 → 最后播放。
+    ///
+    /// 与 Kokoro 那一路最大的区别是**失败原因必须说清楚**：CosyVoice3 有两类
+    /// Kokoro 没有的失败 —— 设备内存不够（MLX 模型常驻 1~1.5GB）、以及模型没下完。
+    /// 这两件事都不能靠"回退系统语音"糊过去，否则用户会以为"选了高音质、听起来还是系统音"，
+    /// 而真实原因是白下了 740MB 或者机器根本跑不动。
+    private func speakCosyVoice(_ text: String, settings: ModelSettings) async {
+        guard !text.isEmpty else { return }
+
+        // 设备能力：不满足就直说，不静默回退
+        let verdict = LocalVoiceCapability.verdict(for: .cosyVoice)
+        if case .unsupported(let why) = verdict {
+            await MainActor.run {
+                self.lastTTSError = why
+                self.isSpeaking = false
+            }
+            speakSystem(text, settings: settings)
+            return
+        }
+
+        let missing = CosyVoiceTTSManager.missingFiles()
+        if !missing.isEmpty {
+            await MainActor.run {
+                self.lastTTSError = "CosyVoice3 模型还没下完（缺 \(missing.count) 个文件）。"
+                    + "请到「设置 → 语音」里下载，约 740MB。"
+                self.isSpeaking = false
+            }
+            speakSystem(text, settings: settings)
+            return
+        }
+
+        isSpeaking = true
+        // CosyVoice3 的合成接口没有语速参数（上游是把语速编进提示文本的），
+        // 所以这里不传——留个死变量只会让人以为语速对它是生效的。
+        kokoroTask = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let samples = try await CosyVoiceTTSManager.shared.synthesize(
+                    text: text, language: Self.cosyVoiceLanguage(for: settings))
+                guard !Task.isCancelled else {
+                    await MainActor.run { self.isSpeaking = false }
+                    return
+                }
+                let wav = WAVWriter.wavData(samples: samples, sampleRate: 24000)
+                await MainActor.run {
+                    self.lastTTSError = nil
+                    self.configurePlaybackSession()
+                    self.playWAVData(wav)
+                }
+            } catch {
+                await MainActor.run {
+                    self.lastTTSError = "CosyVoice3 合成失败：\(error.localizedDescription)"
+                    self.isSpeaking = false
+                    self.speakSystem(text, settings: settings)
+                }
+            }
+        }
+    }
+
+    /// 语言标识。CosyVoice3 的提示文本里用**英文语言名**（`chinese` / `english`），
+    /// 不是 `zh-CN` 这类代码 —— 传错会得到英文腔调念中文的结果。
+    nonisolated static func cosyVoiceLanguage(for settings: ModelSettings) -> String {
+        settings.language == "en" ? "english" : "chinese"
     }
 
     /// 配置音频会话为 Playback 类别（播放 TTS 时需要，静音开关下也有声音）
