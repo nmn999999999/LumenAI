@@ -179,18 +179,8 @@ struct ProvidersView: View {
             } message: { s in
                 Text("「\(s.name)」的地址与请求头会被删除，其工具将从 Agent 工具目录中移除。")
             }
-            .overlay(alignment: .bottom) {
-                if let toastMessage {
-                    Text(toastMessage)
-                        .font(.subheadline.weight(.medium))
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: .capsule)
-                        .padding(.bottom, 12)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .animation(.snappy, value: toastMessage)
+            // 轻提示统一走 `.toast`（原来这里是三份复制粘贴里的一份）
+            .toast($toastMessage)
         }
     }
 
@@ -535,14 +525,9 @@ struct ProvidersView: View {
         return s.count > 60 ? String(s.prefix(60)) + "…" : s
     }
 
+    /// 显示一条轻提示。自动消失与动画都由 `ToastModifier` 负责。
     private func toast(_ message: String) {
-        withAnimation(.snappy) {
-            toastMessage = message
-        }
-        Task {
-            try? await Task.sleep(nanoseconds: 2_200_000_000)
-            withAnimation(.snappy) { toastMessage = nil }
-        }
+        toastMessage = message
     }
 }
 

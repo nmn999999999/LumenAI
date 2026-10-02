@@ -62,16 +62,9 @@ struct PluginsView: View {
             Text(importError ?? "")
         }
         .task { await pluginManager.checkForUpdates() }
-        .overlay(alignment: .bottom) {
-            if let toast {
-                Text(toast)
-                    .font(.subheadline.weight(.medium))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(.ultraThinMaterial, in: .capsule)
-                    .padding(.bottom, 12)
-            }
-        }
+        // 轻提示统一走 `.toast`：样式、动效、自动消失都只定义一次
+        //（这三处原来各抄一份，设置页那份还漏了自动消失）。
+        .toast($toast)
         .alert("模块更新", isPresented: .init(
             get: { pluginManager.lastCheckError != nil },
             set: { if !$0 { pluginManager.lastCheckError = nil } }
@@ -252,11 +245,9 @@ struct PluginsView: View {
         }
     }
 
+    /// 显示一条轻提示。自动消失与动画都由 `ToastModifier` 负责，
+    /// 这里只赋值 —— 三处的显示行为因此必然一致。
     private func toast(_ message: String) {
-        withAnimation(.snappy) { toast = message }
-        Task {
-            try? await Task.sleep(nanoseconds: 2_200_000_000)
-            withAnimation(.snappy) { toast = nil }
-        }
+        toast = message
     }
 }

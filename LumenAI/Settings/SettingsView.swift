@@ -911,16 +911,10 @@ struct SettingsView: View {
             }
             Button(t("取消"), role: .cancel) {}
         }
-        .overlay(alignment: .bottom) {
-            if let s3Toast {
-                Text(s3Toast)
-                    .font(.subheadline.weight(.medium))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(.ultraThinMaterial, in: .capsule)
-                    .padding(.bottom, 12)
-            }
-        }
+        // ⚠️ 这里原来**没有自动消失**：`s3Toast` 被赋值后一直挂着，
+        // 「恢复成功」会停到用户触发下一个动作为止 —— 而同一个文件里其它提示
+        // 是会消失的，用户会以为卡住了。改用统一的 `.toast` 后行为与另外两页一致。
+        .toast($s3Toast)
     }
 
     // MARK: - S3 动作

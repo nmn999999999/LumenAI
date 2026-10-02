@@ -137,6 +137,11 @@ struct ChatView: View {
                 // 与输入框同属"操作区"，跟手指所在的区域一致。
                 // 空清单时 PlanPanel 内部整块不渲染，这里不需要额外 if。
                 PlanPanel(store: todoStore)
+                // 从顶栏搬下来的动作（模型 / 助手 / 任务 / 搜索）。
+                // 放在 PlanPanel 与输入栏之间：它们都属于"操作区"，与手指所在的位置一致；
+                // 而消息列表那一侧保持干净，不被任何常驻控件挤占。
+                composerActionsBar
+                    .padding(.bottom, 6)
                 inputBar
             }
             .background(theme.current.pageBackground(for: colorScheme))
@@ -618,103 +623,15 @@ struct ChatView: View {
                     .accessibilityLabel(t("对话列表"))
             }
         }
-        // 任务清单入口。
+        // 顶栏**只留这两个**。原来这里是 6 个按钮（对话列表 / 任务清单 / 助手 / 搜索 /
+        // 模型 / 新建），其中模型菜单还带一个**文字标签**（"deepseek · deepseek-chat" 这种），
+        // 宽度直接吃掉了 inline 标题 —— 用户反馈"会挡住标题"指的就是它。
         //
-        // 为什么必须有一个**无条件存在**的入口：常驻面板只在"已经有清单"时才渲染，
-        // 所以一个还没触发过它的用户根本不知道这个功能存在 —— 没有清单就没有入口，
-        // 没有入口就更不会有清单，闭环锁死。这个按钮把环打开：有清单时直接看，
-        // 没有清单时解释它是什么、怎么让 AI 产生一份。
-        // 有清单时加一个数字角标，否则这个按钮和普通图标没有任何区别。
-        ToolbarItem(placement: .topBarLeading) {
-            Button {
-                showTaskList = true
-            } label: {
-                Image(systemName: "checklist")
-                    .accessibilityLabel("任务清单")
-                    .overlay(alignment: .topTrailing) {
-                        if todoStore.isActive {
-                            Text("\(todoStore.todos.count)")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 3)
-                                .padding(.vertical, 1)
-                                .background(Color.accentColor, in: .capsule)
-                                .offset(x: 7, y: -7)
-                        }
-                    }
-            }
-        }
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            // 助手选择
-            Menu {
-                ForEach(assistantStore.assistants) { assistant in
-                    Button {
-                        assistantStore.currentAssistantID = assistant.id
-                    } label: {
-                        Label("\(assistant.emoji) \(assistant.name)", systemImage:
-                            assistantStore.currentAssistantID == assistant.id ? "checkmark" : "person")
-                    }
-                }
-            } label: {
-                Image(systemName: assistantStore.current?.emoji == nil ? "person.crop.circle" : "person.crop.circle.badge.checkmark")
-                    .accessibilityLabel(t("选择助手"))
-            }
-
-            // 搜索入口按钮:只"打开"(showSearch = true),关闭由系统"取消"完成。
-            // 不要 toggle —— toggle 与系统 isPresented 双向绑定打架(v0.3.20 教训)。
-            Button {
-                showSearch = true
-            } label: {
-                Image(systemName: "magnifyingglass")
-                    .accessibilityLabel(t("搜索"))
-            }
-
-            // 模型选择（云端 Provider + 本地 GGUF）
-            Menu {
-                let cloudProviders = providerStore.providers.filter(\.enabled)
-                if !cloudProviders.isEmpty {
-                    Section(t("云端模型")) {
-                        ForEach(cloudProviders) { provider in
-                            if provider.models.isEmpty {
-                                Button {
-                                    providerStore.select(providerID: provider.id, model: "")
-                                } label: {
-                                    Label(provider.name, systemImage: "server.rack")
-                                }
-                            }
-                            ForEach(provider.models, id: \.self) { model in
-                                Button {
-                                    providerStore.select(providerID: provider.id, model: model)
-                                } label: {
-                                    Label("\(provider.name) · \(model)", systemImage:
-                                        (providerStore.currentProviderID == provider.id && providerStore.currentModel == model)
-                                        ? "checkmark" : "cloud")
-                                }
-                            }
-                        }
-                    }
-                }
-                if !modelManager.downloadedModels.isEmpty {
-                    Section(t("本地模型")) {
-                        ForEach(modelManager.downloadedModels) { model in
-                            Button {
-                                // 选中本地模型 = 明确切换到本地引擎：清除云端选择，避免二者同时选中、
-                                // 且 resolveEngine 仍优先走云端导致本地选择无效。
-                                providerStore.select(providerID: nil, model: "")
-                                Task { await loadModel(model) }
-                            } label: {
-                                Label(model.name, systemImage:
-                                    (!providerStore.hasCloudSelection && llmService.loadedModelName == model.name)
-                                    ? "checkmark" : "cpu")
-                            }
-                        }
-                    }
-                }
-            } label: {
-                Label(modelMenuTitle, systemImage: modelMenuIcon)
-                    .lineLimit(1)
-            }
-
+        // 分工原则（改动的依据）：顶栏放**和"这一段对话"有关的导航动作**，
+        // 底栏放**和"这一句话怎么发出去"有关的动作**（模型 / 助手 / 任务 / 搜索）。
+        // 这不是纯粹按好看分的：模型和助手是"发消息前要确认的上下文"，
+        // 放在输入框旁边（手指所在的位置）比放在屏幕最上方更贴合使用顺序。
+        ToolbarItem(placement: .topBarTrailing) {
             Button {
                 chatStore.createNew()
             } label: {
@@ -726,6 +643,174 @@ struct ChatView: View {
             // 正在生成的 token 就再也写不回原来那条气泡 —— 那条气泡会永远停在「思考中…」，
             // 而且没有任何报错提示。禁掉比静默丢内容好。
             .disabled(isGenerating)
+        }
+    }
+
+    // MARK: - 输入框上方的动作条（模型 / 助手 / 任务 / 搜索）
+
+    /// 从顶栏搬下来的那批动作。
+    ///
+    /// 为什么用 `.regularMaterial` 而不是玻璃：本工程在 iOS 26.1 真机上反复验证过
+    /// （v0.3.10 / v0.3.20 / v0.3.21 / v0.3.31），**同一 GlassEffectContainer 里相邻的
+    /// `.glassEffect` 按钮会视觉粘连成一片**，Apple 文档里的 spacing 语义在那个组合下不生效。
+    /// 所以这里沿用工具栏岛已经验证过的方案：一个 Material 胶囊承载一排**普通**按钮 ——
+    /// 材质与玻璃按钮不同层，天然独立，不会粘。
+    private var composerActionsBar: some View {
+        HStack(spacing: 0) {
+            // 模型：这一条最关键 —— 它原来是顶栏里最宽的元素（图标 + 文字标签）。
+            Menu {
+                modelMenuContent
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: modelMenuIcon)
+                        .font(.caption2)
+                    Text(modelMenuTitle)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        // 限宽而不是让它自己撑：模型名可以是 "siliconflow · Qwen/Qwen3-8B"
+                        // 这种很长的串，不限宽会把后面三个按钮全挤出去。
+                        .frame(maxWidth: 128, alignment: .leading)
+                }
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 10)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(t("选择模型"))：\(modelMenuTitle)")
+
+            divider
+
+            // 助手
+            Menu {
+                ForEach(assistantStore.assistants) { assistant in
+                    Button {
+                        assistantStore.currentAssistantID = assistant.id
+                    } label: {
+                        Label("\(assistant.emoji) \(assistant.name)", systemImage:
+                            assistantStore.currentAssistantID == assistant.id ? "checkmark" : "person")
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(assistantStore.current?.emoji ?? "🙂")
+                        .font(.caption)
+                    Text(assistantStore.current?.name ?? t("助手"))
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 84, alignment: .leading)
+                }
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 10)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(t("选择助手"))：\(assistantStore.current?.name ?? "")")
+
+            divider
+
+            // 任务清单。**无条件存在**：常驻面板只在"已经有清单"时才渲染，
+            // 所以一个还没触发过它的用户根本不知道这个功能存在 —— 没有清单就没有入口，
+            // 没有入口就更不会有清单，闭环锁死。这个按钮把环打开。
+            Button {
+                showTaskList = true
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "checklist")
+                        .font(.caption2)
+                    if todoStore.isActive {
+                        Text(todoStore.progressText)
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                    } else {
+                        Text("任务")
+                            .font(.caption.weight(.medium))
+                    }
+                }
+                .foregroundStyle(todoStore.isActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .padding(.horizontal, 10)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("任务清单")
+
+            divider
+
+            // 搜索入口:只"打开"(showSearch = true),关闭由系统"取消"完成。
+            // 不要 toggle —— toggle 与系统 isPresented 双向绑定打架(v0.3.20 教训)。
+            Button {
+                showSearch = true
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .frame(width: 40, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(t("搜索"))
+        }
+        .padding(.horizontal, 4)
+        .background(.regularMaterial, in: .capsule)
+        // 整条合成一个无障碍组：四个动作会各自被单独朗读，容器本身不该再被当成一个元素。
+        .accessibilityElement(children: .contain)
+        .padding(.horizontal, 14)
+    }
+
+    /// 分隔线。用 1pt 的 Divider 而不是 Spacer：四个动作紧挨着时，
+    /// 没有了图标之间的天然留白，需要一条视觉边界告诉用户"这是四个独立按钮"。
+    private var divider: some View {
+        Rectangle()
+            .fill(.quaternary)
+            .frame(width: 1, height: 16)
+    }
+
+    /// 模型菜单的内容。从原来的顶栏 Menu 里整段搬过来，逻辑一字未改
+    /// （云端 Provider 分组 + 本地 GGUF 分组 + 各自的选中态）。
+    @ViewBuilder
+    private var modelMenuContent: some View {
+        let cloudProviders = providerStore.providers.filter(\.enabled)
+        if !cloudProviders.isEmpty {
+            Section(t("云端模型")) {
+                ForEach(cloudProviders) { provider in
+                    if provider.models.isEmpty {
+                        Button {
+                            providerStore.select(providerID: provider.id, model: "")
+                        } label: {
+                            Label(provider.name, systemImage: "server.rack")
+                        }
+                    }
+                    ForEach(provider.models, id: \.self) { model in
+                        Button {
+                            providerStore.select(providerID: provider.id, model: model)
+                        } label: {
+                            Label("\(provider.name) · \(model)", systemImage:
+                                (providerStore.currentProviderID == provider.id && providerStore.currentModel == model)
+                                ? "checkmark" : "cloud")
+                        }
+                    }
+                }
+            }
+        }
+        if !modelManager.downloadedModels.isEmpty {
+            Section(t("本地模型")) {
+                ForEach(modelManager.downloadedModels) { model in
+                    Button {
+                        // 选中本地模型 = 明确切换到本地引擎：清除云端选择，避免二者同时选中、
+                        // 且 resolveEngine 仍优先走云端导致本地选择无效。
+                        providerStore.select(providerID: nil, model: "")
+                        Task { await loadModel(model) }
+                    } label: {
+                        Label(model.name, systemImage:
+                            (!providerStore.hasCloudSelection && llmService.loadedModelName == model.name)
+                            ? "checkmark" : "cpu")
+                    }
+                }
+            }
         }
     }
 

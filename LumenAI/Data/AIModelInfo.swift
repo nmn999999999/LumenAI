@@ -25,6 +25,16 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
         URL(string: "https://hf-mirror.com/\(repo)/resolve/main/\(fileName)")
     }
 
+    /// 是不是**本项目自己训出来的**权重（而不是通用底座）。
+    ///
+    /// 判据用 repo 归属而不是 id 字符串：id 是我们随手起的名字，改一次这个判断就悄悄失效；
+    /// 而"权重来自本项目自己的仓库"本身就是定义，不受改名影响。
+    ///
+    /// 为什么要这个标记：模型列表里有 13 个条目，用户没理由知道该选哪个。
+    /// 自训的那一个是**唯一带陪伴语域与跨对话记忆**的（其余都是通用底座，
+    /// `note` 工具在它们身上不会真的被调用），所以必须让它一眼可辨。
+    var isSelfTrained: Bool { repo.hasPrefix("luozx16/lumen-") }
+
     /// 估算运行所需内存（GB）：≈ 文件大小 ×1.4 + 1GB（KV 缓存 + 激活 + 系统开销），向上取偶。
     /// 用于模型页「建议内存」提示，避免下完装不上的尴尬。
     var estimatedRAMDescription: String {
