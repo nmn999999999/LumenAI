@@ -87,6 +87,17 @@ struct LumenAIApp: App {
                     }
                     // 插件：启动静默检查模块更新（1 天节流，服务页显示可更新角标）
                     await PluginManager.shared.checkForUpdatesIfNeeded()
+
+                    // CosyVoice3 的首次加载要编译 Metal 着色器（几十秒）。
+                    // 如果等用户点「朗读」才开始加载，那几十秒就是他眼里的
+                    // 「点了没反应」—— 而这跟合成本身没关系，完全可以在启动时就消化掉。
+                    // `preload()` 只在模型已就绪且设备支持时才真的加载，
+                    // 否则启动就白吃 1GB 内存，反而更容易被系统杀掉。
+                    if SettingsStorage.shared.settings.ttsEngine == "cosyvoice" {
+                        Task.detached(priority: .utility) {
+                            await CosyVoiceTTSManager.shared.preload()
+                        }
+                    }
                 }
                 // 数据安全：切后台/退出时立即落盘对话，防止 500ms 防抖窗口内强杀 App 丢消息
                 .onChange(of: scenePhase) { _, phase in

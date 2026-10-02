@@ -46,10 +46,18 @@ final class TTSService: NSObject, ObservableObject {
     func stop() {
         kokoroTask?.cancel()
         kokoroTask = nil
+        cosyProducer?.cancel()
+        cosyProducer = nil
         networkTask?.cancel()
         networkTask = nil
         synthesizer.stopSpeaking(at: .immediate)
         audioPlayer?.stop()
+        audioPlayer = nil
+        chunkedPlaybackActive = false
+        // ⚠️ 必须唤醒可能正挂在 `playAndWait` 上的分句循环。
+        // 不唤醒的话它会永远等下去，`isSpeaking` 再也回不到 false ——
+        // 表现是「点了一次停止之后，朗读按钮就再也点不动了」。
+        finishPlaybackWait()
         isSpeaking = false
     }
 
@@ -85,6 +93,23 @@ final class TTSService: NSObject, ObservableObject {
     // MARK: 本地神经 TTS（Kokoro，离线）
 
     private var kokoroTask: Task<Void, Never>?
+
+    /// 分句朗读的「生产者」任务（逐句合成）。
+    ///
+    /// 单独持有它是因为它是 `Task.detached`：**取消外层任务并不会连带取消它**，
+    /// 不单独存一份引用，`stop()` 就停不掉正在合成的那一句。
+    private var cosyProducer: Task<Void, Never>?
+
+    /// 是否处于「分句播放」模式。
+    ///
+    /// 用来阻止播放代理在**每一句播完**时都把 `isSpeaking` 清成 false ——
+    /// 分句模式下句间并没有说完，清掉会让界面在朗读途中显示"没在朗读"，
+    /// 用户这时再点一次「朗读」会被当成重新开始。
+    private var chunkedPlaybackActive = false
+
+    /// 等「这一段播完」的挂起点，由播放代理唤醒。
+    private var playbackContinuation: CheckedContinuation<Void, Never>?
+
     /// 供 UI 读取的最新错误（模型未下载 / 引擎失败等）
     @Published var lastTTSError: String?
 
@@ -234,15 +259,30 @@ final class TTSService: NSObject, ObservableObject {
             return
         }
 
-        isSpeaking = true
+        // ── 分句 ──
+        //
+        // 这是「要等很久才听到声音」的正解。CosyVoice3 是自回归模型：
+        // 逐 token 生成语音 token → flow matching → HiFi-GAN，
+        // **整段文本全生成完才可能出声**。切成句子后，第一句合成完就能开播，
+        // 其余句子在播放期间继续合成，出声时间从「整段」降到「一句」。
+        let chunks = SpeechChunker.chunks(text)
+        guard !chunks.isEmpty else {
+            isSpeaking = false
+            return
+        }
 
-        // 音色克隆：有参考音频就带上。
-        // 读失败（文件被清理掉、格式损坏）**不当作致命错误** —— 退回模型自带音色仍然能出声，
-        // 只是音色不是用户想要的；这种情况值得在上面的 lastTTSError 里留一句提示。
-        var reference: (samples: [Float], rate: Int)?
+        // ── 参考音频 → 说话人嵌入（整段朗读只算一次）──
+        //
+        // 嵌入只跟参考音频有关，而一次朗读里它不可能变。原来是每句（原本是每次
+        // 合成）现算一遍，而那个计算是同步的重活（重采样 + mel + CoreML），
+        // 会卡住界面。现在算一次并按指纹缓存，详见 CosyVoiceTTSManager。
+        var embedding: [Float]?
         do {
-            if let loaded = try CosyVoiceVoiceStore.shared.loadReferenceSamples() {
-                reference = (loaded.0, loaded.1)
+            if let loaded = try CosyVoiceVoiceStore.shared.loadReference() {
+                embedding = try await CosyVoiceTTSManager.shared.speakerEmbedding(
+                    audio: loaded.samples,
+                    sampleRate: loaded.rate,
+                    signature: loaded.signature)
             }
         } catch {
             await MainActor.run {
@@ -250,41 +290,127 @@ final class TTSService: NSObject, ObservableObject {
             }
         }
 
-        // CosyVoice3 的合成接口没有语速参数（上游是把语速编进提示文本的），
-        // 所以这里不传——留个死变量只会让人以为语速对它是生效的。
-        kokoroTask = Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            do {
-                let samples = try await CosyVoiceTTSManager.shared.synthesize(
-                    text: text,
-                    language: Self.cosyVoiceLanguage(for: settings),
-                    referenceAudio: reference?.samples,
-                    referenceSampleRate: reference?.rate ?? 24000)
-                guard !Task.isCancelled else {
-                    await MainActor.run { self.isSpeaking = false }
-                    return
-                }
-                let wav = WAVWriter.wavData(samples: samples, sampleRate: 24000)
-                let stats = Self.stats(samples, sampleRate: 24000)
+        // ── 加载引擎：单独一个阶段 ──
+        //
+        // 首次要编译 Metal 着色器（几十秒）。把它混进「正在合成」里，
+        // 用户看到的是一直转圈，会以为卡死了；分开报才知道在等什么。
+        await MainActor.run {
+            self.lastDiagnostic = "正在加载引擎…（首次需编译 Metal 着色器，可能要几十秒）"
+        }
+        do {
+            _ = try await CosyVoiceTTSManager.shared.loadEngine()
+        } catch {
+            await MainActor.run {
+                self.lastTTSError = "CosyVoice3 引擎加载失败：\(error.localizedDescription)"
+                self.lastDiagnostic = "引擎加载失败：\(error.localizedDescription)"
+                self.isSpeaking = false
+                self.speakSystem(text, settings: settings)
+            }
+            return
+        }
+
+        isSpeaking = true
+        chunkedPlaybackActive = true
+        let language = Self.cosyVoiceLanguage(for: settings)
+        let total = chunks.count
+
+        // ── 流水线：生产者逐句合成，消费者逐句播放 ──
+        let (stream, continuation) = AsyncStream<Data>.makeStream()
+
+        // 生产者**必须是独立任务**。如果把它和下面的播放循环写在同一个 task 里，
+        // 它会先把所有句子合成完才轮到播放 —— 流水线就退化回
+        // 「全部合成完再播」，也就是我们要修的那个问题本身。
+        cosyProducer = Task.detached(priority: .userInitiated) { [weak self] in
+            // ⚠️ 先取**强引用**再用。写成 `self?.xxx` 直接进 `MainActor.run` 的闭包，
+            // Swift 6 会判「sending 'self' risks causing data races」——
+            // 它把这个弱引用当成"跨隔离域传递 main actor 隔离的值"。
+            // 而 `TTSService` 是 `@MainActor` 类、本身即 Sendable，取成局部强引用后
+            // 这次传递就是安全的（也因此 `guard let self` 是这里的正确写法，
+            // 不是图省事）。任务本身很短命，多持有一会儿引用没有代价。
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            for (index, chunk) in chunks.enumerated() {
+                if Task.isCancelled { break }
                 await MainActor.run {
-                    self.lastTTSError = nil
-                    self.configurePlaybackSession()
-                    // 峰值这一步是分水岭：它把「模型返回静音」与「播放没出声」分开。
-                    // 没有它，两种原因在界面上完全一样。
-                    self.lastDiagnostic = stats.isSilent
-                        ? "CosyVoice3 跑通了但**输出是静音**：\(stats.text)。这属于模型/权重问题，不是播放问题。"
-                        : "CosyVoice3 合成成功：\(stats.text) · WAV \(wav.count) 字节"
-                    self.playWAVData(wav)
+                    self.lastDiagnostic = "正在合成第 \(index + 1)/\(total) 句…"
+                        + "（合成好一句就立刻开播，不用等整段）"
                 }
-            } catch {
-                await MainActor.run {
-                    self.lastTTSError = "CosyVoice3 合成失败：\(error.localizedDescription)"
-                    self.isSpeaking = false
-                    self.lastDiagnostic = "合成阶段抛错：\(error.localizedDescription)"
-                    self.speakSystem(text, settings: settings)
+                do {
+                    let samples = try await CosyVoiceTTSManager.shared.synthesize(
+                        text: chunk, language: language, speakerEmbedding: embedding)
+                    if Task.isCancelled { break }
+                    let stats = TTSService.stats(samples, sampleRate: 24000)
+                    if stats.isSilent {
+                        await MainActor.run {
+                            self.lastDiagnostic = "第 \(index + 1)/\(total) 句是静音"
+                                + "（\(stats.text)）—— 模型侧问题，不是播放问题。"
+                        }
+                    }
+                    continuation.yield(WAVWriter.wavData(samples: samples, sampleRate: 24000))
+                } catch {
+                    await MainActor.run {
+                        self.lastTTSError = "CosyVoice3 第 \(index + 1) 句合成失败："
+                            + "\(error.localizedDescription)"
+                        self.lastDiagnostic = "第 \(index + 1)/\(total) 句合成失败："
+                            + "\(error.localizedDescription)"
+                    }
+                    break
                 }
             }
+            continuation.finish()
         }
+
+        // 消费者：按顺序播放，播完一句再取下句
+        var played = 0
+        var fellBack = false
+        for await wav in stream {
+            if Task.isCancelled { break }
+            if await playAndWait(wav) {
+                played += 1
+            } else {
+                // playWAVData 内部已经回退系统 TTS 并说明原因，这里不再叠加
+                fellBack = true
+                break
+            }
+        }
+
+        cosyProducer?.cancel()
+        cosyProducer = nil
+        chunkedPlaybackActive = false
+        await MainActor.run {
+            // 回退系统 TTS 时 isSpeaking 由系统 TTS 那边管，别在这里清掉它
+            if !fellBack { self.isSpeaking = false }
+            if played == total && total > 0 {
+                self.lastDiagnostic = "朗读完成：\(played) 句全部合成并播放。"
+                    + "（分句流水线：第 1 句合成完就出声，其余在播放期间合成）"
+            }
+        }
+    }
+
+    /// 播放一段 WAV 并**等到播完**。返回是否真的开始播放。
+    ///
+    /// 分句朗读必须能等到一句播完才能接下一句 —— 否则后一句会把前一句直接打断，
+    /// 听起来像是只有最后一句在响。
+    private func playAndWait(_ data: Data) async -> Bool {
+        guard playWAVData(data) else { return false }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            // 极端短的音频可能在 play() 后立刻播完，代理回调已经排进主队列；
+            // 但那是**之后**才执行的，这里同步把 continuation 挂上不会漏掉它。
+            playbackContinuation = continuation
+        }
+        return true
+    }
+
+    /// 唤醒正挂着等播放结束的分句循环。
+    ///
+    /// `stop()` 也必须调它：否则用户在分句朗读途中点「停止」，
+    /// 播放循环会永远等在那次 `playAndWait` 上，`isSpeaking` 再也回不到 false，
+    /// 表现就是「停止之后再也点不动朗读」。
+    private func finishPlaybackWait() {
+        playbackContinuation?.resume()
+        playbackContinuation = nil
     }
 
     /// 语言标识。CosyVoice3 的提示文本里用**英文语言名**（`chinese` / `english`），
@@ -317,7 +443,9 @@ final class TTSService: NSObject, ObservableObject {
         return nil
     }
 
-    private func playWAVData(_ data: Data) {
+    /// 播放一段 WAV。返回是否**成功开始播放**（false 表示已走系统 TTS 回退）。
+    @discardableResult
+    private func playWAVData(_ data: Data) -> Bool {
         // 会话出错**不直接放弃**：有些情况只是重复激活会报错，路由其实可用。
         // 但要把它记下来 —— 这是"没声音"最隐蔽的一种原因。
         let sessionError = configurePlaybackSession()
@@ -340,7 +468,7 @@ final class TTSService: NSObject, ObservableObject {
             if !lastSpokenText.isEmpty {
                 speakSystem(lastSpokenText, settings: SettingsStorage.shared.settings)
             }
-            return
+            return false
         }
         audioPlayer = player
         player.delegate = self
@@ -358,11 +486,12 @@ final class TTSService: NSObject, ObservableObject {
             audioPlayer = nil
             isSpeaking = false
             speakSystem(lastSpokenText, settings: SettingsStorage.shared.settings)
-            return
+            return false
         }
         lastDiagnostic = (lastDiagnostic ?? "")
             + " → 已交给 AVAudioPlayer 播放（\(data.count) 字节）"
         isSpeaking = true
+        return true
     }
 
     /// 最近一次要朗读的文本。播放失败回退系统 TTS 时要用它 ——
@@ -452,6 +581,14 @@ extension TTSService: AVSpeechSynthesizerDelegate {
 
 extension TTSService: AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.isSpeaking = false }
+        Task { @MainActor in
+            // 先唤醒分句循环（它在等这一句播完），再决定要不要清 isSpeaking。
+            self.finishPlaybackWait()
+            // 分句模式下只是"这一句播完了"，整段还没完 ——
+            // 这时清掉 isSpeaking 会让界面在朗读途中显示"没在朗读"。
+            if !self.chunkedPlaybackActive {
+                self.isSpeaking = false
+            }
+        }
     }
 }

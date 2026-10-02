@@ -253,28 +253,31 @@ final class CosyVoiceTTSManager: ObservableObject {
     func unload() {
         engine = nil
         speakerEncoder = nil
+        cachedEmbedding = nil
         if state == .ready { state = .idle }
     }
 
     // MARK: - 合成
 
-    /// 合成一段语音，返回 24kHz 单声道样本。
+    /// 合成一段语音，返回 24kHz 单声道样本。`text` 建议是**一句话**，不是整段 ——
+    /// 见 `SpeechChunker`：整段合成完才出声是「点了半天没反应」的根因。
     ///
-    /// `referenceAudio` 非空时做**音色克隆**：先用 CAM++ 提取 192 维说话人嵌入，
-    /// 再交给 flow 模型做条件生成。
+    /// `speakerEmbedding` 非空时做**音色克隆**。
+    ///
+    /// ⚠️ 这里刻意**收嵌入而不是收参考音频**。原来传的是原始音频、在函数内部现算嵌入，
+    /// 有两个后果：(a) `embed` 内部要重采样 + 提 80 维 mel + 跑一次 CoreML 推理，
+    /// 是同步重活，而本类型是 `@MainActor` —— 它会卡住界面；
+    /// (b) 分句朗读时每一句都要重算一遍，长文本会卡到不可用。
+    /// 现在嵌入由 `speakerEmbedding(audio:sampleRate:signature:)` 单独算、按指纹缓存，
+    /// 整段朗读只算一次。
     func synthesize(
         text: String,
         language: String = "chinese",
-        referenceAudio: [Float]? = nil,
-        referenceSampleRate: Int = 24000
+        speakerEmbedding: [Float]? = nil
     ) async throws -> [Float] {
         let model = try await loadEngine()
         let box = Self.box(for: model)
-        var embedding: [Float]?
-        if let ref = referenceAudio, !ref.isEmpty {
-            let encoder = try await loadSpeakerEncoder()
-            embedding = try encoder.embed(audio: ref, sampleRate: referenceSampleRate)
-        }
+        let embedding = speakerEmbedding
         let samples = await Task.detached(priority: .userInitiated) { [box] in
             box.synthesize(text: text, language: language, embedding: embedding)
         }.value
@@ -282,6 +285,72 @@ final class CosyVoiceTTSManager: ObservableObject {
             throw CosyVoiceError.synthFailed("合成结果为空（模型返回了 0 个采样点）")
         }
         return samples
+    }
+
+    /// 计算说话人嵌入（音色克隆用），按 `signature` 缓存。
+    ///
+    /// **重活全部在 main actor 之外**：CAM++ 的 `embed` 是一个同步调用，里面包含
+    /// 重采样、80 维 mel 提取和一次 CoreML 推理。放在 `@MainActor` 上会直接卡住 UI。
+    func speakerEmbedding(
+        audio: [Float],
+        sampleRate: Int,
+        signature: String
+    ) async throws -> [Float] {
+        if let cached = cachedEmbedding, cached.signature == signature {
+            return cached.embedding
+        }
+        let encoder = try await loadSpeakerEncoder()
+        let box = Self.encoderBox(for: encoder)
+        let embedding = try await Task.detached(priority: .userInitiated) {
+            try box.embed(audio: audio, sampleRate: sampleRate)
+        }.value
+        cachedEmbedding = (signature, embedding)
+        return embedding
+    }
+
+    /// 嵌入缓存。参考音频不变就只算一次 —— 一次朗读里它不可能变。
+    private var cachedEmbedding: (signature: String, embedding: [Float])?
+
+    /// 预热：只加载引擎，不合成。
+    ///
+    /// 存在的理由：首次加载要编译 Metal 着色器（几十秒）。如果等用户点「朗读」
+    /// 才开始加载，那几十秒就是他眼里的「点了没反应」。启动时后台预热掉，
+    /// 真正朗读时只剩合成时间。
+    ///
+    /// 但**只在模型已就绪且设备支持时**才真的加载 —— 否则启动就白吃 1GB 内存，
+    /// 反而更容易被系统杀掉。
+    func preload() async {
+        guard Self.isReadyToLoad() else { return }
+        guard LocalVoiceCapability.verdict(for: .cosyVoice).canUse else { return }
+        _ = try? await loadEngine()
+    }
+
+    private static var encoderBoxes: [ObjectIdentifier: EncoderBox] = [:]
+
+    private static func encoderBox(for encoder: CamPlusPlusSpeaker) -> EncoderBox {
+        let key = ObjectIdentifier(encoder)
+        if let existing = encoderBoxes[key] { return existing }
+        let created = EncoderBox(encoder)
+        encoderBoxes[key] = created
+        return created
+    }
+}
+
+/// CAM++ 说话人编码器的串行访问盒子。
+///
+/// 与 `EngineBox` 同样的理由：`CamPlusPlusSpeaker` 持有 CoreML `MLModel`，
+/// 不是 `Sendable`，而 `Task.detached` 要求闭包是 `@Sendable`。
+/// 这里用锁**显式承担**「保证串行访问」的责任，而不是强转绕过编译器。
+private final class EncoderBox: @unchecked Sendable {
+    private let encoder: CamPlusPlusSpeaker
+    private let lock = NSLock()
+
+    init(_ encoder: CamPlusPlusSpeaker) { self.encoder = encoder }
+
+    func embed(audio: [Float], sampleRate: Int) throws -> [Float] {
+        lock.lock()
+        defer { lock.unlock() }
+        return try encoder.embed(audio: audio, sampleRate: sampleRate)
     }
 }
 

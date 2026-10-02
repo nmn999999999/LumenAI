@@ -95,19 +95,35 @@ final class CosyVoiceVoiceStore: ObservableObject {
 
     /// 读取参考音频样本（带缓存）。没有参考音频时返回 nil。
     func loadReferenceSamples() throws -> ([Float], Int)? {
+        guard let loaded = try loadReference() else { return nil }
+        return (loaded.samples, loaded.rate)
+    }
+
+    /// 读取参考音频，并带上一个**指纹**。
+    ///
+    /// 指纹是给「说话人嵌入缓存」当 key 用的。光比样本数不够 ——
+    /// 换一段时长恰好相同的音频会命中旧缓存，克隆出上一个人的音色，
+    /// 而且是静默的（用户只会觉得"换了个参考音频怎么没变化"）。
+    /// 所以用「文件名 + 修改时间 + 样本数」三者一起。
+    func loadReference() throws -> (samples: [Float], rate: Int, signature: String)? {
         guard let name = referenceName else { return nil }
         let url = Self.referenceDirectory.appendingPathComponent(name)
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let stamp = attrs?[.modificationDate] as? Date
 
-        if let samples = cachedSamples, stamp == cachedStamp {
-            return (samples, cachedRate)
+        let samples: [Float]
+        let rate: Int
+        if let cached = cachedSamples, stamp == cachedStamp {
+            samples = cached
+            rate = cachedRate
+        } else {
+            (samples, rate) = try Self.decode(url: url)
+            cachedSamples = samples
+            cachedRate = rate
+            cachedStamp = stamp
         }
-        let (samples, rate) = try Self.decode(url: url)
-        cachedSamples = samples
-        cachedRate = rate
-        cachedStamp = stamp
-        return (samples, rate)
+        let signature = "\(name)#\(stamp?.timeIntervalSince1970 ?? 0)#\(samples.count)"
+        return (samples, rate, signature)
     }
 
     /// 供界面报告「选择文件」阶段的失败（该阶段不经过 `importReference`）。
