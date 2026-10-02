@@ -739,6 +739,10 @@ struct SettingsView: View {
     @State private var cosyIncludeOptional = false
     @State private var cosySelfTest: KokoroSelfTest = .idle
     @ObservedObject private var cosyVoiceStore = CosyVoiceVoiceStore.shared
+    /// 订阅 TTS 服务：试听要读它的 lastDiagnostic（诊断结论）。
+    /// 原来这里是直接读 `TTSService.shared.lastTTSError` 的静态调用，
+    /// 那个值变了界面不会重绘 —— 诊断信息写出来了也看不见。
+    @ObservedObject private var tts = TTSService.shared
     @State private var showVoiceImporter = false
 
     /// 「测试本地语音」的状态
@@ -861,13 +865,35 @@ struct SettingsView: View {
                         }
                         Button {
                             // 直接合成一句让用户当场听到克隆效果 ——
-                            // 「设置完了却不知道像不像」是这类功能最常见的挫败点
-                            Task { TTSService.shared.speak("你好，这是克隆后的声音，听起来像吗？") }
+                            // 「设置完了却不知道像不像」是这类功能最常见的挫败点。
+                            //
+                            // ⚠️ 必须走 `previewCosyVoice` 而不是全局 `speak()`：
+                            // `speak()` 按 `settings.ttsEngine` 分发，引擎选的是 Kokoro
+                            // 或系统时，在这里点「试听」测的**根本不是 CosyVoice**。
+                            // 用户看到「点了没声音」，而真实原因是被测的是另一个引擎。
+                            tts.previewCosyVoice("你好，这是克隆后的声音，听起来像吗？")
                         } label: {
                             Label("试听", systemImage: "play.circle")
                                 .font(.caption)
                         }
-                        .disabled(missingCount > 0)
+                        .disabled(missingCount > 0 || tts.isSpeaking)
+                    }
+
+                    // ── 试听诊断 ──
+                    // 「点了没声音」至少有三种互不相同的原因：引擎没跑起来 /
+                    // 模型合成出来的就是静音 / 合成正常但播放没出声。
+                    // 不把实测结果摆出来，用户和我们都只能猜。
+                    if let diag = tts.lastDiagnostic {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("上次试听").font(.caption2).foregroundStyle(.secondary)
+                            Text(diag)
+                                .font(.caption2)
+                                .foregroundStyle(diag.contains("静音") || diag.contains("失败")
+                                                 || diag.contains("抛错") || diag.contains("没走到")
+                                                 ? .red : .green)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
                 .fileImporter(isPresented: $showVoiceImporter,
