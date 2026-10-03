@@ -794,6 +794,17 @@ final class KokoroTTSManager: ObservableObject {
         KokoroEngineCache.invalidate()
     }
 
+    /// 预热：只加载引擎，不合成。目的是把首次初始化的开销从用户点击"朗读"时挪走。
+    ///
+    /// 与 CosyVoice 不同，Kokoro 的模型较小（约 175MB）、启动快，但首次仍需初始化 ONNX Runtime，
+    /// 这可能需要几秒。预热把这段延迟从"用户点朗读"挪到启动时。
+    ///
+    /// **只在模型已就绪且设备支持时**才真的加载 —— 否则启动白吃内存。
+    func preload() async {
+        guard KokoroModelManifest.isComplete(in: Self.modelDirectory) else { return }
+        _ = try? await Self.engine()
+    }
+
     // MARK: 下载实现
 
     private enum ProgressPhase {
