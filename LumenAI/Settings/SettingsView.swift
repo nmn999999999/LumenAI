@@ -593,22 +593,13 @@ struct SettingsView: View {
                 Divider()
 
                 // 朗读引擎
-                // 5 段了，标签必须短 —— 分段控件不会换行，长了会直接截断成
-                // 「本地·高…」，反而看不懂。详细区别放在下面那张卡里说。
                 Picker(t("朗读引擎"), selection: $storage.settings.ttsEngine) {
                     Text(t("系统")).tag("system")
-                    Text(t("轻量")).tag("kokoro")
-                    Text(t("高音质")).tag("cosyvoice")
-                    Text(t("免费云")).tag("edge")
-                    Text(t("自建")).tag("network")
+                    Text(t("本地·轻量")).tag("kokoro")
+                    Text(t("本地·高音质")).tag("cosyvoice")
+                    Text(t("网络")).tag("network")
                 }
                 .pickerStyle(.segmented)
-                Text("系统 = 手机自带；轻量/高音质 = 本地离线（占内存、吃 GPU）；"
-                     + "免费云 = 微软在线语音，免 Key 免注册、不占内存；"
-                     + "自建 = 你自己的 OpenAI 兼容语音服务。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
 
                 if storage.settings.ttsEngine == "network" {
                     // 用哪家服务来合成 —— 这是这次新加的，之前只能"用当前对话的那家"。
@@ -674,8 +665,6 @@ struct SettingsView: View {
                     kokoroTTSCard
                 } else if storage.settings.ttsEngine == "cosyvoice" {
                     cosyVoiceTTSCard
-                } else if storage.settings.ttsEngine == "edge" {
-                    edgeTTSCard
                 } else {
                     HStack {
                         Text(t("系统语音")).font(.subheadline)
@@ -964,115 +953,6 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 云端免费 TTS（微软 Edge 朗读服务）
-
-    @ObservedObject private var edgeTTS = TTSService.shared
-    /// 连通性自检状态。**不复用** `KokoroSelfTest`：后者是为本地引擎设计的
-    /// （只有 idle/running/ok/failed），而云端自检成功时我们想把"返回了多少字节"
-    /// 一起显示出来，所以这里用一个独立的枚举带关联值。
-    @State private var edgeSelfTest: EdgeSelfTest = .idle
-
-    enum EdgeSelfTest: Equatable {
-        case idle
-        case running
-        case ok(Int)         // 返回的音频字节数
-        case failed(String)
-    }
-
-    /// 云端免费语音。
-    ///
-    /// 这张卡存在的理由不是"多一个音色"，而是**给跑不动本地模型的设备一条路**：
-    /// 它不占本机内存、不碰 GPU、不需要 API Key 和注册。
-    private var edgeTTSCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "云端免费语音", systemImage: "cloud")
-
-            Text("微软 Edge 浏览器的朗读服务，音色质量很好，**免费、无需 API Key、无需注册**。"
-                 + "不占手机内存、不用 GPU —— 设备跑不动本地高音质时，这是最省事的一条路。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                Text(t("音色")).font(.subheadline)
-                Spacer()
-                Picker(t("音色"), selection: $storage.settings.ttsEdgeVoice) {
-                    ForEach(EdgeTTS.groupedVoices) { group in
-                        Section(group.name) {
-                            ForEach(group.items) { voice in
-                                Text(voice.label).tag(voice.id)
-                            }
-                        }
-                    }
-                }
-                .frame(maxWidth: 230)
-            }
-
-            if storage.settings.ttsSpeed != 1.0 {
-                Text("语速 \(String(format: "%.2f", storage.settings.ttsSpeed))× "
-                     + "→ 会作为 \(EdgeTTS.rateString(for: storage.settings.ttsSpeed)) 发给服务端")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 8) {
-                Button {
-                    Task { TTSService.shared.previewEdge("你好，我是晓晓，这是云端免费语音的试听。") }
-                } label: {
-                    Label("试听", systemImage: "play.circle").font(.caption)
-                }
-                .disabled(edgeTTS.isSpeaking)
-
-                Button {
-                    edgeSelfTest = .running
-                    Task {
-                        do {
-                            let bytes = try await EdgeTTS.selfTest(voice: storage.settings.ttsEdgeVoice)
-                            edgeSelfTest = .ok(bytes)
-                        } catch {
-                            edgeSelfTest = .failed(error.localizedDescription)
-                        }
-                    }
-                } label: {
-                    Text("测试连通性").font(.caption)
-                }
-
-                switch edgeSelfTest {
-                case .idle:
-                    EmptyView()
-                case .running:
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.mini)
-                        Text("连接中…").font(.caption2).foregroundStyle(.secondary)
-                    }
-                case .ok(let bytes):
-                    Label("连通（\(bytes / 1024) KB 音频）", systemImage: "checkmark.circle.fill")
-                        .font(.caption2).foregroundStyle(.green)
-                case .failed(let msg):
-                    Text(msg).font(.caption2).foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            if let diag = edgeTTS.lastDiagnostic {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("上次试听").font(.caption2).foregroundStyle(.secondary)
-                    Text(diag)
-                        .font(.caption2)
-                        .foregroundStyle(diag.contains("失败") ? .red : .green)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                }
-            }
-
-            Text("说明：这是 Edge 朗读功能的内部端点，不是微软公开的 API —— "
-                 + "协议可能随时变化。所以这里把失败原因如实报出来并回退系统语音，"
-                 + "而不是静默无声。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
     private var kokoroTTSCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             // 这个卡片原本没有标题，只有一个状态 Label，用户看不出它与上面
@@ -1116,6 +996,36 @@ struct SettingsView: View {
                         } label: {
                             Text("测试本地语音").font(.caption)
                         }
+                        switch kokoroSelfTest {
+                        case .idle:
+                            Text("点一下会真的加载引擎并合成一句话，用来确认能出声")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        case .running:
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.mini)
+                                Text("正在加载引擎…").font(.caption2).foregroundStyle(.secondary)
+                            }
+                        case .ok:
+                            Label("引擎加载成功，可以出声", systemImage: "checkmark.circle.fill")
+                                .font(.caption2).foregroundStyle(.green)
+                        case .failed(let msg):
+                            Label("加载失败：\(msg)", systemImage: "xmark.octagon.fill")
+                                .font(.caption2).foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    // ── 试听按钮（强制走 Kokoro，不看全局引擎设置）──
+                    HStack(spacing: 8) {
+                        Button {
+                            // 直接合成一句让用户当场听到效果
+                            TTSService.shared.previewKokoro("你好，这是 Kokoro 本地语音的试听效果。")
+                        } label: {
+                            Label("试听", systemImage: "play.circle")
+                                .font(.caption)
+                        }
+                        .disabled(kokoroManager.state == .downloading || TTSService.shared.isSpeaking)
+
                         switch kokoroSelfTest {
                         case .idle:
                             Text("点一下会真的加载引擎并合成一句话，用来确认能出声")

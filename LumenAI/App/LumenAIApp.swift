@@ -98,6 +98,13 @@ struct LumenAIApp: App {
                             await CosyVoiceTTSManager.shared.preload()
                         }
                     }
+                    // Kokoro 预热：模型较小、启动快，但首次仍需初始化 ONNX Runtime（几秒）。
+                    // 选了 Kokoro 时也后台预热，把首次延迟从"点朗读"挪走。
+                    if SettingsStorage.shared.settings.ttsEngine == "kokoro" {
+                        Task.detached(priority: .utility) {
+                            await KokoroTTSManager.shared.preload()
+                        }
+                    }
                 }
                 // 数据安全：切后台/退出时立即落盘对话，防止 500ms 防抖窗口内强杀 App 丢消息
                 .onChange(of: scenePhase) { _, phase in

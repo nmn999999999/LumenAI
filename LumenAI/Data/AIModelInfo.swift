@@ -331,7 +331,7 @@ struct ModelSettings: Codable, Sendable {
     /// 发送时自动联网搜索（将搜索结果注入上下文）
     var cloudWebSearch: Bool
     /// 朗读引擎："system"（系统 TTS）、"kokoro"（本地·轻量）、
-    /// "cosyvoice"（本地·高音质）、"edge"（云端·免费）、"network"（OpenAI 兼容自建）
+    /// "cosyvoice"（本地·高音质）、"network"（OpenAI 兼容自建）
     var ttsEngine: String
     /// 系统 TTS 语音标识（如 zh-CN / en-US）
     var ttsVoice: String
@@ -351,11 +351,7 @@ struct ModelSettings: Codable, Sendable {
     var ttsModel: String
     /// Kokoro 本地 TTS 音色 ID（如 zf_xiaoxiao / zm_yunjian）
     var ttsKokoroVoice: String
-    /// Edge 在线语音（微软朗读服务）的音色名，如 zh-CN-XiaoxiaoNeural。
-    ///
-    /// 单独一个字段而不是复用 `ttsVoice`：后者存的是**系统 TTS** 的语音标识
-    /// （zh-CN / en-US 这类），两者的取值空间完全不同，混用会让切引擎时互相覆盖。
-    var ttsEdgeVoice: String
+
     /// Kokoro 本地 TTS 语速（0.5 - 2.0，1.0 为原速）
     var ttsSpeed: Double
     /// 界面语言："zh" / "en"
@@ -431,7 +427,6 @@ struct ModelSettings: Codable, Sendable {
         ttsVoiceName: String = "alloy",
         ttsModel: String = "tts-1",
         ttsKokoroVoice: String = "zf_xiaoxiao",
-        ttsEdgeVoice: String = "zh-CN-XiaoxiaoNeural",
         ttsSpeed: Double = 1.0,
         language: String = "zh",
         keepScreenOn: Bool = false,
@@ -482,7 +477,6 @@ struct ModelSettings: Codable, Sendable {
         self.ttsProviderID = ttsProviderID
         self.ttsModel = ttsModel
         self.ttsKokoroVoice = ttsKokoroVoice
-        self.ttsEdgeVoice = ttsEdgeVoice
         self.ttsSpeed = ttsSpeed
         self.language = language
         self.keepScreenOn = keepScreenOn
@@ -516,7 +510,7 @@ struct ModelSettings: Codable, Sendable {
         case temperature, topP, topK, maxTokens, contextLength, systemPrompt,
              gpuLayers, searchEngine, searxngURL, showThinking, showToolCalls, useMmap,
              apiEnabled, apiEndpoint, apiKey, apiModel, apiTemperature, apiMaxTokens,
-             cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsProviderID, ttsKokoroVoice, ttsEdgeVoice, ttsSpeed, language,
+             cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsProviderID, ttsKokoroVoice, ttsSpeed, language,
              keepScreenOn, memoryEnabled, worldBookEnabled, instructionEnabled,
              promptStrategy, useMetalAuto, kvCacheQuantize, autoCheckUpdate, grayOptIn, autoExtractMemory,
              s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region,
@@ -552,7 +546,7 @@ struct ModelSettings: Codable, Sendable {
         ttsEngine = try c.decodeIfPresent(String.self, forKey: .ttsEngine) ?? "system"
         ttsVoice = try c.decodeIfPresent(String.self, forKey: .ttsVoice) ?? ""
         ttsVoiceName = try c.decodeIfPresent(String.self, forKey: .ttsVoiceName) ?? "alloy"
-        ttsEdgeVoice = try c.decodeIfPresent(String.self, forKey: .ttsEdgeVoice) ?? "zh-CN-XiaoxiaoNeural"
+
         // 旧存档没有这个键 → 空串 → 沿用当前对话的 Provider，与旧版行为完全一致
         ttsProviderID = try c.decodeIfPresent(String.self, forKey: .ttsProviderID) ?? ""
         ttsModel = try c.decodeIfPresent(String.self, forKey: .ttsModel) ?? "tts-1"
@@ -607,7 +601,7 @@ struct ModelSettings: Codable, Sendable {
         try c.encode(ttsEngine, forKey: .ttsEngine)
         try c.encode(ttsVoice, forKey: .ttsVoice)
         try c.encode(ttsVoiceName, forKey: .ttsVoiceName)
-        try c.encode(ttsEdgeVoice, forKey: .ttsEdgeVoice)
+
         try c.encode(ttsProviderID, forKey: .ttsProviderID)
         try c.encode(ttsModel, forKey: .ttsModel)
         try c.encode(ttsKokoroVoice, forKey: .ttsKokoroVoice)

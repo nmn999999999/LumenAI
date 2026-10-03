@@ -38,10 +38,7 @@ final class TTSService: NSObject, ObservableObject {
             Task { await speakKokoro(text, settings: settings) }
         case "cosyvoice":
             Task { await speakCosyVoice(text, settings: settings) }
-        case "edge":
-            // 免费云端（微软 Edge 朗读服务）。复用 networkTask 是因为
-            // `stop()` 已经会取消它 —— 两者都是网络路径，不会并存（speak 先 stop）。
-            networkTask = Task { await speakEdge(text, settings: settings) }
+        
         default:
             speakSystem(text, settings: settings)
         }
@@ -125,19 +122,6 @@ final class TTSService: NSObject, ObservableObject {
     /// 让界面直接说出来。
     @Published var lastDiagnostic: String?
 
-    /// 「试听」入口（云端免费版）：**强制走 Edge TTS**，不受当前设置影响。
-    ///
-    /// 与 `previewCosyVoice` 同构 —— 卡片里的试听按钮测的是**这张卡片对应的引擎**，
-    /// 而不是全局 `speak()` 当前选的那个（否则引擎选的是别的时，
-    /// 在这里点试听测的根本不是这个引擎）。
-    func previewEdge(_ text: String) {
-        stop()
-        lastSpokenText = text
-        lastDiagnostic = "正在请求云端语音…"
-        let settings = SettingsStorage.shared.settings
-        networkTask = Task { await speakEdge(text, settings: settings) }
-    }
-
     /// 「试听」入口：**强制走 CosyVoice3**，不受当前 `ttsEngine` 设置影响。
     ///
     /// 原来卡片里的试听按钮调的是全局 `speak()`，而 `speak()` 按
@@ -150,6 +134,19 @@ final class TTSService: NSObject, ObservableObject {
         lastDiagnostic = "正在合成…（首次会先加载引擎，并编译 Metal 着色器，可能要几十秒）"
         let settings = SettingsStorage.shared.settings
         Task { await speakCosyVoice(text, settings: settings) }
+    }
+
+    /// 「试听」入口（Kokoro）：**强制走 Kokoro**，不受当前设置影响。
+    ///
+    /// 与 `previewCosyVoice` 同构 —— 卡片里的试听按钮测的是**这张卡片对应的引擎**，
+    /// 而不是全局 `speak()` 当前选的那个（否则引擎选的是别的时，
+    /// 在这里点「试听」测的根本不是这个引擎）。
+    func previewKokoro(_ text: String) {
+        stop()
+        lastSpokenText = text
+        lastDiagnostic = "正在合成…（首次会先加载引擎，可能要几秒）"
+        let settings = SettingsStorage.shared.settings
+        Task { await speakKokoro(text, settings: settings) }
     }
 
     /// 合成结果体检。
@@ -428,99 +425,6 @@ final class TTSService: NSObject, ObservableObject {
     private func finishPlaybackWait() {
         playbackContinuation?.resume()
         playbackContinuation = nil
-    }
-
-    // MARK: 云端免费 TTS（微软 Edge 朗读服务）
-
-    /// 无需 API Key、无需注册的在线语音。
-    ///
-    /// 与两个本地引擎最根本的差别：**不占本机内存、不碰 GPU**。
-    /// 对「本地·高音质会把机器拖死 / 卡退」的设备，这是唯一可行的出路 ——
-    /// 所以它存在的意义不只是"多一个音色"，而是"有一条跑得动的路"。
-    private func speakEdge(_ text: String, settings: ModelSettings) async {
-        guard !text.isEmpty else { return }
-
-        let chunks = SpeechChunker.chunks(text)
-        guard !chunks.isEmpty else {
-            isSpeaking = false
-            return
-        }
-
-        let voice = settings.ttsEdgeVoice.isEmpty ? EdgeTTS.defaultVoice : settings.ttsEdgeVoice
-        let rate = EdgeTTS.rateString(for: settings.ttsSpeed)
-        let total = chunks.count
-
-        isSpeaking = true
-        chunkedPlaybackActive = true
-        await MainActor.run {
-            self.lastDiagnostic = "正在请求云端语音（\(EdgeTTS.voiceLabel(for: voice))）…"
-        }
-
-        // 这里**不用**本地那条「生产者/消费者双任务」：云端合成是网络往返，
-        // 并发多发请求只会被限流，而且没有"抢 GPU"这回事。
-        // 改成顺序处理 + 单句预取：第 n 句在播的时候，第 n+1 句的请求已经在路上。
-        var played = 0
-        var fellBack = false
-        var prefetched: Task<Data, Error>?
-
-        for (index, chunk) in chunks.enumerated() {
-            if Task.isCancelled { break }
-            await MainActor.run {
-                self.lastDiagnostic = "正在合成第 \(index + 1)/\(total) 句（云端）…"
-            }
-
-            let request = prefetched
-                ?? Task { try await EdgeTTS.synthesize(text: chunk, voice: voice, rate: rate) }
-            prefetched = nil
-
-            let mp3: Data
-            do {
-                mp3 = try await request.value
-            } catch {
-                await MainActor.run {
-                    self.lastTTSError = "云端语音合成失败（第 \(index + 1) 句）："
-                        + "\(error.localizedDescription)"
-                    self.lastDiagnostic = "云端第 \(index + 1)/\(total) 句失败："
-                        + "\(error.localizedDescription)"
-                }
-                // 一句都没播出来才回退系统语音。已经播了几句就停在这儿 ——
-                // 从头用系统音念一遍会让用户听到重复内容。
-                if played == 0 {
-                    await MainActor.run {
-                        self.chunkedPlaybackActive = false
-                        self.speakSystem(text, settings: settings)
-                    }
-                    fellBack = true
-                }
-                break
-            }
-
-            // 立刻把下一句的请求发出去，让它在**本句播放期间**完成
-            if index + 1 < chunks.count {
-                let upcoming = chunks[index + 1]
-                prefetched = Task {
-                    try await EdgeTTS.synthesize(text: upcoming, voice: voice, rate: rate)
-                }
-            }
-
-            if Task.isCancelled { break }
-            if await playAndWait(mp3) {
-                played += 1
-            } else {
-                fellBack = true
-                break
-            }
-        }
-
-        prefetched?.cancel()
-        chunkedPlaybackActive = false
-        await MainActor.run {
-            if !fellBack { self.isSpeaking = false }
-            if played == total && total > 0 {
-                self.lastDiagnostic = "云端朗读完成：\(played) 句"
-                    + "（免费 Edge 语音 · \(EdgeTTS.voiceLabel(for: voice))）"
-            }
-        }
     }
 
     /// 语言标识。CosyVoice3 的提示文本里用**英文语言名**（`chinese` / `english`），
