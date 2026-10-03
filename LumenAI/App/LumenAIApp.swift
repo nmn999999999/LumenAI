@@ -96,30 +96,11 @@ struct LumenAIApp: App {
                     // 插件：启动静默检查模块更新（1 天节流，服务页显示可更新角标）
                     await PluginManager.shared.checkForUpdatesIfNeeded()
 
-                    // CosyVoice3 的首次加载要编译 Metal 着色器（几十秒）。
-                    // 如果等用户点「朗读」才开始加载，那几十秒就是他眼里的
-                    // 「点了没反应」—— 而这跟合成本身没关系，完全可以在启动时就消化掉。
-                    // `preload()` 只在模型已就绪且设备支持时才真的加载，
-                    // 否则启动就白吃 1GB 内存，反而更容易被系统杀掉。
-                    //
-                    // ⚠️ 延迟 5 秒再预热（v0.3.73）：卡顿报告显示启动阶段
-                    // CosyVoice 的 Qwen3Tokenizer 加载（root.utility-qos.cooperative）
-                    // 与首帧/切页的 SwiftUI 布局抢 CPU —— 主线程因此被顶过 461ms。
-                    // 预热不急这一时，避开首屏渲染高峰再跑。
-                    if SettingsStorage.shared.settings.ttsEngine == "cosyvoice" {
-                        Task.detached(priority: .utility) {
-                            try? await Task.sleep(nanoseconds: 5_000_000_000)
-                            await CosyVoiceTTSManager.shared.preload()
-                        }
-                    }
-                    // Kokoro 预热：模型较小、启动快，但首次仍需初始化 ONNX Runtime（几秒）。
-                    // 选了 Kokoro 时也后台预热，把首次延迟从"点朗读"挪走。同样避开首帧。
-                    if SettingsStorage.shared.settings.ttsEngine == "kokoro" {
-                        Task.detached(priority: .utility) {
-                            try? await Task.sleep(nanoseconds: 5_000_000_000)
-                            await KokoroTTSManager.shared.preload()
-                        }
-                    }
+                    // v0.3.74：两个本地 TTS 引擎（CosyVoice / Kokoro）**不再启动预热**，
+                    // 改为手动加载 —— 启动期是主线程布局的高峰，预热的 tokenizer/着色器
+                    // 编译会跟首帧抢 CPU（0.3.73 的卡顿报告正是这条路径）。
+                    // 按需加载的入口本来就有：设置页「测试本地语音 / 试听」按钮、
+                    // 聊天里点「朗读」时 TTSService 会自己加载引擎（带进度提示）。
                 }
                 // 数据安全：切后台/退出时立即落盘对话，防止 500ms 防抖窗口内强杀 App 丢消息
                 .onChange(of: scenePhase) { _, phase in

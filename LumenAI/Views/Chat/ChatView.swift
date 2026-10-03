@@ -8,10 +8,7 @@ import UIKit
 /// 文件选择按钮（DocumentPicker 封装）
 struct DocumentPickerButton: View {
     @Binding var selectedFiles: [URL]
-    let canChat: Bool
     let onPick: ([URL]) -> Void
-    /// 选择失败时的反馈（原来只 print，用户看不到任何反应）
-    var onError: ((String) -> Void)? = nil
 
     @State private var showPicker = false
 
@@ -27,20 +24,22 @@ struct DocumentPickerButton: View {
                 .accessibilityLabel("添加文件")
         }
         .buttonStyle(.plain)
-        .disabled(!canChat)
-        .opacity(canChat ? 1 : 0.35)
-        .fileImporter(
-            isPresented: $showPicker,
-            allowedContentTypes: [.data, .pdf, .text, .spreadsheet, .presentation, .archive, .audio, .video, .image],
-            allowsMultipleSelection: true
-        ) { result in
-            switch result {
-            case .success(let urls):
+        // 不再按 canChat 置灰：选文件不需要模型，"没有模型"应该是发送时给出
+        // 明确提示，而不是让文件按钮点了没反应（"没办法提交文件"的一种）。
+        .sheet(isPresented: $showPicker) {
+            // v0.3.74：换 UIKit asCopy 选择器（见 UIKitFilePicker 注释 ——
+            // SwiftUI .fileImporter 在 iOS 26 真机有读权限/弹窗不关闭的已知问题）
+            UIKitFilePicker(
+                allowedTypes: [.data, .pdf, .text, .spreadsheet, .presentation, .archive, .audio, .video, .image],
+                allowsMultipleSelection: true
+            ) { urls in
+                showPicker = false
                 selectedFiles = urls
                 onPick(urls)
-            case .failure(let error):
-                onError?(error.localizedDescription)
+            } onCancelled: {
+                showPicker = false
             }
+            .ignoresSafeArea()
         }
     }
 }
@@ -581,10 +580,8 @@ struct ChatView: View {
                 // 每个图标固定纯色（蓝/橙/绿/红）；激活时实心色圈 + 白色图标 → 切换状态颜色反馈清晰。
                 HStack(spacing: 18) {
                     // 文件选择按钮（放在图片前面，更符合"先选文件再选图"的认知顺序）
-                    DocumentPickerButton(selectedFiles: $selectedFiles, canChat: canChat) { urls in
+                    DocumentPickerButton(selectedFiles: $selectedFiles) { urls in
                         Task { await importFiles(urls) }
-                    } onError: { msg in
-                        errorMessage = "文件选择失败：\(msg)"
                     }
 
                     PhotosPicker(
@@ -600,9 +597,7 @@ struct ChatView: View {
                             .accessibilityLabel(t("添加图片"))
                     }
                     .buttonStyle(.plain)
-                    // 只写了 opacity 会让按钮看起来置灰、实际仍可点（旁边 Agent 按钮两个都写了）。
-                    .disabled(!canChat)
-                    .opacity(canChat ? 1 : 0.35)
+                    // 同文件按钮：选图不需要模型，发送时再校验（v0.3.74）
 
                     Button {
                         if isAgentMode || canUseAgentMode {
@@ -814,7 +809,9 @@ struct ChatView: View {
         // v0.3.73：只选文件不打字也应能发送 —— 原来漏了 fileAttachments，
         // 用户选完文件发送键还是灰的，表现为"文件无法上传"。
         let hasFile = !fileAttachments.isEmpty
-        return canChat && (hasText || hasImage || hasFile) && !isGenerating
+        // v0.3.74：不再把 canChat 混进来 —— 没有模型时灰按钮是"点了没反应"，
+        // 改为允许按下、sendMessage 里给出"先去装载模型"的明确指引。
+        return (hasText || hasImage || hasFile) && !isGenerating
     }
 
     // MARK: - 工具栏（模型选择 / 助手选择 / 搜索 / 新对话）
@@ -1047,6 +1044,13 @@ struct ChatView: View {
     private func sendMessage() {
         let rawText = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSend else { return }
+
+        // 没有可用模型：以前是发送键直接灰掉（点了没反应），
+        // 现在按下去给出明确指引；附件/文字都保留不清空。
+        guard canChat else {
+            errorMessage = "还没有可用的模型：请先到「模型」页装载一个本地模型，或到「服务」页选择云端模型，再发送。你选的附件已保留。"
+            return
+        }
 
         // 文生图命令：/draw <描述>（云端 OpenAI 兼容 images/generations）
         if rawText.hasPrefix("/draw ") || rawText.hasPrefix("/draw\n") || rawText == "/draw" {

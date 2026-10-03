@@ -51,20 +51,29 @@ struct FilesView: View {
             .onAppear { reload() }
             .onChange(of: path) { reload() }
         }
-        .fileImporter(
-            isPresented: $showImporter,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: false
-        ) { result in
-            guard case .success(let urls) = result, let url = urls.first else { return }
-            do {
-                let rel = try FileManagerService.shared.importExternal(
-                    url, preferredPath: currentPath.isEmpty ? nil : currentPath + "/" + url.lastPathComponent)
-                toast = "已导入 \(rel)"
-                reload()
-            } catch {
-                errorMessage = error.localizedDescription
+        // v0.3.74：换 UIKit asCopy 选择器（SwiftUI .fileImporter 在 iOS 26 真机
+        // 有"选完读不到/弹窗不关"的已知问题，见 UIKitFilePicker 注释）。
+        // 类型列到 .data/.content 一层：除了文件夹（public.folder 不属于它们），
+        // 文件夹用 asCopy 拷不了、以前传进来也是读失败。
+        .sheet(isPresented: $showImporter) {
+            UIKitFilePicker(
+                allowedTypes: [.data, .content, .compositeContent],
+                allowsMultipleSelection: false
+            ) { urls in
+                showImporter = false
+                guard let url = urls.first else { return }
+                do {
+                    let rel = try FileManagerService.shared.importExternal(
+                        url, preferredPath: currentPath.isEmpty ? nil : currentPath + "/" + url.lastPathComponent)
+                    toast = "已导入 \(rel)"
+                    reload()
+                } catch {
+                    errorMessage = error.localizedDescription
+                }
+            } onCancelled: {
+                showImporter = false
             }
+            .ignoresSafeArea()
         }
         // v0.3.73：自定义居中输入弹窗（替代系统 .alert，见 nameDialog 注释）
         .overlay {
