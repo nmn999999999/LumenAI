@@ -58,7 +58,11 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
+                // LazyVStack（v0.3.73）：设置页 15 张卡全部急切布局时，body 求值 +
+                // layout 会把主线程顶过 461ms（UIKit-runloop 卡顿报告里的最大嫌疑，
+                // SettingsView.body.getter 占了 46 个采样里的一半）。懒加载后
+                // 屏幕外的卡片不参与首帧计算，切页/滚动都轻了。
+                LazyVStack(alignment: .leading, spacing: 20) {
                     apiModeCard
                     generationCard
                     displayCard

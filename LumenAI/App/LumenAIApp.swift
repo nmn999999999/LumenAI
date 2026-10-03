@@ -101,15 +101,22 @@ struct LumenAIApp: App {
                     // 「点了没反应」—— 而这跟合成本身没关系，完全可以在启动时就消化掉。
                     // `preload()` 只在模型已就绪且设备支持时才真的加载，
                     // 否则启动就白吃 1GB 内存，反而更容易被系统杀掉。
+                    //
+                    // ⚠️ 延迟 5 秒再预热（v0.3.73）：卡顿报告显示启动阶段
+                    // CosyVoice 的 Qwen3Tokenizer 加载（root.utility-qos.cooperative）
+                    // 与首帧/切页的 SwiftUI 布局抢 CPU —— 主线程因此被顶过 461ms。
+                    // 预热不急这一时，避开首屏渲染高峰再跑。
                     if SettingsStorage.shared.settings.ttsEngine == "cosyvoice" {
                         Task.detached(priority: .utility) {
+                            try? await Task.sleep(nanoseconds: 5_000_000_000)
                             await CosyVoiceTTSManager.shared.preload()
                         }
                     }
                     // Kokoro 预热：模型较小、启动快，但首次仍需初始化 ONNX Runtime（几秒）。
-                    // 选了 Kokoro 时也后台预热，把首次延迟从"点朗读"挪走。
+                    // 选了 Kokoro 时也后台预热，把首次延迟从"点朗读"挪走。同样避开首帧。
                     if SettingsStorage.shared.settings.ttsEngine == "kokoro" {
                         Task.detached(priority: .utility) {
+                            try? await Task.sleep(nanoseconds: 5_000_000_000)
                             await KokoroTTSManager.shared.preload()
                         }
                     }

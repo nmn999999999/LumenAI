@@ -66,6 +66,26 @@ struct MessageBubble: View {
                 if !message.images.isEmpty {
                     imageRow
                 }
+                // v0.3.73：文件附件气泡内可见（此前没有任何渲染，发出去的文件"看不见"）
+                if !message.files.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(message.files) { f in
+                            HStack(spacing: 6) {
+                                Image(systemName: "doc.fill")
+                                    .font(.caption2)
+                                Text(f.name)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(.white.opacity(0.18), in: .capsule)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                }
                 if !message.content.isEmpty {
                     Text(message.content)
                         .foregroundStyle(.white)

@@ -302,6 +302,26 @@ final class LLMService: ObservableObject {
 
     // MARK: 私有辅助
 
+    /// 把一条消息携带的文件附件渲染为可注入 prompt 的文本（云/本地共用）。
+    /// - 文本文件：内联全文（带文件名标记）
+    /// - 非文本（PDF/图片/压缩包…）：模型读不了二进制，明确给出「已收到 + 工作区路径」，
+    ///   而不是像 v0.3.72 那样静默丢弃 —— 静默丢弃会让用户以为"传了但模型装傻"。
+    static func fileAttachmentText(for m: ChatMessage) -> String {
+        guard !m.files.isEmpty else { return "" }
+        var parts: [String] = []
+        for f in m.files {
+            if f.isTextPreviewable,
+               let data = try? Data(contentsOf: FileManagerService.shared.root.appendingPathComponent(f.path)),
+               let text = String(data: data, encoding: .utf8) {
+                parts.append("【文件: \(f.name)】\n\(text)")
+            } else {
+                parts.append("【附件: \(f.name)】（\(f.mimeType)，\(ByteCountFormatter.string(fromByteCount: f.size, countStyle: .file))，"
+                    + "位于工作区 \(f.path)；无法直接读取内容，可用文件工具查看）")
+            }
+        }
+        return parts.joined(separator: "\n\n")
+    }
+
     private func tryRequireEngine() -> LLMEngine {
         if let engine { return engine }
         return EchoEngine()
@@ -317,7 +337,15 @@ final class LLMService: ObservableObject {
         for m in messages {
             switch m.role {
             case .user:
-                result.append(.init(role: .user, content: m.content))
+                // v0.3.73：本地引擎原来完全忽略文件附件 —— 用户发的文件模型一个字都看不到。
+                // 与云端同一条路径：文本内联、非文本给工作区路径说明。
+                var content = m.content
+                let fileText = Self.fileAttachmentText(for: m)
+                if !fileText.isEmpty {
+                    if !content.isEmpty { content += "\n\n" }
+                    content += fileText
+                }
+                result.append(.init(role: .user, content: content))
             case .assistant:
                 result.append(.init(role: .assistant, content: m.content))
             case .tool:
@@ -341,16 +369,12 @@ final class LLMService: ObservableObject {
             case .user:
                 // user 消息 content 为空但有图片/文件：OpenAI/Gemini/Claude 都要求 content 字段存在
                 var content = m.content
-                // 如果有文件且内容为空或仅含文本，追加文件预览
-                let textFiles = m.files.filter { $0.isTextPreviewable }
-                if !textFiles.isEmpty {
-                    let fileContents = textFiles.compactMap { f -> String? in
-                        guard let data = try? Data(contentsOf: FileManagerService.shared.root.appendingPathComponent(f.path)),
-                              let text = String(data: data, encoding: .utf8) else { return nil }
-                        return "【文件: \(f.name)】\n\(text)"
-                    }.joined(separator: "\n\n")
+                // 文件附件：文本文件内联全文；非文本文件给出工作区路径说明
+                // （v0.3.73 前非文本文件被静默丢弃，用户以为"文件上传了但模型什么都不知道"）
+                let fileText = Self.fileAttachmentText(for: m)
+                if !fileText.isEmpty {
                     if !content.isEmpty { content += "\n\n" }
-                    content += fileContents
+                    content += fileText
                 }
                 if content.isEmpty && !m.images.isEmpty { content = "（附图片）" }
                 result.append(.init(role: .user, content: content, images: m.images))

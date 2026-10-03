@@ -9,13 +9,28 @@ struct FilesView: View {
     @State private var editingFile: String?
     @State private var editingText = ""
     @State private var showImporter = false
-    @State private var showNewFolder = false
-    @State private var showNewFile = false
-    @State private var newItemName = ""
+    /// v0.3.73：新建文件夹/新建文件/重命名统一走一个居中弹窗。
+    /// 原来用系统 .alert + TextField —— 输入框被系统排在标题和按钮之间、
+    /// 不在弹窗中间，用户反馈"输入框没在弹窗中间"。改为自定义 overlay 居中卡片。
+    @State private var nameDialog: NameDialog?
+    @State private var dialogText = ""
+    @FocusState private var dialogFocused: Bool
     @State private var pendingDelete: String?
-    @State private var renamingPath: String?
-    @State private var renameText = ""
     @State private var shareURL: URL?
+
+    private enum NameDialog: Identifiable {
+        case newFolder
+        case newFile
+        case rename(old: String)
+
+        var id: String {
+            switch self {
+            case .newFolder: return "newFolder"
+            case .newFile: return "newFile"
+            case .rename(let old): return "rename:\(old)"
+            }
+        }
+    }
 
     private var currentPath: String { path.joined(separator: "/") }
 
@@ -51,51 +66,11 @@ struct FilesView: View {
                 errorMessage = error.localizedDescription
             }
         }
-        .alert(t("新建文件夹"), isPresented: $showNewFolder) {
-            TextField(t("名称"), text: $newItemName)
-            Button(t("创建")) {
-                let name = newItemName.trimmingCharacters(in: .whitespaces)
-                guard !name.isEmpty else { return }
-                do {
-                    try FileManagerService.shared.makeDirectory(join(name))
-                    newItemName = ""
-                    reload()
-                } catch { errorMessage = error.localizedDescription }
+        // v0.3.73：自定义居中输入弹窗（替代系统 .alert，见 nameDialog 注释）
+        .overlay {
+            if let dialog = nameDialog {
+                nameDialogOverlay(dialog)
             }
-            Button(t("取消"), role: .cancel) { newItemName = "" }
-        }
-        .alert(t("新建文件"), isPresented: $showNewFile) {
-            TextField(t("名称.txt"), text: $newItemName)
-            Button(t("创建")) {
-                var name = newItemName.trimmingCharacters(in: .whitespaces)
-                guard !name.isEmpty else { return }
-                if !name.contains(".") { name += ".txt" }
-                do {
-                    try FileManagerService.shared.write(join(name), content: "")
-                    newItemName = ""
-                    reload()
-                } catch { errorMessage = error.localizedDescription }
-            }
-            Button(t("取消"), role: .cancel) { newItemName = "" }
-        }
-        .alert(t("重命名"), isPresented: .init(
-            get: { renamingPath != nil },
-            set: { if !$0 { renamingPath = nil } }
-        )) {
-            TextField(t("新名称"), text: $renameText)
-            Button(t("确定")) {
-                guard let old = renamingPath else { return }
-                let name = renameText.trimmingCharacters(in: .whitespaces)
-                guard !name.isEmpty else { return }
-                let dir = (old as NSString).deletingLastPathComponent
-                let dest = dir.isEmpty ? name : dir + "/" + name
-                do {
-                    try FileManagerService.shared.move(old, to: dest)
-                    renamingPath = nil
-                    reload()
-                } catch { errorMessage = error.localizedDescription }
-            }
-            Button(t("取消"), role: .cancel) { renamingPath = nil }
         }
         .confirmationDialog(
             t("删除？"),
@@ -183,8 +158,8 @@ struct FilesView: View {
             .swipeActions(edge: .trailing) {
                 Button(t("删除"), role: .destructive) { pendingDelete = entry.path }
                 Button(t("重命名")) {
-                    renameText = (entry.path as NSString).lastPathComponent
-                    renamingPath = entry.path
+                    dialogText = (entry.path as NSString).lastPathComponent
+                    withAnimation(.snappy) { nameDialog = .rename(old: entry.path) }
                 }
                 .tint(.blue)
             }
@@ -198,8 +173,8 @@ struct FilesView: View {
             .swipeActions(edge: .trailing) {
                 Button(t("删除"), role: .destructive) { pendingDelete = entry.path }
                 Button(t("重命名")) {
-                    renameText = (entry.path as NSString).lastPathComponent
-                    renamingPath = entry.path
+                    dialogText = (entry.path as NSString).lastPathComponent
+                    withAnimation(.snappy) { nameDialog = .rename(old: entry.path) }
                 }
                 .tint(.blue)
                 Button(t("分享")) { exportFile(entry.path) }
@@ -277,12 +252,12 @@ struct FilesView: View {
         ToolbarItemGroup(placement: .topBarTrailing) {
             Menu {
                 Button(t("新建文件夹"), systemImage: "folder.badge.plus") {
-                    newItemName = ""
-                    showNewFolder = true
+                    dialogText = ""
+                    withAnimation(.snappy) { nameDialog = .newFolder }
                 }
                 Button(t("新建文件"), systemImage: "doc.badge.plus") {
-                    newItemName = ""
-                    showNewFile = true
+                    dialogText = ""
+                    withAnimation(.snappy) { nameDialog = .newFile }
                 }
                 Divider()
                 Button(t("导入文件"), systemImage: "square.and.arrow.down") {
@@ -291,6 +266,93 @@ struct FilesView: View {
             } label: {
                 Image(systemName: "plus.circle.fill")
             }
+        }
+    }
+
+    // MARK: - 居中输入弹窗（新建文件夹 / 新建文件 / 重命名）
+
+    @ViewBuilder
+    private func nameDialogOverlay(_ dialog: NameDialog) -> some View {
+        // 注意：本函数是 @ViewBuilder，不能写 `title = ...` 这类赋值语句
+        // （语句表达式 () 不是 View，会报 "type '()' cannot conform to 'View'"）。
+        // 文案用元组一次取出。
+        let texts = nameDialogTexts(dialog)
+
+        ZStack {
+            Color.black.opacity(0.35)
+                .ignoresSafeArea()
+                .onTapGesture { closeNameDialog() }
+
+            VStack(spacing: 18) {
+                Text(texts.title)
+                    .font(.headline)
+
+                // 弹窗正中的输入框（用户反馈的核心：原来系统 alert 的输入框不居中）
+                TextField(texts.placeholder, text: $dialogText)
+                    .textFieldStyle(.plain)
+                    .focused($dialogFocused)
+                    .submitLabel(.done)
+                    .onSubmit { confirmNameDialog() }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 10))
+                    .frame(maxWidth: 260)
+
+                HStack {
+                    Button(t("取消"), role: .cancel) { closeNameDialog() }
+                    Spacer()
+                    Button(texts.confirm) { confirmNameDialog() }
+                        .fontWeight(.semibold)
+                        .disabled(dialogText.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                .font(.subheadline)
+            }
+            .padding(22)
+            .frame(maxWidth: 320)
+            .background(.regularMaterial, in: .rect(cornerRadius: 20))
+            .padding(.horizontal, 40)
+        }
+        .onAppear {
+            // 弹窗出现后自动聚焦（async 让布局先完成，否则 focus 可能不生效）
+            DispatchQueue.main.async { dialogFocused = true }
+        }
+    }
+
+    private func nameDialogTexts(_ dialog: NameDialog) -> (title: String, placeholder: String, confirm: String) {
+        switch dialog {
+        case .newFolder: return (t("新建文件夹"), t("名称"), t("创建"))
+        case .newFile: return (t("新建文件"), t("名称.txt"), t("创建"))
+        case .rename: return (t("重命名"), t("新名称"), t("确定"))
+        }
+    }
+
+    private func closeNameDialog() {
+        dialogFocused = false
+        withAnimation(.snappy) { nameDialog = nil }
+        dialogText = ""
+    }
+
+    private func confirmNameDialog() {
+        guard let dialog = nameDialog else { return }
+        let name = dialogText.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        do {
+            switch dialog {
+            case .newFolder:
+                try FileManagerService.shared.makeDirectory(join(name))
+            case .newFile:
+                var final = name
+                if !final.contains(".") { final += ".txt" }
+                try FileManagerService.shared.write(join(final), content: "")
+            case .rename(let old):
+                let dir = (old as NSString).deletingLastPathComponent
+                let dest = dir.isEmpty ? name : dir + "/" + name
+                try FileManagerService.shared.move(old, to: dest)
+            }
+            closeNameDialog()
+            reload()
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 

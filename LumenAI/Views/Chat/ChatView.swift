@@ -10,6 +10,8 @@ struct DocumentPickerButton: View {
     @Binding var selectedFiles: [URL]
     let canChat: Bool
     let onPick: ([URL]) -> Void
+    /// 选择失败时的反馈（原来只 print，用户看不到任何反应）
+    var onError: ((String) -> Void)? = nil
 
     @State private var showPicker = false
 
@@ -37,8 +39,32 @@ struct DocumentPickerButton: View {
                 selectedFiles = urls
                 onPick(urls)
             case .failure(let error):
-                print("文件选择失败: \(error)")
+                onError?(error.localizedDescription)
             }
+        }
+    }
+}
+
+/// 附件 chip 里的小缩略图：body 每帧重算时不再重复解码 JPEG（解码一次存 @State）
+private struct ChipThumbnail: View {
+    let data: Data
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Color.gray.opacity(0.25)
+            }
+        }
+        .frame(width: 22, height: 22)
+        .clipShape(.rect(cornerRadius: 5))
+        .onAppear {
+            guard image == nil else { return }
+            image = UIImage(data: data)
         }
     }
 }
@@ -557,6 +583,8 @@ struct ChatView: View {
                     // 文件选择按钮（放在图片前面，更符合"先选文件再选图"的认知顺序）
                     DocumentPickerButton(selectedFiles: $selectedFiles, canChat: canChat) { urls in
                         Task { await importFiles(urls) }
+                    } onError: { msg in
+                        errorMessage = "文件选择失败：\(msg)"
                     }
 
                     PhotosPicker(
@@ -624,6 +652,15 @@ struct ChatView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
+            // 附件待发 chips（v0.3.73）：选中的文件/图片必须看得见、可单个移除。
+            // 此前输入区完全没有附件预览 —— 用户选完文件像没反应，以为上传失败。
+            if !fileAttachments.isEmpty || !attachments.isEmpty {
+                attachmentChips
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             GlassEffectContainer(spacing: 12) {
                 HStack(alignment: .bottom, spacing: 10) {
                     // iOS 26 苹果相机风格：主行只有 [+] / [输入] / [发送] 三个元素
@@ -665,6 +702,68 @@ struct ChatView: View {
         }
     }
 
+    /// 输入区上方的附件 chips（文件 + 图片），带单个移除
+    private var attachmentChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(fileAttachments) { f in
+                    HStack(spacing: 6) {
+                        Image(systemName: Self.fileIcon(for: f.mimeType))
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.purple)
+                        Text(f.name)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button {
+                            withAnimation(.snappy) { fileAttachments.removeAll { $0.id == f.id } }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: .capsule)
+                }
+                ForEach(attachments.indices, id: \.self) { i in
+                    HStack(spacing: 6) {
+                        ChipThumbnail(data: attachments[i].data)
+                        Button {
+                            // 不用 remove(at:)：Swift 6 在此上下文把它判成
+                            // Array.remove / RangeReplaceableCollection.remove 二义性。
+                            withAnimation(.snappy) {
+                                attachments = attachments.enumerated()
+                                    .filter { $0.offset != i }.map(\.element)
+                            }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .background(.regularMaterial, in: .capsule)
+                }
+            }
+        }
+    }
+
+    /// 文件类型 → SF Symbol 图标
+    private static func fileIcon(for mimeType: String) -> String {
+        if mimeType.hasPrefix("image/") { return "photo" }
+        if mimeType.hasPrefix("video/") { return "film" }
+        if mimeType.hasPrefix("audio/") { return "waveform" }
+        if mimeType == "application/pdf" { return "doc.richtext" }
+        if mimeType.contains("zip") || mimeType.contains("tar") || mimeType.contains("gzip") { return "archivebox" }
+        if mimeType.contains("sheet") || mimeType.contains("excel") || mimeType.contains("csv") { return "tablecells" }
+        return "doc"
+    }
+
     private var sendButton: some View {
         Button {
             if isGenerating {
@@ -702,13 +801,20 @@ struct ChatView: View {
         asrService.onFinal = { text in
             inputText = voiceBaseText.isEmpty ? text : voiceBaseText + " " + text
         }
+        // v0.3.73：权限被拒/引擎起不来时必须有可见反馈（原来静默失败 = "语音用不了"）
+        asrService.onError = { msg in
+            errorMessage = msg
+        }
         asrService.start()
     }
 
     private var canSend: Bool {
         let hasText = !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasImage = !attachments.isEmpty
-        return canChat && (hasText || hasImage) && !isGenerating
+        // v0.3.73：只选文件不打字也应能发送 —— 原来漏了 fileAttachments，
+        // 用户选完文件发送键还是灰的，表现为"文件无法上传"。
+        let hasFile = !fileAttachments.isEmpty
+        return canChat && (hasText || hasImage || hasFile) && !isGenerating
     }
 
     // MARK: - 工具栏（模型选择 / 助手选择 / 搜索 / 新对话）
@@ -985,7 +1091,9 @@ struct ChatView: View {
             guard canUseAgentMode else {
                 isAgentMode = false
                 errorMessage = "当前模型不支持 Agent 模式（需云端或 ≥3B 本地模型），已按普通对话发送。"
-                startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage }, files: fileAttachments)
+                // ⚠️ 必须传局部 files：fileAttachments 在上面已被清空（line ~966），
+                // 传它等于传 []，附件全部静默丢失（v0.3.72 的"文件无法上传"根因）。
+                startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage }, files: files)
                 return
             }
             // Agent 模式：人设提示词（助手/变量/人格）显式放入历史首条，
@@ -1027,7 +1135,8 @@ struct ChatView: View {
             return
         }
 
-        startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage }, files: fileAttachments)
+        // 同上：局部 files（清空后的 fileAttachments 是 []，附件会被静默丢弃）
+        startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage }, files: files)
     }
 
     // MARK: - 断点续跑
@@ -1664,6 +1773,7 @@ struct ChatView: View {
     private func importFiles(_ urls: [URL]) async {
         let fm = FileManagerService.shared
         var loaded: [ChatMessage.FileData] = []
+        var failures: [String] = []
         for url in urls {
             do {
                 let path = try fm.importExternal(url)
@@ -1686,11 +1796,17 @@ struct ChatView: View {
                     isTextPreviewable: isText
                 ))
             } catch {
-                // 导入失败记录错误但不阻断其它文件
-                print("导入文件失败 \(url.lastPathComponent): \(error)")
+                // 导入失败记录但不阻断其它文件；最后统一弹给用户看
+                // （原来只 print，用户看不到任何失败反馈 —— "文件无法上传"的观感之一）
+                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
-        fileAttachments = loaded
+        // 追加而不是覆盖：分两次选文件时第一次的不丢
+        let known = Set(fileAttachments.map(\.path))
+        fileAttachments.append(contentsOf: loaded.filter { !known.contains($0.path) })
+        if !failures.isEmpty {
+            errorMessage = "文件导入失败：\n" + failures.joined(separator: "\n")
+        }
         selectedFiles = []
     }
 
@@ -1730,6 +1846,8 @@ struct ChatView: View {
         inputText = ""
         attachments = []
         selectedItems = []
+        fileAttachments = []
+        selectedFiles = []
         inputFocused = false
 
         var conv = chatStore.currentOrNew

@@ -26,6 +26,9 @@ final class ASRService: ObservableObject {
     var onFinal: ((String) -> Void)?
     /// 识别到中间结果（用于实时上屏）
     var onPartial: ((String) -> Void)?
+    /// 错误反馈（权限被拒 / 引擎起不来…）。v0.3.73 前这些错误全被静默吞掉，
+    /// 用户点麦克风没反应、也不知道为什么 —— 表现为"语音用不了"。
+    var onError: ((String) -> Void)?
 
     private var recognizer: SFSpeechRecognizer?
     private var audioEngine: AVAudioEngine?
@@ -67,11 +70,28 @@ final class ASRService: ObservableObject {
             ASRService.requestPermissionAndStart()
             return
         }
+        // ⚠️ Speech 授权 ≠ 麦克风授权。v0.3.72 及以前从不请求 mic 权限：
+        // 被拒后 AVAudioEngine.start() 抛错、被下面的 catch 静默吞掉，
+        // 用户点麦克风永远"没反应"。先显式请求 mic，再起引擎。
+        Task { @MainActor in
+            let granted = await AVAudioApplication.requestRecordPermission()
+            guard granted else {
+                self.onError?("麦克风权限被拒绝。请到「设置 → 隐私与安全性 → 麦克风」为 LumenAI 开启后重试。")
+                return
+            }
+            self.startEngine()
+        }
+    }
 
+    /// 已拿到 Speech + 麦克风双权限后的引擎启动流程
+    private func startEngine() {
         let lang = SettingsStorage.shared.settings.language == "en" ? "en-US" : "zh-CN"
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: lang)),
               recognizer.isAvailable
-        else { return }
+        else {
+            onError?("当前语言的语音识别不可用（请检查系统语言与网络）。")
+            return
+        }
         self.recognizer = recognizer
 
         let audioSession = AVAudioSession.sharedInstance()
@@ -109,7 +129,13 @@ final class ASRService: ObservableObject {
                     }
                 }
                 if hasError {
+                    // 识别任务出错（超时/被打断…）：已有上屏内容就安静收尾；
+                    // 一个字都没识别出来则明确提示，否则用户又会觉得"点了没反应"。
+                    let nothingHeard = self.partialText.isEmpty
                     self.stop()
+                    if nothingHeard {
+                        self.onError?("没有听到语音，请靠近麦克风重试。")
+                    }
                 }
             }
         }
@@ -130,7 +156,9 @@ final class ASRService: ObservableObject {
             isListening = true
             partialText = ""
         } catch {
+            // v0.3.72 前：静默 stop()，用户点麦克风永远没反应
             stop()
+            onError?("无法启动麦克风录音：\(error.localizedDescription)")
         }
     }
 
@@ -161,6 +189,9 @@ final class ASRService: ObservableObject {
                 if ok {
                     // start() 内部会 guard isListening / isAuthorized
                     svc.start()
+                } else if captured != .notDetermined {
+                    // 被拒过：系统不会再弹窗，必须明确告诉用户去哪开
+                    svc.onError?("语音识别权限被拒绝。请到「设置 → 隐私与安全性 → 语音识别」为 LumenAI 开启。")
                 }
             }
         }
