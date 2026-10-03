@@ -560,6 +560,38 @@ enum BuiltInTools {
             ],
             requiresApproval: true,  // 沙盒 shell 会写入/删除文件,需要用户授权
         ),
+        // 用户文件工作区（Documents/Files）。
+        //
+        // 为什么要有它：用户明确要「让 AI 自己完成文件管理编辑」。此前模型只能
+        // 靠 `note`（单文件键值笔记）和 `shell`（受限命令解释器）绕，两者都不是
+        // "文件"语义：note 只能存单块文本、shell 的工作区是另一个目录（shellbox）。
+        // 结果是用户问"我那个文件呢"，模型既列不出来也改不了。
+        //
+        // 与 `shell` 的边界写进**首句**（本地模型工具描述会被截到 150 字，见 shell 的定义处）：
+        // 结构化文件读写走这里，跑命令/管道走 shell。两者工作区不同，混用会让模型
+        // 在一个目录里写完再去另一个目录找。
+        AgentToolDefinition(
+            id: "file_op",
+            name: "file_op",
+            description: "读写用户文件（文件工作区）。读改文件用这个；要跑命令或管道请用 shell。op=list 列出目录、read 读取文本（支持 offset/limit 行号）、write 新建或覆盖、append 追加、mkdir 建目录、move 移动或重命名、delete 删除、stat 查看信息。改一个已有文件的标准做法：先 read 看清原文，再用 write 写回完整内容。path 相对于工作区根目录，如 notes/todo.md",
+            parameters: [
+                "op": .init(type: "string", description: "操作（必填）", enumValues: ["list", "read", "write", "append", "mkdir", "move", "delete", "stat"]),
+                "path": .init(type: "string", description: "文件或目录路径（必填），相对于工作区根目录，如 notes/todo.md；list 可传 \".\" 表示根目录", enumValues: nil),
+                "content": .init(type: "string", description: "要写入的完整文本（write / append 必填）", enumValues: nil),
+                "to": .init(type: "string", description: "move 的目标路径（move 必填）", enumValues: nil),
+                "offset": .init(type: "number", description: "read 的起始行号，从 1 开始（可选，默认 1）", enumValues: nil),
+                "limit": .init(type: "number", description: "read 最多返回多少行（可选，默认 200）", enumValues: nil)
+            ],
+            // false。取舍理由与 note 基本相同，但更硬：作用范围被 `resolve()` 死锁在
+            // Documents/Files 之内（越界路径直接抛错，符号链接与 `..` 一并拦下），
+            // 碰不到模型权重、聊天存档、笔记这些 App 自己的资产；而这个工具是
+            // "让 AI 自己完成文件管理"的唯一入口，属于高频路径 —— 每个 op 都弹窗
+            // 会把审批训练成无脑确认（见 note 与 shell 的取舍对比）。
+            // delete 是唯一有破坏性的 op：代价是它也不弹窗，但删掉的东西在
+            // 「文件」界面里对用户完全可见，且不进废纸篓以外的任何系统位置。
+            // 如果将来审批能细到 (工具, op)，delete/move 应该单独设为 true。
+            requiresApproval: false,
+        ),
     ]
 
     // MARK: - 执行入口
@@ -609,6 +641,7 @@ enum BuiltInTools {
         case "note":            return await executeNote(arguments: arguments)
         case "todo":            return await executeTodo(arguments: arguments)
         case "clipboard":       return executeClipboard(arguments: arguments)
+        case "file_op":         return executeFileOp(arguments: arguments)
         case "web_search":      return await executeWebSearch(arguments: arguments)
         case "regex_extract":   return executeRegexExtract(arguments: arguments)
         case "text_summary":    return executeTextSummary(arguments: arguments)
@@ -633,6 +666,103 @@ enum BuiltInTools {
         case "jwt_decode":      return executeJWTDecode(arguments: arguments)
         default:
             return unknownToolMarker + toolName
+        }
+    }
+
+    /// 用户文件工作区。真实逻辑全在 `FileManagerService`（同步、带锁、沙盒化路径），
+    /// 这里只负责把模型的参数翻成人话再翻回来。
+    ///
+    /// 返回值一律是**给模型看的文本**，不是给用户看的：包含足够复述给用户的信息
+    /// （路径、行号、字节数），但不含实现细节（不吐绝对路径 —— 那是沙盒内部信息，
+    /// 对模型没有用处，只是上下文噪音）。
+    private static func executeFileOp(arguments: [String: Any]) -> String {
+        let service = FileManagerService.shared
+
+        guard let op = (arguments["op"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !op.isEmpty else {
+            return "错误: 缺少 op 参数（可用: list/read/write/append/mkdir/move/delete/stat）"
+        }
+        let path = (arguments["path"] as? String) ?? ""
+
+        /// 把 service 抛出的错误统一成 "错误: ..." 前缀。
+        /// 前缀不能省：上层靠它区分"工具真的失败了"和"工具返回了一段含错误字样的正常内容"。
+        func failure(_ error: Error) -> String {
+            if let fileError = error as? FileManagerService.FileError {
+                return "错误: \(fileError.errorDescription ?? "文件操作失败")"
+            }
+            return "错误: \(error.localizedDescription)"
+        }
+
+        do {
+            switch op {
+            case "list":
+                let entries = try service.list(path)
+                guard !entries.isEmpty else {
+                    return "工作区是空的（路径 \(path.isEmpty ? "." : path)）。可以用 op=write 新建文件。"
+                }
+                let formatter = DateFormatter()
+                formatter.dateFormat = "yyyy-MM-dd HH:mm"
+                let lines = entries.map { entry -> String in
+                    if entry.isDirectory {
+                        return "📁 \(entry.path)/"
+                    }
+                    let size = ByteCountFormatter.string(
+                        fromByteCount: Int64(entry.bytes), countStyle: .file)
+                    let stamp = entry.modified.map { formatter.string(from: $0) } ?? "-"
+                    return "📄 \(entry.path)  (\(size), \(stamp))"
+                }
+                return "共 \(entries.count) 项：\n" + lines.joined(separator: "\n")
+
+            case "read":
+                let offset = (arguments["offset"] as? Int)
+                    ?? Int((arguments["offset"] as? Double) ?? 1)
+                let limit = (arguments["limit"] as? Int)
+                    ?? Int((arguments["limit"] as? Double) ?? Double(FileManagerService.defaultReadLimit))
+                let result = try service.read(path, offset: offset, limit: limit)
+                guard !result.text.isEmpty else {
+                    return "文件 \(path) 为空，或起始行 \(result.startLine) 超出了总行数 \(result.totalLines)。"
+                }
+                let lastLine = result.startLine + result.text.components(separatedBy: "\n").count - 1
+                let more = lastLine < result.totalLines
+                    ? "\n\n（以上是第 \(result.startLine)–\(lastLine) 行，共 \(result.totalLines) 行；"
+                      + "需要后面的内容请把 offset 设为 \(lastLine + 1)）"
+                    : "\n\n（以上是全文，共 \(result.totalLines) 行）"
+                return result.text + more
+
+            case "write", "append":
+                guard let content = arguments["content"] as? String else {
+                    return "错误: op=\(op) 需要 content 参数"
+                }
+                if op == "write" {
+                    let bytes = try service.write(path, content: content)
+                    return "已写入 \(path)（\(bytes) 字节，整体覆盖）"
+                }
+                let bytes = try service.append(path, content: content)
+                return "已追加到 \(path)（追加后共 \(bytes) 字节）"
+
+            case "mkdir":
+                try service.makeDirectory(path)
+                return "已创建目录 \(path)"
+
+            case "move":
+                guard let to = (arguments["to"] as? String), !to.isEmpty else {
+                    return "错误: op=move 需要 to 参数（目标路径）"
+                }
+                try service.move(path, to: to)
+                return "已把 \(path) 移动/重命名为 \(to)"
+
+            case "delete":
+                try service.delete(path)
+                return "已删除 \(path)"
+
+            case "stat":
+                return try service.stat(path)
+
+            default:
+                return "错误: 不支持的 op「\(op)」（可用: list/read/write/append/mkdir/move/delete/stat）"
+            }
+        } catch {
+            return failure(error)
         }
     }
 

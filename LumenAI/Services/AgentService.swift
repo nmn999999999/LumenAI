@@ -104,6 +104,22 @@ final class AgentService: ObservableObject {
                      : "- Long-term memory: **NOT available** — the `note` tool is not enabled."
                        + " Do not promise to remember anything; say it must be enabled in Settings first.")
 
+        // 用户文件工作区。为什么值得单列一条：它是**唯一**能让模型"动手改东西"的地方，
+        // 而模型对它的默认假设是错的 —— 它会以为自己在通用文件系统上（写 `/tmp/x.txt`、
+        // 读 `~/Documents/...`），于是列出不存在的路径、或者干脆声称改好了。
+        // 说清楚"根目录在哪、只能在这里面、改文件要先 read 再 write"，它才会真的去做。
+        let hasFileOp = tools.contains { $0.name == "file_op" }
+        if hasFileOp {
+            lines.append("- User files: readable and writable through the `file_op` tool"
+                         + " (list/read/write/append/mkdir/move/delete/stat). Every path is"
+                         + " relative to the file workspace root; paths are sandboxed, so"
+                         + " absolute paths and `..` are rejected. To edit an existing file,"
+                         + " `read` it first and then `write` the complete new content back —"
+                         + " `write` replaces the whole file. The workspace is separate from the"
+                         + " `shell` tool's own directory, so do not look for a file you created"
+                         + " with `file_op` by running `ls` in `shell`.")
+        }
+
         // 关掉的工具（只说关掉的）
         let enabledNames = Set(tools.map(\.name))
         let allBuiltin = BuiltInTools.allTools.map(\.name)

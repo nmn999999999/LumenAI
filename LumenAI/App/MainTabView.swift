@@ -15,6 +15,11 @@ struct MainTabView: View {
                     Label(t("模型"), systemImage: "cpu.fill")
                 }
 
+            FilesView()
+                .tabItem {
+                    Label(t("文件"), systemImage: "folder.fill")
+                }
+
             ProvidersView()
                 .tabItem {
                     Label(t("服务"), systemImage: "server.rack")
