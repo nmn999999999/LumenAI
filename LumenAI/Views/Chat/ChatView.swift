@@ -1,8 +1,47 @@
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 #if canImport(UIKit)
 import UIKit
 #endif
+
+/// 文件选择按钮（DocumentPicker 封装）
+struct DocumentPickerButton: View {
+    @Binding var selectedFiles: [URL]
+    let canChat: Bool
+    let onPick: ([URL]) -> Void
+
+    @State private var showPicker = false
+
+    var body: some View {
+        Button {
+            showPicker = true
+        } label: {
+            Image(systemName: "doc.badge.plus")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.purple)
+                .frame(width: 44, height: 44)
+                .background(.purple.opacity(0.15), in: Circle())
+                .accessibilityLabel("添加文件")
+        }
+        .buttonStyle(.plain)
+        .disabled(!canChat)
+        .opacity(canChat ? 1 : 0.35)
+        .fileImporter(
+            isPresented: $showPicker,
+            allowedContentTypes: [.data, .pdf, .text, .spreadsheet, .presentation, .archive, .audio, .video, .image],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                selectedFiles = urls
+                onPick(urls)
+            case .failure(let error):
+                print("文件选择失败: \(error)")
+            }
+        }
+    }
+}
 
 struct ChatView: View {
     @EnvironmentObject private var chatStore: ChatStore
@@ -33,6 +72,8 @@ struct ChatView: View {
     @State private var isAgentMode = false
     @State private var selectedItems: [PhotosPickerItem] = []
     @State private var attachments: [ChatMessage.ImageData] = []
+    @State private var selectedFiles: [URL] = []
+    @State private var fileAttachments: [ChatMessage.FileData] = []
     @State private var showConversationList = false
     /// 任务清单整页（工具栏入口）。见 toolbarContent 里那个 checklist 按钮的注释。
     @State private var showTaskList = false
@@ -485,6 +526,11 @@ struct ChatView: View {
                 // 材质与玻璃不同层、天然独立不粘连；按钮 44pt 与主输入行对齐，间距 18 不再紧贴。
                 // 每个图标固定纯色（蓝/橙/绿/红）；激活时实心色圈 + 白色图标 → 切换状态颜色反馈清晰。
                 HStack(spacing: 18) {
+                    // 文件选择按钮（放在图片前面，更符合"先选文件再选图"的认知顺序）
+                    DocumentPickerButton(selectedFiles: $selectedFiles, canChat: canChat) { urls in
+                        Task { await importFiles(urls) }
+                    }
+
                     PhotosPicker(
                         selection: $selectedItems,
                         maxSelectionCount: 3,
@@ -885,9 +931,12 @@ struct ChatView: View {
 
         let settings = SettingsStorage.shared.settings
         let images = attachments
+        let files = fileAttachments
         inputText = ""
         attachments = []
         selectedItems = []
+        fileAttachments = []
+        selectedFiles = []
         inputFocused = false
 
         // 提示词变量解析（Prompt Variables）
@@ -896,7 +945,7 @@ struct ChatView: View {
         let text = PromptVariableResolver.resolve(rawText, model: modelName, providerName: providerName)
 
         var conv = chatStore.currentOrNew
-        conv.messages.append(ChatMessage(role: .user, content: text, images: images))
+        conv.messages.append(ChatMessage(role: .user, content: text, images: images, files: files))
         conv.updateTitle()
         conv.modelName = providerStore.hasCloudSelection ? providerStore.selectionText : llmService.loadedModelName
         chatStore.upsert(conv)
@@ -908,7 +957,7 @@ struct ChatView: View {
             guard canUseAgentMode else {
                 isAgentMode = false
                 errorMessage = "当前模型不支持 Agent 模式（需云端或 ≥3B 本地模型），已按普通对话发送。"
-                startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage })
+                startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage }, files: fileAttachments)
                 return
             }
             // Agent 模式：人设提示词（助手/变量/人格）显式放入历史首条，
@@ -950,7 +999,7 @@ struct ChatView: View {
             return
         }
 
-        startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage })
+        startGeneration(history: Array(conv.messages), settings: effectiveSettings, images: images.compactMap { $0.cgImage }, files: fileAttachments)
     }
 
     // MARK: - 断点续跑
@@ -1203,7 +1252,7 @@ struct ChatView: View {
     }
 
     /// 核心生成流程：创建 assistant 气泡并流式渲染（云 / 本地自动路由）
-    private func startGeneration(history: [ChatMessage], settings: ModelSettings, images: [CGImage]) {
+    private func startGeneration(history: [ChatMessage], settings: ModelSettings, images: [CGImage], files: [ChatMessage.FileData] = []) {
         isGenerating = true
         // 见上面 agent 那处的说明：切后台要能多活一会儿，到期则主动收尾。
         BackgroundTaskKeeper.shared.begin(.generation) { [self] in
@@ -1235,7 +1284,7 @@ struct ChatView: View {
 
                 if let provider = resolved.provider, !resolved.model.isEmpty {
                     // 云端
-                    var cloudMessages = llmService.makeCloudMessages(history, settings: settings)
+                    var cloudMessages = llmService.makeCloudMessages(history, settings: settings, files: files)
                     if let ctx = searchCtx {
                         cloudMessages.insert(CloudMessage(role: .system, content: ctx), at: 0)
                     }
@@ -1252,7 +1301,7 @@ struct ChatView: View {
                     if let ctx = searchCtx {
                         localHistory.insert(ChatMessage(role: .system, content: ctx), at: 0)
                     }
-                    stream = llmService.streamChat(history: localHistory, settings: settings, images: images)
+                    stream = llmService.streamChat(history: localHistory, settings: settings, images: images, files: files)
                 }
 
                 for try await token in stream {
@@ -1422,7 +1471,7 @@ struct ChatView: View {
         let providerName = providerStore.currentProvider?.name ?? ""
         let effective = effectiveSettings(from: settings, modelName: modelName, providerName: providerName)
 
-        startGeneration(history: Array(conv.messages), settings: effective, images: userMsg.images.compactMap { $0.cgImage })
+        startGeneration(history: Array(conv.messages), settings: effective, images: userMsg.images.compactMap { $0.cgImage }, files: [])
     }
 
     private func editMessage(_ message: ChatMessage) {
@@ -1448,7 +1497,7 @@ struct ChatView: View {
         let providerName = providerStore.currentProvider?.name ?? ""
         let effective = effectiveSettings(from: settings, modelName: modelName, providerName: providerName)
 
-        startGeneration(history: Array(conv.messages), settings: effective, images: msg.images.compactMap { $0.cgImage })
+        startGeneration(history: Array(conv.messages), settings: effective, images: msg.images.compactMap { $0.cgImage }, files: [])
     }
 
     private func deleteMessage(_ message: ChatMessage) {
@@ -1581,6 +1630,40 @@ struct ChatView: View {
             }
         }
         attachments = loaded
+    }
+
+    /// 导入外部文件到工作区，并生成 FileData 附件列表
+    private func importFiles(_ urls: [URL]) async {
+        let fm = FileManagerService.shared
+        var loaded: [ChatMessage.FileData] = []
+        for url in urls {
+            do {
+                let path = try fm.importExternal(url)
+                // 拿到相对路径后，从工作区再 stat 一下拿元数据
+                let full = fm.root.appendingPathComponent(path)
+                let values = try? full.resourceValues(
+                    forKeys: [.contentTypeKey, .fileSizeKey, .creationDateKey])
+                let mime = values?.contentType?.preferredMIMEType ?? "application/octet-stream"
+                let size = Int64(values?.fileSize ?? 0)
+                let created = values?.creationDate ?? Date()
+                let isText = mime.hasPrefix("text/") || mime == "application/json" ||
+                             mime == "application/xml" || path.hasSuffix(".md") || path.hasSuffix(".txt") ||
+                             path.hasSuffix(".swift") || path.hasSuffix(".py") || path.hasSuffix(".json")
+                loaded.append(ChatMessage.FileData(
+                    name: full.lastPathComponent,
+                    path: path,
+                    mimeType: mime,
+                    size: size,
+                    createdAt: created,
+                    isTextPreviewable: isText
+                ))
+            } catch {
+                // 导入失败记录错误但不阻断其它文件
+                print("导入文件失败 \(url.lastPathComponent): \(error)")
+            }
+        }
+        fileAttachments = loaded
+        selectedFiles = []
     }
 
     /// 压缩图片，避免超出模型/内存限制

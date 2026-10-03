@@ -24,6 +24,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     var isStreaming: Bool
     var isAgentRound: Bool
     var images: [ImageData]
+    var files: [FileData]
     var toolCalls: [ToolCall]
     /// 生成速度提示（如 "⚡ 14.3 tok/s"）；nil 不显示。可选字段，旧存档解码兼容。
     var speedText: String?
@@ -36,6 +37,20 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
             guard let uiImage = UIImage(data: data) else { return nil }
             return uiImage.cgImage
         }
+    }
+
+    /// 文件附件（工作区内的文件路径 + 元数据，不存二进制）。
+    /// 为什么不存 Data：文件可能很大（几 MB 甚至几百 MB），把二进制塞进 conversations.json
+    /// 会让它瞬间膨胀到几百 MB、存储/解码全卡死。这里只存相对路径 + 元数据，
+    /// 真正需要内容时通过 `FileManagerService` 再读。
+    struct FileData: Codable, Sendable, Equatable, Identifiable {
+        let id: UUID = UUID()
+        let name: String
+        let path: String         // 相对于 Documents/Files 的相对路径
+        let mimeType: String
+        let size: Int64
+        let createdAt: Date
+        var isTextPreviewable: Bool = false  // 解码时根据 mimeType 推断
     }
 
     /// opencode 风格的 ToolPart 状态机：
@@ -190,6 +205,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
         isStreaming: Bool = false,
         isAgentRound: Bool = false,
         images: [ImageData] = [],
+        files: [FileData] = [],
         toolCalls: [ToolCall] = [],
         speedText: String? = nil
     ) {
@@ -200,6 +216,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
         self.isStreaming = isStreaming
         self.isAgentRound = isAgentRound
         self.images = images
+        self.files = files
         self.toolCalls = toolCalls
         self.speedText = speedText
     }
@@ -208,7 +225,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     // 否则编译器的自动实现对每个字段都是必填 → 旧版本（无 speedText）的
     // conversations.json 解码失败 → try? 静默吞错 → 用户对话历史整个丢失。
     private enum CodingKeys: String, CodingKey {
-        case id, role, content, timestamp, isStreaming, isAgentRound, images, toolCalls, speedText
+        case id, role, content, timestamp, isStreaming, isAgentRound, images, files, toolCalls, speedText
     }
 
     init(from decoder: Decoder) throws {
@@ -220,6 +237,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
         self.isStreaming = try c.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
         self.isAgentRound = try c.decodeIfPresent(Bool.self, forKey: .isAgentRound) ?? false
         self.images = try c.decodeIfPresent([ImageData].self, forKey: .images) ?? []
+        self.files = try c.decodeIfPresent([FileData].self, forKey: .files) ?? []
         self.toolCalls = try c.decodeIfPresent([ToolCall].self, forKey: .toolCalls) ?? []
         self.speedText = try c.decodeIfPresent(String.self, forKey: .speedText)
     }
@@ -233,6 +251,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
         try c.encode(isStreaming, forKey: .isStreaming)
         try c.encode(isAgentRound, forKey: .isAgentRound)
         try c.encode(images, forKey: .images)
+        try c.encode(files, forKey: .files)
         try c.encode(toolCalls, forKey: .toolCalls)
         try c.encodeIfPresent(speedText, forKey: .speedText)
     }

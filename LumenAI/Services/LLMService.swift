@@ -159,13 +159,14 @@ final class LLMService: ObservableObject {
         history: [ChatMessage],
         settings: ModelSettings,
         images: [CGImage] = [],
+        files: [ChatMessage.FileData] = [],
         tools: [AgentToolDefinition] = []
     ) -> AsyncThrowingStream<String, Error> {
         // 云端 Provider 模式（多 Provider）
         if hasCloudSelection, let provider = currentCloudProvider {
             return streamCloud(
                 provider: provider, model: currentCloudModel,
-                history: history, settings: settings, images: images,
+                history: history, settings: settings, images: images, files: files,
                 tools: tools
             )
         }
@@ -188,9 +189,10 @@ final class LLMService: ObservableObject {
         history: [ChatMessage],
         settings: ModelSettings,
         images: [CGImage] = [],
+        files: [ChatMessage.FileData] = [],
         tools: [AgentToolDefinition] = []
     ) -> AsyncThrowingStream<String, Error> {
-        let cloudMessages = makeCloudMessages(history, settings: settings)
+        let cloudMessages = makeCloudMessages(history, settings: settings, files: files)
         // 仅在 Agent 模式 + 用户真传了 tool 定义时启用 native flow(避免普通对话误注入)
         let effectiveTools: [AgentToolDefinition] = tools.isEmpty ? [] : tools
         return CloudChatClient.stream(
@@ -328,7 +330,7 @@ final class LLMService: ObservableObject {
     }
 
     /// 渲染为云端协议消息（含图片，供 OpenAI / Gemini / Claude）
-    func makeCloudMessages(_ messages: [ChatMessage], settings: ModelSettings) -> [CloudMessage] {
+    func makeCloudMessages(_ messages: [ChatMessage], settings: ModelSettings, files: [ChatMessage.FileData] = []) -> [CloudMessage] {
         var result: [CloudMessage] = []
         let hasSystem = messages.contains { $0.role == .system }
         if !hasSystem, !settings.systemPrompt.isEmpty {
@@ -337,8 +339,20 @@ final class LLMService: ObservableObject {
         for m in messages {
             switch m.role {
             case .user:
-                // user 消息 content 为空但有图片：OpenAI/Gemini/Claude 都要求 content 字段存在
-                let content = m.content.isEmpty && !m.images.isEmpty ? "（附图片）" : m.content
+                // user 消息 content 为空但有图片/文件：OpenAI/Gemini/Claude 都要求 content 字段存在
+                var content = m.content
+                // 如果有文件且内容为空或仅含文本，追加文件预览
+                let textFiles = m.files.filter { $0.isTextPreviewable }
+                if !textFiles.isEmpty {
+                    let fileContents = textFiles.compactMap { f -> String? in
+                        guard let data = try? Data(contentsOf: FileManagerService.shared.root.appendingPathComponent(f.path)),
+                              let text = String(data: data, encoding: .utf8) else { return nil }
+                        return "【文件: \(f.name)】\n\(text)"
+                    }.joined(separator: "\n\n")
+                    if !content.isEmpty { content += "\n\n" }
+                    content += fileContents
+                }
+                if content.isEmpty && !m.images.isEmpty { content = "（附图片）" }
                 result.append(.init(role: .user, content: content, images: m.images))
             case .assistant:
                 // assistant content 不能为空（OpenAI 拒空 assistant message），
