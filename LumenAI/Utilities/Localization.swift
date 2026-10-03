@@ -47,6 +47,7 @@ enum L10n {
         "多个 Key 用逗号分隔，自动轮换": ["zh": "多个 Key 用逗号分隔，自动轮换", "en": "Separate keys with commas; rotated automatically"],
         "保存": ["zh": "保存", "en": "Save"],
         "取消": ["zh": "取消", "en": "Cancel"],
+        "清除": ["zh": "清除", "en": "Clear"],
         "启用": ["zh": "启用", "en": "Enabled"],
         "提供商名称": ["zh": "提供商名称", "en": "Provider name"],
 

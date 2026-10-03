@@ -131,6 +131,8 @@ struct ChatView: View {
     /// 而不是每个 token 一次）。
     @State private var tokenBuffer = AgentTokenBuffer()
     @FocusState private var inputFocused: Bool
+    /// in-content 搜索行的焦点（v0.3.75 起替代系统 .searchable，见 searchBarRow 注释）。
+    @FocusState private var searchFieldFocused: Bool
 
     /// 工具授权弹窗：当 AgentService 解析到 requiresApproval=true 的工具时挂起等用户决策。
     /// 阻断式 alert：等用户按「允许 / 本会话内总是允许 / 拒绝」前，AgentService.run() 在
@@ -172,18 +174,21 @@ struct ChatView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // M3 修复:搜索迁移到系统 .searchable(见 messageList 上的修饰符),
-                // 这里只保留搜索结果 overlay(输入框由系统工具栏渲染)。
-                if showSearch && !searchResults.isEmpty {
-                    searchResultsList
+                // v0.3.75:搜索改为 in-content 输入行（searchBarRow），不再用系统 .searchable。
+                // 卡顿报告（UIKit-runloop，0.3.74，timeout 375ms，切 tab 时）显示：
+                // 导航栏每次布局都要走 UISearchController / _UISearchBarVisualProviderIOS /
+                // hidesSearchBarWhenScrolling 的高度计算（37 采样中约三分之一带搜索栏栈帧），
+                // 再与 SwiftUI HostingScrollView 的 contentInset→导航栏滚动观察者互相踢，
+                // 形成 UIKit↔SwiftUI 反馈环。把搜索栏从导航项上摘掉即打断该环。
+                // （v0.3.20-22 的 toggle 教训针对"自定义按钮 ↔ 系统 isPresented 状态机"，
+                //  自绘输入行没有这台状态机，showSearch 完全自主，按钮可安全 toggle。）
+                if showSearch {
+                    searchBarRow
+                    if !searchResults.isEmpty {
+                        searchResultsList
+                    }
                 }
                 messageList
-                    // 搜索:用系统 .searchable。⚠️ 经验(v0.3.20-22):
-                    // - 自定义按钮 toggle + isPresented 绑定 → "点开收不起"(toggle 与系统状态打架)
-                    // - .searchToolbarBehavior(.minimize) 的按钮状态机 → "点 x 收起又自动重开"
-                    // 稳定组合:自定义按钮只"单向打开"(showSearch = true),关闭完全交给
-                    // 系统"取消"按钮(系统把 isPresented 置 false);不用 minimize。
-                    .searchable(text: $searchText, isPresented: $showSearch, placement: .toolbar)
                     .onChange(of: searchText) { _, newValue in
                         // 防抖：停止输入 200ms 后再执行全量搜索，避免每个按键都扫描所有会话
                         searchTask?.cancel()
@@ -193,11 +198,12 @@ struct ChatView: View {
                             searchResults = chatStore.search(query: newValue)
                         }
                     }
-                    // 搜索收起时清空状态(系统通过 isPresented 置 false)
+                    // 搜索收起时清空状态
                     .onChange(of: showSearch) { _, isPresented in
                         if !isPresented {
                             searchText = ""
                             searchResults = []
+                            searchFieldFocused = false
                         }
                     }
                 if canChat {
@@ -453,7 +459,51 @@ struct ChatView: View {
 
     // MARK: - 搜索栏
 
-    /// M3:系统 .searchable 渲染输入框;这里只在展开搜索且有结果时显示结果列表 overlay
+    /// in-content 搜索输入行（v0.3.75 起替代系统 .searchable，背景见 body 里的注释）。
+    /// 展开时渲染在消息列表上方；焦点与清除/取消全部自管，不依赖任何系统状态机。
+    private var searchBarRow: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                TextField(t("搜索消息..."), text: $searchText)
+                    .font(.subheadline)
+                    .textInputAutocapitalization(.never)
+                    .disableAutocorrection(true)
+                    .focused($searchFieldFocused)
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(t("清除"))
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+
+            Button(t("取消")) {
+                showSearch = false
+            }
+            .font(.subheadline)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(.regularMaterial)
+        .onAppear {
+            // 打开搜索时把焦点从输入栏挪到搜索框（键盘平滑交接）
+            inputFocused = false
+            searchFieldFocused = true
+        }
+    }
+
+    /// 展开搜索且有结果时，显示结果列表（贴在搜索输入行下方）
     private var searchResultsList: some View {
         ScrollView {
             LazyVStack(spacing: 8) {
@@ -943,14 +993,13 @@ struct ChatView: View {
 
             divider
 
-            // 搜索入口:只"打开"(showSearch = true),关闭由系统"取消"完成。
-            // 不要 toggle —— toggle 与系统 isPresented 双向绑定打架(v0.3.20 教训)。
+            // 搜索入口（v0.3.75 起搜索是 in-content 行，showSearch 完全自管，可安全 toggle）
             Button {
-                showSearch = true
+                showSearch.toggle()
             } label: {
                 Image(systemName: "magnifyingglass")
                     .font(.caption)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(showSearch ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
                     .frame(width: 40, height: 30)
                     .contentShape(Rectangle())
             }
