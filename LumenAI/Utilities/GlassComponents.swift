@@ -130,4 +130,32 @@ extension View {
     func toast(_ message: Binding<String?>, duration: Double = 2.2) -> some View {
         modifier(ToastModifier(message: message, duration: duration))
     }
+
+    /// 滚动到顶/底时显示液态玻璃边缘高光（iOS 26 `scrollEdgeEffectStyle`）。
+    /// 所有可滚动界面统一走这里，保证每个页面滚到边缘都有同一套玻璃反馈。
+    func glassScrollEdges(_ edges: Edge.Set = [.top, .bottom]) -> some View {
+        scrollEdgeEffectStyle(.soft, for: edges)
+    }
+}
+
+// MARK: - 全局通透背景
+
+/// 垫在 `MainTabView` 后面的浅渐变背景。
+///
+/// 为什么需要：Material / 玻璃的「通透」是**透出下层**，而 SwiftUI 默认窗口是
+/// 一层不透明的 systemBackground —— 底下没有东西可透，玻璃就只剩灰。
+/// 垫一层与页面同底色的渐变后，毛玻璃卡片、列表行间隙、滚动边缘高光
+/// 才能显出层次；同时 NavigationStack 推出的子页面（详情/编辑页）是透明的，
+/// 它们看到的就是这一层 —— 所以底色必须和 `AppTheme.pageBackground` 同源。
+struct AppBackdrop: View {
+    let colors: [Color]
+
+    var body: some View {
+        LinearGradient(
+            colors: colors,
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+        .background(colors.first ?? .clear)
+    }
 }

@@ -16,6 +16,8 @@ struct PluginsView: View {
             installedSection
             remoteSection
         }
+        .scrollContentBackground(.hidden)
+        .glassScrollEdges()
         .navigationTitle("模块 / JS 插件")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

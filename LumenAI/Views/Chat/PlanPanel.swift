@@ -349,6 +349,8 @@ struct TaskListSheet: View {
                 Text("这份清单只属于当前这段对话。换对话会自动切到那一段的清单；删除对话时它也会一起删掉。")
             }
         }
+        .scrollContentBackground(.hidden)
+        .glassScrollEdges()
     }
 
     private var emptyState: some View {

@@ -183,6 +183,8 @@ struct PersonaView: View {
                     .font(.caption2)
             }
         }
+        .scrollContentBackground(.hidden)
+        .glassScrollEdges()
         .navigationTitle("人格与记忆")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $addingWorld) { PersonaEntrySheet(kind: .world) }

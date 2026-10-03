@@ -44,6 +44,8 @@ struct ConversationListView: View {
                     pendingDelete = first
                 }
             }
+            .scrollContentBackground(.hidden)
+            .glassScrollEdges()
             .overlay {
                 if chatStore.conversations.isEmpty {
                     ContentUnavailableView(

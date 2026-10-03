@@ -81,6 +81,8 @@ struct ChatView: View {
     @State private var isGenerating = false
     @State private var generationTask: Task<Void, Never>?
     @State private var showSearch = false
+    /// 滚离消息底部时显示「回到最新」浮球（见 messageList 的 onScrollGeometryChange）。
+    @State private var showScrollToBottom = false
     @State private var searchText = ""
     @State private var searchResults: [ChatStore.SearchResult] = []
     @State private var searchTask: Task<Void, Never>?
@@ -361,6 +363,15 @@ struct ChatView: View {
                 }
             }
             .defaultScrollAnchor(.bottom)
+            .glassScrollEdges()
+            // 滚离底部时浮现「回到最新」按钮；距底超过一屏的 1/6 才出现，
+            // 否则刚发完消息就会闪一下。
+            .onScrollGeometryChange(for: Bool.self, of: { geometry in
+                geometry.contentSize.height
+                    - (geometry.contentOffset.y + geometry.containerSize.height) > 160
+            }, action: { _, show in
+                showScrollToBottom = show
+            })
             // 在消息列表上下滑即可收起键盘
             .scrollDismissesKeyboard(.interactively)
             // 点击消息区域任意空白处（含气泡间隙）收起键盘；
@@ -370,6 +381,23 @@ struct ChatView: View {
                 guard !voiceOverEnabled else { return }
                 inputFocused = false
             })
+            // 回到最新消息：滚远了才出现，玻璃胶囊不遮字。
+            .overlay(alignment: .bottomTrailing) {
+                if showScrollToBottom {
+                    Button {
+                        withAnimation(.snappy) { scrollToBottom(proxy) }
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(width: 34, height: 34)
+                    }
+                    .buttonStyle(.glass)
+                    .padding(.trailing, 18)
+                    .padding(.bottom, 4)
+                    .transition(.scale.combined(with: .opacity))
+                    .accessibilityLabel(t("回到最新消息"))
+                }
+            }
         }
     }
 

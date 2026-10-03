@@ -49,6 +49,10 @@ struct ProvidersView: View {
                 backupSection
                 aboutSection
             }
+            // 玻璃化：列表不带自己的不透明底色，透出窗口渐变背景；
+            // 滚动到边缘显示玻璃高光。
+            .scrollContentBackground(.hidden)
+            .glassScrollEdges()
             .navigationTitle(t("服务"))
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {

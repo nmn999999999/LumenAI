@@ -78,7 +78,7 @@ struct SettingsView: View {
                 .padding(14)
             }
             .background(theme.current.pageBackground(for: colorScheme))
-            .scrollEdgeEffectStyle(.hard, for: .top)
+            .glassScrollEdges()
             .navigationTitle("设置")
             .scrollDismissesKeyboard(.interactively)
             .onTapGesture {

@@ -32,8 +32,8 @@ struct ModelListView: View {
                 .padding(14)
             }
             .background(theme.current.pageBackground(for: colorScheme))
-            // iOS 26 液态玻璃：滚动到顶部边界时导航栏恢复"浮动圆球"折叠效果
-            .scrollEdgeEffectStyle(.hard, for: .top)
+            // iOS 26 液态玻璃：滚动到边缘时显示玻璃高光（上下统一走 glassScrollEdges）
+            .glassScrollEdges()
             .navigationTitle("模型")
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {

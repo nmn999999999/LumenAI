@@ -57,10 +57,29 @@ enum AppTheme: String, CaseIterable, Codable, Sendable {
         nil  // 跟随系统；如需扩展"强制亮/强制暗"再加 case
     }
 
-    /// 页面背景色：按当前 colorScheme 自动选择亮/暗背景，
-    /// 让主题切换不只作用于 tint，页面背景也跟随（REVIEW m4）。
-    func pageBackground(for scheme: ColorScheme) -> Color {
+    /// 页面底色的基底（不透明纯色）。渐变与窗口兜底背景共用它，
+    /// 保证「页面内」与「推出去的子页面」看到的是同一套底色。
+    func pageBase(for scheme: ColorScheme) -> Color {
         scheme == .dark ? bubbleBackgroundDark : bubbleBackgroundLight
+    }
+
+    /// 页面渐变的色标：基底 → 基底 → 主题强调色。
+    /// 窗口兜底背景（AppBackdrop）与页面背景共用同一组色标，两层不会对不上。
+    func pageColors(for scheme: ColorScheme) -> [Color] {
+        let base = pageBase(for: scheme)
+        let accent = accentColor.opacity(scheme == .dark ? 0.30 : 0.22)
+        return [base, base, accent]
+    }
+
+    /// 页面背景：在基底色上叠一层向右下渐隐的主题色，让毛玻璃卡片、
+    /// 列表行间隙、滚动边缘高光透得出层次（纯色背景会把这些全部盖死，
+    /// 玻璃只剩一层灰）。原来这里是纯色（REVIEW m4），玻璃化后改成渐变。
+    func pageBackground(for scheme: ColorScheme) -> LinearGradient {
+        LinearGradient(
+            colors: pageColors(for: scheme),
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
     }
 }
 

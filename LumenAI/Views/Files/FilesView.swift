@@ -27,6 +27,8 @@ struct FilesView: View {
                 }
                 fileSection
             }
+            .scrollContentBackground(.hidden)
+            .glassScrollEdges()
             .navigationTitle(path.isEmpty ? t("文件") : path.last!)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }

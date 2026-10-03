@@ -66,6 +66,7 @@ struct LumenAIApp: App {
     @StateObject private var chatStore = ChatStore()
     @StateObject private var agentService = AgentService()
     @StateObject private var theme = ThemeObserver()
+    @Environment(\.colorScheme) private var colorScheme
     /// 数据安全：切后台/退出时立即落盘（见 body 里的 onChange）
     @Environment(\.scenePhase) private var scenePhase
 
@@ -79,6 +80,13 @@ struct LumenAIApp: App {
                 .environmentObject(theme)
                 .tint(theme.current.accentColor)
                 .preferredColorScheme(theme.current.preferredColorScheme)
+                // 通透的前提：玻璃要透得见「下层」。垫一层与页面同源的渐变作为
+                // 窗口底色，毛玻璃卡片、列表间隙、推送出来的子页面才显出层次
+                // （见 AppBackdrop / AppTheme.pageColors 注释）。
+                .background {
+                    AppBackdrop(colors: theme.current.pageColors(for: colorScheme))
+                        .ignoresSafeArea()
+                }
                 .task {
                     await autoLoadLastModel()
                     // 滚动更新：启动静默检查 GitHub Release（按设置开关 + 间隔节流）

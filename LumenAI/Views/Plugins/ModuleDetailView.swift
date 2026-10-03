@@ -80,6 +80,8 @@ struct ModuleDetailView: View {
                     .font(.caption2)
             }
         }
+        .scrollContentBackground(.hidden)
+        .glassScrollEdges()
         .navigationTitle(module.manifest.name)
         .navigationBarTitleDisplayMode(.inline)
     }
