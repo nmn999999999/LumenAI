@@ -585,37 +585,24 @@ enum CloudChatClient {
             throw CloudError.httpError(http.statusCode, String(data: errorData, encoding: .utf8) ?? "")
         }
 
-        var data = Data()
-        for try await byte in bytes {
-            data.append(byte)
-            // 按行切分（UTF-8 安全：整行解码，避免逐字节转 Character 破坏非 ASCII）
-            while let nl = data.firstIndex(of: 0x0A) {
-                let lineData = data[data.startIndex..<nl]
-                data = Data(data[data.index(after: nl)...])
-                let line = String(data: lineData, encoding: .utf8) ?? ""
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
+        // 性能：用 bytes.lines 按行读取（内部缓冲、C 速度切行、整行 UTF-8 解码）。
+        // 旧实现逐字节 append 且**每追加一个字节就从头 firstIndex(of: 0x0A) 找换行**，
+        // 单行成本 O(行长²)，外加每字节一次异步序列迭代开销 —— 云端流式输出每个
+        // token 都走这条路，是实测热点。
+        // AsyncLineSequence 会剥掉行终止符（\n / \r\n），且流末尾未换行的最后一行
+        // 也会照常产出，语义上覆盖了旧代码的"末尾残留数据"分支。
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
 
-                if trimmed.hasPrefix("data:") {
-                    let payload = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                    if payload == "[DONE]" {
-                        onDone()
-                        return
-                    }
-                    guard let payloadData = payload.data(using: .utf8),
-                          let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
-                    else { continue }
-                    try onJSON(json)
+            if trimmed.hasPrefix("data:") {
+                let payload = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                if payload == "[DONE]" {
+                    onDone()
+                    return
                 }
-            }
-        }
-        // 末尾残留数据（无换行结尾）
-        if let tail = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespaces),
-            tail.hasPrefix("data:") {
-            let payload = String(tail.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            if payload != "[DONE]",
-               let payloadData = payload.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] {
+                guard let payloadData = payload.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
+                else { continue }
                 try onJSON(json)
             }
         }

@@ -215,13 +215,15 @@ enum MarkdownRenderer {
             }
             return nil
         }
-        // 有序: "1. " / "1) "
-        let pattern = #"^\d+[.)]\s+"#
-        if let range = t.range(of: pattern, options: .regularExpression) {
-            return parseInline(String(t[range.upperBound...]))
-        }
-        return nil
+        // 有序: "1. " / "1) " —— 预编译正则（块级解析对每行都要调用，
+        // `range(of:options:.regularExpression)` 每次调用都会重新编译 pattern）
+        guard let regex = orderedListRegex,
+              let match = regex.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+              let range = Range(match.range, in: t) else { return nil }
+        return parseInline(String(t[range.upperBound...]).trimmingCharacters(in: .whitespaces))
     }
+
+    private static let orderedListRegex = try? NSRegularExpression(pattern: #"^\d+[.)]\s+"#)
 
     private static func isTableSeparator(_ line: String) -> Bool {
         let t = line.trimmingCharacters(in: .whitespaces)
@@ -267,19 +269,21 @@ enum MarkdownRenderer {
 
     static func parseInline(_ text: String) -> AttributedString {
         var result = AttributedString()
-        var remaining = Substring(text)
+        // 性能：在 text 上滑动搜索起点，而不是像旧实现那样每匹配一轮
+        // `String(remaining)` 拷贝一次剩余全文（长段落 + 多内联标记时是
+        // O(全文长 × 匹配数) 的重复拷贝）。NSRange 始终以 text 的索引空间计算。
+        var searchStart = text.startIndex
 
-        while !remaining.isEmpty {
+        while searchStart < text.endIndex {
             // 找到最早匹配
             var best: (range: Range<String.Index>, kind: InlineKind, groups: [String])?
-            let nsString = String(remaining)
+            let nsRange = NSRange(searchStart..<text.endIndex, in: text)
             for pattern in compiledInline {
-                let ns = NSRange(remaining.startIndex..<remaining.endIndex, in: remaining)
-                guard let match = pattern.regex.firstMatch(in: nsString, range: ns) else { continue }
-                guard let swiftRange = Range(match.range, in: remaining) else { continue }
+                guard let match = pattern.regex.firstMatch(in: text, range: nsRange) else { continue }
+                guard let swiftRange = Range(match.range, in: text) else { continue }
                 let groups = (0..<match.numberOfRanges).compactMap { idx -> String? in
-                    guard let r = Range(match.range(at: idx), in: remaining) else { return nil }
-                    return String(remaining[r])
+                    guard let r = Range(match.range(at: idx), in: text) else { return nil }
+                    return String(text[r])
                 }
                 if best == nil || swiftRange.lowerBound < best!.range.lowerBound {
                     best = (swiftRange, pattern.kind, groups)
@@ -287,13 +291,13 @@ enum MarkdownRenderer {
             }
 
             guard let found = best else {
-                result.append(AttributedString(String(remaining)))
+                result.append(AttributedString(String(text[searchStart...])))
                 break
             }
 
             // 匹配前文本
-            if found.range.lowerBound > remaining.startIndex {
-                result.append(AttributedString(String(remaining[remaining.startIndex..<found.range.lowerBound])))
+            if found.range.lowerBound > searchStart {
+                result.append(AttributedString(String(text[searchStart..<found.range.lowerBound])))
             }
 
             switch found.kind {
@@ -327,7 +331,7 @@ enum MarkdownRenderer {
                 }
             }
 
-            remaining = remaining[found.range.upperBound...]
+            searchStart = found.range.upperBound
         }
 
         return result

@@ -173,19 +173,41 @@ final class CosyVoiceTTSManager: ObservableObject {
             throw URLError(.badServerResponse)
         }
         let total = http.expectedContentLength > 0 ? http.expectedContentLength : expected
-        var data = Data()
-        data.reserveCapacity(Int(min(total, 64 * 1024 * 1024)))
+        // 性能：流式写盘（1MB 块），不要把整个模型堆进内存 —— 旧实现把文件完整
+        // 累在一份 Data 里再一次性写出，2GB 模型就是 2GB 常驻内存，低内存设备
+        // 直接被系统杀；且逐字节 Data.append 也有可观的额外开销。
+        // 逐字节迭代 AsyncBytes 的开销保留（公开 API 没有块级读取），但落盘
+        // 与进度统计都按块批量做。
+        let tmp = dest.appendingPathExtension("part")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: nil) else {
+            throw URLError(.cannotCreateFile)
+        }
+        let handle = try FileHandle(forWritingTo: tmp)
+        defer { try? handle.close() }
+        var buffer = Data()
+        let blockSize = 1 << 20  // 1MB
+        buffer.reserveCapacity(blockSize)
+        var written = 0
         var lastReport = 0
-        for try await byte in bytes {
-            data.append(byte)
-            if data.count - lastReport > 512 * 1024 {
-                lastReport = data.count
-                onProgress(total > 0 ? Double(data.count) / Double(total) : 0)
+        func flushBuffer() throws {
+            guard !buffer.isEmpty else { return }
+            try handle.write(contentsOf: buffer)
+            written += buffer.count
+            buffer.removeAll(keepingCapacity: true)
+            if written - lastReport > 512 * 1024 {
+                lastReport = written
+                onProgress(total > 0 ? Double(written) / Double(total) : 0)
             }
         }
+        for try await byte in bytes {
+            buffer.append(byte)
+            if buffer.count >= blockSize {
+                try flushBuffer()
+            }
+        }
+        try flushBuffer()
+        try handle.close()
         // 先写临时文件再原子替换：中途失败不会留下"看起来存在、其实是半个"的文件
-        let tmp = dest.appendingPathExtension("part")
-        try data.write(to: tmp, options: .atomic)
         _ = try? FileManager.default.removeItem(at: dest)
         try FileManager.default.moveItem(at: tmp, to: dest)
         onProgress(1)
