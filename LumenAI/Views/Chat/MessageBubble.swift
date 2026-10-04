@@ -400,8 +400,15 @@ struct ToolCallChip: View {
 
     private var prettyArguments: String {
         guard let data = call.arguments.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data),
-              let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return call.arguments }
+        // create_plugin 的参数含整段 tools.js（可达 20KB）：chip 展开时不直接铺代码
+        //（既撑爆气泡也重复信息——源码已在安装确认卡里完整展示），替换为长度与预览。
+        if call.name == "create_plugin", let code = obj["tools_js"] as? String {
+            let preview = String(code.prefix(200))
+            obj["tools_js"] = "（JS 源码共 \(code.count) 字符，已在安装确认卡片中完整展示。开头预览：\(preview)\(code.count > 200 ? " …" : "")）"
+        }
+        guard let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
               let str = String(data: pretty, encoding: .utf8)
         else { return call.arguments }
         return str

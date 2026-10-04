@@ -173,59 +173,80 @@ struct ChatView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                // v0.3.75:搜索改为 in-content 输入行（searchBarRow），不再用系统 .searchable。
-                // 卡顿报告（UIKit-runloop，0.3.74，timeout 375ms，切 tab 时）显示：
-                // 导航栏每次布局都要走 UISearchController / _UISearchBarVisualProviderIOS /
-                // hidesSearchBarWhenScrolling 的高度计算（37 采样中约三分之一带搜索栏栈帧），
-                // 再与 SwiftUI HostingScrollView 的 contentInset→导航栏滚动观察者互相踢，
-                // 形成 UIKit↔SwiftUI 反馈环。把搜索栏从导航项上摘掉即打断该环。
-                // （v0.3.20-22 的 toggle 教训针对"自定义按钮 ↔ 系统 isPresented 状态机"，
-                //  自绘输入行没有这台状态机，showSearch 完全自主，按钮可安全 toggle。）
-                if showSearch {
-                    searchBarRow
-                    if !searchResults.isEmpty {
-                        searchResultsList
-                    }
-                }
-                messageList
-                    .onChange(of: searchText) { _, newValue in
-                        // 防抖：停止输入 200ms 后再执行全量搜索，避免每个按键都扫描所有会话
-                        searchTask?.cancel()
-                        searchTask = Task {
-                            try? await Task.sleep(nanoseconds: 200_000_000)
-                            guard !Task.isCancelled else { return }
-                            searchResults = chatStore.search(query: newValue)
-                        }
-                    }
-                    // 搜索收起时清空状态
-                    .onChange(of: showSearch) { _, isPresented in
-                        if !isPresented {
-                            searchText = ""
-                            searchResults = []
-                            searchFieldFocused = false
-                        }
-                    }
-                if canChat {
-                    agentStepsBar
-                }
-                // 任务清单面板：夹在消息列表与输入栏之间。
-                // 为什么在消息列表**下方**而不是浮在消息之上：agent 的正文/工具结果仍要能完整读，
-                // 浮层会遮内容。放在输入栏**上方**则是因为它描述的是"接下来要发生什么"，
-                // 与输入框同属"操作区"，跟手指所在的区域一致。
-                // 空清单时 PlanPanel 内部整块不渲染，这里不需要额外 if。
-                PlanPanel(store: todoStore)
-                // 从顶栏搬下来的动作（模型 / 助手 / 任务 / 搜索）。
-                // 放在 PlanPanel 与输入栏之间：它们都属于"操作区"，与手指所在的位置一致；
-                // 而消息列表那一侧保持干净，不被任何常驻控件挤占。
-                composerActionsBar
-                    .padding(.bottom, 6)
-                inputBar
+            // body 刻意保持"瘦"：这个 ViewBuilder 曾在 Swift 类型检查器上反复超时
+            //（"unable to type-check in reasonable time"，且对编译机负载敏感）。
+            // 主体内容、3 个 sheet、生命周期回调、2 个 alert 全部拆到独立方法/属性 ——
+            // 每个多语句闭包在各自的表达式预算里求解，body 只剩几条具体方法调用。
+            errorAlert(
+                lifecycleObservers(standardSheets(chatRootVStack))
+                    .approvalAlert(
+                        pending: $pendingApproval,
+                        isWaiting: approvalCenter.isWaiting,
+                        detail: approvalAlertDetail
+                    )
+            )
+        }
+    }
+
+    /// VStack 主体：搜索区 / 消息列表 / 步骤条 / 计划面板 / 操作行 / 输入栏，
+    /// 外加导航栏外观修饰。
+    @ViewBuilder
+    private var chatRootVStack: some View {
+        VStack(spacing: 0) {
+            // v0.3.75:搜索改为 in-content 输入行（searchBarRow），不再用系统 .searchable。
+            // 卡顿报告（UIKit-runloop，0.3.74，timeout 375ms，切 tab 时）显示：
+            // 导航栏每次布局都要走 UISearchController / _UISearchBarVisualProviderIOS /
+            // hidesSearchBarWhenScrolling 的高度计算（37 采样中约三分之一带搜索栏栈帧），
+            // 再与 SwiftUI HostingScrollView 的 contentInset→导航栏滚动观察者互相踢，
+            // 形成 UIKit↔SwiftUI 反馈环。把搜索栏从导航项上摘掉即打断该环。
+            // （v0.3.20-22 的 toggle 教训针对"自定义按钮 ↔ 系统 isPresented 状态机"，
+            //  自绘输入行没有这台状态机，showSearch 完全自主，按钮可安全 toggle。）
+            if showSearch {
+                searchSection
             }
-            .background(theme.current.pageBackground(for: colorScheme))
-            .navigationTitle(chatStore.currentOrNew.title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { toolbarContent }
+            messageList
+                .onChange(of: searchText) { _, newValue in
+                    // 防抖：停止输入 200ms 后再执行全量搜索，避免每个按键都扫描所有会话
+                    searchTask?.cancel()
+                    searchTask = Task {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                        guard !Task.isCancelled else { return }
+                        searchResults = chatStore.search(query: newValue)
+                    }
+                }
+                // 搜索收起时清空状态
+                .onChange(of: showSearch) { _, isPresented in
+                    if !isPresented {
+                        searchText = ""
+                        searchResults = []
+                        searchFieldFocused = false
+                    }
+                }
+            if canChat {
+                agentStepsBar
+            }
+            // 任务清单面板：夹在消息列表与输入栏之间。
+            // 为什么在消息列表**下方**而不是浮在消息之上：agent 的正文/工具结果仍要能完整读，
+            // 浮层会遮内容。放在输入栏**上方**则是因为它描述的是"接下来要发生什么"，
+            // 与输入框同属"操作区"，跟手指所在的区域一致。
+            // 空清单时 PlanPanel 内部整块不渲染，这里不需要额外 if。
+            PlanPanel(store: todoStore)
+            // 从顶栏搬下来的动作（模型 / 助手 / 任务 / 搜索）。
+            // 放在 PlanPanel 与输入栏之间：它们都属于"操作区"，与手指所在的位置一致；
+            // 而消息列表那一侧保持干净，不被任何常驻控件挤占。
+            composerActionsBar
+                .padding(.bottom, 6)
+            inputBar
+        }
+        .background(theme.current.pageBackground(for: colorScheme))
+        .navigationTitle(chatStore.currentOrNew.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { toolbarContent }
+    }
+
+    /// 三个 sheet（会话列表 / 编辑消息 / 任务清单）。实例方法：可直接取 self 的 @State 投影。
+    private func standardSheets<V: View>(_ content: V) -> some View {
+        content
             .sheet(isPresented: $showConversationList) {
                 ConversationListView()
                     .presentationDetents([.medium, .large])
@@ -236,6 +257,12 @@ struct ChatView: View {
             .sheet(isPresented: $showTaskList) {
                 TaskListSheet(store: todoStore)
             }
+    }
+
+    /// 全局生命周期回调：语音状态、生成时常亮、todo 按对话绑定、中断提示、
+    /// onAppear 续跑与 scenePhase 监听。
+    private func lifecycleObservers<V: View>(_ content: V) -> some View {
+        content
             .onChange(of: ttsService.isSpeaking) { _, speaking in
                 if !speaking { speakingMessageID = nil }
             }
@@ -275,6 +302,11 @@ struct ChatView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { resumeInterruptedAgentRunIfNeeded() }
             }
+    }
+
+    /// 错误提示 alert。
+    private func errorAlert<V: View>(_ content: V) -> some View {
+        content
             .alert("出错了", isPresented: .init(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } }
@@ -283,55 +315,31 @@ struct ChatView: View {
             } message: {
                 Text(errorMessage ?? "")
             }
-            .alert(
-                "需要执行「\(pendingApproval?.call.title ?? pendingApproval?.call.name ?? "工具")」吗?",
-                isPresented: .init(
-                    // 同时看中心：用户在**灵动岛**上按了按钮时，弹窗这边没有直接改
-                    // `pendingApproval`，而它必须自己消失 —— 否则 App 里会留着一个
-                    // "还在问你要不要执行"的弹窗，而那个请求早就被答复过了。
-                    get: { pendingApproval != nil && approvalCenter.isWaiting },
-                    set: { if !$0 {
-                        // 自动关闭（如返回上一级）= 拒绝，避免 AgentService 永久阻塞
-                        // 走中心恢复：它保证只生效一次 ——
-                        // 用户可能在弹窗和灵动岛按钮之间"两个都点到"。
-                        AgentApprovalCenter.shared.resolve(.deny)
-                        pendingApproval = nil
-                    } }
-                )
-            ) {
-                Button("拒绝", role: .destructive) {
-                    AgentApprovalCenter.shared.resolve(.deny)
-                    pendingApproval = nil
-                }
-                // 本会话内总是允许：消掉「同一个工具在循环里被反复弹窗」造成的审批疲劳。
-                // 作用域是 AgentService 本次 run（一个 agent 任务），不是整个对话 ——
-                // 理由见 AgentService.run 里 runApprovedTools 的注释（对话级授权会让
-                // 被注入污染过的上下文拥有静默触发副作用工具的能力）。
-                Button("本会话内总是允许") {
-                    AgentApprovalCenter.shared.resolve(.alwaysForSession)
-                    pendingApproval = nil
-                }
-                Button("允许") {
-                    AgentApprovalCenter.shared.resolve(.once)
-                    pendingApproval = nil
-                }
-            } message: {
-                if let pending = pendingApproval {
-                    // 工具名单独列一行（原来只在标题里，标题过长时会被截断），参数用缩进 JSON 展示；
-                    // lineLimit 限制弹窗高度：参数很长时 alert 会被撑破、按钮被挤出屏幕点不到。
-                    // 完整参数仍可在气泡里的工具 chip 中展开查看。
-                    Text("""
-                    此工具会运行真实操作（SSH / MCP 等），是否授权?
+    }
 
-                    工具: \(pending.call.name)
-
-                    参数:
-                    \(prettyArgumentsForApproval(pending.call.arguments))
-                    """)
-                    .lineLimit(16)
-                }
-            }
+    /// 搜索区（自绘输入行 + 结果列表）。抽成独立属性：body 的 ViewBuilder 已在类型检查
+    /// 临界点，少一层嵌套条件/少两个直接子视图，给新增视图留出推断预算。
+    @ViewBuilder
+    private var searchSection: some View {
+        searchBarRow
+        if !searchResults.isEmpty {
+            searchResultsList
         }
+    }
+
+    /// 通用授权 alert 的正文（工具名 + 缩进 JSON 参数）。
+    /// 参数很长时 alert 会被撑破、按钮被挤出屏幕点不到，所以正文在 alert 内再限 16 行；
+    /// 完整参数仍可在气泡里的工具 chip 中展开查看。
+    private var approvalAlertDetail: String {
+        guard let pending = pendingApproval else { return "" }
+        return """
+               此工具会运行真实操作（SSH / MCP 等），是否授权?
+
+               工具: \(pending.call.name)
+
+               参数:
+               \(prettyArgumentsForApproval(pending.call.arguments))
+               """
     }
 
     /// 是否可发送：本地模型已加载 或 已配置云端 Provider
@@ -1313,8 +1321,15 @@ struct ChatView: View {
                 await withCheckedContinuation { (cont: CheckedContinuation<ApprovalDecision, Never>) in
                     // 交给中心持有：灵动岛的按钮是**另一个进程**渲染、由系统拉起 App 执行的，
                     // 它拿不到这个视图的 @State，只能通过中心找到这个等待中的请求。
-                    AgentApprovalCenter.shared.park(callName: call.title ?? call.name, cont)
-                    pendingApproval = PendingApproval(call: call, continuation: cont)
+                    // create_plugin 要展示完整源码与权限 → 走 App 根层的专用安装卡片
+                    //（MainTabView 的 PluginInstallSheetAnchor 观察中心的 pendingInstallCall）；
+                    // 其余工具继续走这里的通用授权 alert。
+                    if call.name == "create_plugin" {
+                        AgentApprovalCenter.shared.parkInstall(call, cont)
+                    } else {
+                        AgentApprovalCenter.shared.park(callName: call.title ?? call.name, cont)
+                        pendingApproval = PendingApproval(call: call, continuation: cont)
+                    }
                 }
             }
         )
@@ -1979,4 +1994,51 @@ final class AgentTokenBuffer {
     var text: [UUID: String] = [:]
     /// 上次真正刷入气泡的时刻（时间节流用）。同样不能放 `@State`，理由同上。
     var lastFlush: Date = .distantPast
+}
+
+/// ChatView 的通用工具授权 alert。
+///
+/// 为什么从 ChatView.body 里搬出来：那段 alert 含 3 个按钮、自定义 Binding(get:set:)
+/// 和多行插值正文，是 body 修饰符链上单个最重的泛型表达式；而 body 整体本就处在
+/// Swift 类型检查器的超时临界附近（机器负载高时会概率性触发
+/// "unable to type-check in reasonable time"）。搬进独立方法后，约束求解在两个较小的
+/// 表达式上各自计时。private 扩展定义在同文件，故能见到 ChatView 的私有嵌套类型。
+private extension View {
+    @ViewBuilder
+    func approvalAlert(pending: Binding<ChatView.PendingApproval?>,
+                       isWaiting: Bool,
+                       detail: String) -> some View {
+        let title = "需要执行「\(pending.wrappedValue?.call.title ?? pending.wrappedValue?.call.name ?? "工具")」吗?"
+        self.alert(
+            title,
+            isPresented: Binding(
+                get: { pending.wrappedValue != nil && isWaiting },
+                set: { if !$0 {
+                    // 自动关闭（如返回上一级）= 拒绝，避免 AgentService 永久阻塞。
+                    // 走中心恢复：它保证只生效一次 —— 用户可能在弹窗和灵动岛按钮间"两个都点到"。
+                    AgentApprovalCenter.shared.resolve(.deny)
+                    pending.wrappedValue = nil
+                } }
+            )
+        ) {
+            Button("拒绝", role: .destructive) {
+                AgentApprovalCenter.shared.resolve(.deny)
+                pending.wrappedValue = nil
+            }
+            // 本会话内总是允许：消掉「同一个工具在循环里被反复弹窗」造成的审批疲劳。
+            // 作用域是 AgentService 本次 run（一个 agent 任务），不是整个对话 ——
+            // 理由见 AgentService.run 里 runApprovedTools 的注释（对话级授权会让
+            // 被注入污染过的上下文拥有静默触发副作用工具的能力）。
+            Button("本会话内总是允许") {
+                AgentApprovalCenter.shared.resolve(.alwaysForSession)
+                pending.wrappedValue = nil
+            }
+            Button("允许") {
+                AgentApprovalCenter.shared.resolve(.once)
+                pending.wrappedValue = nil
+            }
+        } message: {
+            Text(detail).lineLimit(16)
+        }
+    }
 }

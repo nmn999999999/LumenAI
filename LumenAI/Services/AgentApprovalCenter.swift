@@ -21,6 +21,15 @@ final class AgentApprovalCenter: ObservableObject {
     /// 是否有请求在等。UI 观察它来关闭弹窗。
     @Published private(set) var isWaiting = false
 
+    /// 待安装插件的工具调用（仅 create_plugin）。非 nil 时 App 根层的
+    /// PluginInstallSheetAnchor 弹出安装确认卡（展示权限与完整源码）。
+    /// 放在中心而不是 ChatView 的 @State 里，理由与本类存在的理由相同：
+    /// 安装卡是 App 级 UI（挂在 MainTabView 根层，用户在任意 tab 都能看到），
+    /// 同时也避开了 ChatView.body 已到极限的 SwiftUI 类型推断预算。
+    /// setter 不做 private：sheet(item:) 需要可写 Binding（系统在卡片关闭时回写 nil）；
+    /// 业务上的写入点只有 parkInstall / resolve / park 重入，全部 @MainActor。
+    @Published var pendingInstallCall: ChatMessage.ToolCall?
+
     private var continuation: CheckedContinuation<ApprovalDecision, Never>?
 
     private init() {}
@@ -70,6 +79,8 @@ final class AgentApprovalCenter: ObservableObject {
         // 灵动岛的按钮可能**先于**这次提问被按下（App 被拉起、任务从断点续跑，
         // 才走到这一步）。所以先看有没有留着的决定，有就直接答复，不让用户白等。
         if let decided = consumeExternalDecision(forTool: callName) {
+            // 外部决定已先一步到达（灵动岛）：安装卡不必再弹。
+            pendingInstallCall = nil
             c.resume(returning: decided)
             return
         }
@@ -78,11 +89,19 @@ final class AgentApprovalCenter: ObservableObject {
         // 挂着的后果是整个 agent 任务永久阻塞，而且界面上没有任何迹象。
         if let old = continuation {
             continuation = nil
+            pendingInstallCall = nil
             old.resume(returning: .deny)
         }
         continuation = c
         pendingToolName = callName
         isWaiting = true
+    }
+
+    /// create_plugin 专用：挂起等待 + 公布待安装调用（根层安装卡据此弹出）。
+    func parkInstall(_ call: ChatMessage.ToolCall,
+                     _ c: CheckedContinuation<ApprovalDecision, Never>) {
+        pendingInstallCall = call
+        park(callName: call.title ?? call.name, c)
     }
 
     /// 来自灵动岛的决定：**先落盘**，再尝试恢复当前等待者。
@@ -102,6 +121,7 @@ final class AgentApprovalCenter: ObservableObject {
         continuation = nil
         pendingToolName = nil
         isWaiting = false
+        pendingInstallCall = nil
         c.resume(returning: decision)
         return true
     }

@@ -592,6 +592,30 @@ enum BuiltInTools {
             // 如果将来审批能细到 (工具, op)，delete/move 应该单独设为 true。
             requiresApproval: false,
         ),
+        // AI 给自己装能力：模型在对话里生成一个 JS 插件（manifest + tools.js），
+        // 用户在安装卡片上确认后落盘，**当轮即可调用**新工具（AgentService 在安装成功后
+        // 重建工具目录）。执行入口 PluginCreator（校验/预检/安装都在那里）。
+        //
+        // requiresApproval 必须是 true：这个工具的副作用 = 把模型生成的代码持久安装进
+        // Modules/，没有用户逐次确认就是"模型任意落盘代码"。卡片是自定义的
+        // （PluginInstallApprovalSheet，展示权限与完整源码），不走通用 alert。
+        //
+        // ⚠️ 与 todo 一样**不进** defaultEnabledNames（本文件末尾的 12 工具训练契约）：
+        // 本地小模型既没见过这个工具名，也写不好插件代码。它只出现在云端全量目录里。
+        AgentToolDefinition(
+            id: "create_plugin",
+            name: "create_plugin",
+            description: "生成并安装一个新的 JS 工具插件，为本 App 扩展可复用能力（用户会看到安装确认卡片，需其批准）。仅当用户明确要求一个「可反复使用的新功能/新工具」时使用；一次性文本处理、普通问答不要用。安装成功后工具在本次任务中立即可用。",
+            parameters: [
+                "id": .init(type: "string", description: "模块唯一 id（必填）：小写字母开头，只含字母数字 . _ -，不能以点开头，≤64 字符，建议带业务前缀，如 text-tools、json-path-x", enumValues: nil),
+                "name": .init(type: "string", description: "给用户看的模块名称（必填），≤40 字，如「文本工具集」", enumValues: nil),
+                "description": .init(type: "string", description: "模块做什么的一句话描述（≤300 字）", enumValues: nil),
+                "version": .init(type: "string", description: "版本号（可选，默认 1.0.0）；用相同 id 修正插件时递增", enumValues: nil),
+                "permissions": .init(type: "array", description: "权限字符串数组（可选，纯计算插件传空数组或省略）：仅支持 \"network\"（联网，nativeFetch 仅支持 https）与 \"storage\"（模块私有键值存储）；其他值会被拒绝", enumValues: nil),
+                "tools_js": .init(type: "string", description: "完整 JavaScript 源码（必填，≤20000 字符）。须调用 registerTool({name, description, parameters, run}) 注册一个或多个工具：name 为小写下划线风格且不与已有工具重名；parameters 是 {参数名:{type,description}}；run(args) 返回字符串（对象请 JSON.stringify），也可返回 Promise。需要 HTTP 时用 nativeFetch(url)（需声明 network 权限）；持久化用 storeGet/storeSet（需 storage）", enumValues: nil)
+            ],
+            requiresApproval: true,
+        ),
     ]
 
     // MARK: - 执行入口
@@ -772,6 +796,11 @@ enum BuiltInTools {
     @MainActor
     static func executeWithFallbacks(toolName: String,
                                      argumentsJSON: String) async -> ToolExecutionOutcome {
+        // create_plugin 先走专用入口：它不"执行命令"，而是校验+预检+安装模型生成的 JS 插件。
+        // 走到这里时 AgentService 的审批已经通过（requiresApproval=true，用户在安装卡片上确认过）。
+        if toolName == "create_plugin" {
+            return ToolExecutionOutcome(text: await PluginCreator.create(argumentsJSON: argumentsJSON))
+        }
         let builtin = await execute(toolName: toolName, argumentsJSON: argumentsJSON)
         // 用共享常量判哨兵：写成字面量的话，两处早晚会漂移成"不再匹配"，
         // 结果是所有 MCP/插件工具突然全部变成"未知工具"。
