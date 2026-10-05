@@ -76,6 +76,7 @@ struct SettingsView: View {
                     searchCard
                     sshCard
                     moduleSettingsCard
+                    diagnosticsCard
                     aboutCard
                     dangerZone
                 }
@@ -1611,6 +1612,32 @@ struct SettingsView: View {
                             // 插件下发的远程 UI（JSON 声明式，改配置界面不用换底包）
                             RemoteUIView(module: module, groups: module.manifest.settingsUI ?? [])
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 开发者诊断
+
+    /// Agent Runtime 的 A/B benchmark 入口（阶段 12）。
+    /// 放在 `aboutCard` 之前、默认不打扰：普通用户不需要它，但性能优化必须能在真机上复现对比。
+    private var diagnosticsCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionHeader(title: "开发者诊断", systemImage: "gauge.with.dots.needle.67percent")
+                Text("对比 baseline 与 optimized 的工具命中率、成功率、reasoning/tool token、TTFT 与 P50/P95 延迟。建议在 Release 构建上运行以取得真实数字。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                NavigationLink {
+                    AgentBenchmarkView()
+                } label: {
+                    HStack {
+                        Label("Agent 性能 A/B Benchmark", systemImage: "chart.bar.xaxis")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
                     }
                 }
             }

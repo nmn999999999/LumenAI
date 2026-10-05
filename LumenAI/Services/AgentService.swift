@@ -56,6 +56,10 @@ final class AgentService: ObservableObject {
     @Published private(set) var steps: [Step] = []
     @Published private(set) var isRunning = false
 
+    /// 最近一次 run 的结构化性能指标（AgentPerformanceMetrics）。
+    /// 供 A/B benchmark 与调试读取；不参与任何控制流，纯粹是观测产物。
+    @Published private(set) var lastMetrics: AgentPerformanceMetrics?
+
     /// 被系统打断时的说明（目前只有一种来源：切到后台的时间用尽、我们主动取消了这一轮）。
     ///
     /// 为什么需要一句话而不是静默取消：取消的表现是气泡停在半句话上、界面回到可输入状态，
@@ -302,7 +306,10 @@ final class AgentService: ObservableObject {
         /// 断点续跑：传入存档时，从它记录的轮次与历史上接着跑，而不是从零开始。
         /// 调用方（ChatView）负责把对话切回去、并把内容接在同一条气泡上 ——
         /// 这两件事需要 UI 状态，AgentService 自己做不到。
-        resuming checkpoint: AgentRunCheckpoint? = nil
+        resuming checkpoint: AgentRunCheckpoint? = nil,
+        /// 优化开关集合。默认全部开启（线上行为）；benchmark 传 `.baseline`
+        /// 即可复现改造前的行为，用于对比与紧急回滚。详见 `AgentOptimizations`。
+        optimizations: AgentOptimizations = .optimized
     ) async -> (content: String, toolCalls: [ChatMessage.ToolCall]) {
 
         steps.removeAll()
@@ -314,6 +321,23 @@ final class AgentService: ObservableObject {
         let checkpointResumeCount = (checkpoint?.resumeCount ?? 0)
         let checkpointStartedAt = checkpoint?.startedAt ?? Date()
         defer { isRunning = false }
+
+        // ── 性能观测（阶段 1）：不参与任何控制流，只记录 ──
+        // run 总墙钟起点 + 每轮累积器。埋点通过轮首的 `defer` 集中提交，
+        // 因此不会在循环的多个出口（continue / break / return）散落重复代码。
+        let perfRunStart = Date()
+        let perfRecorder = AgentPerformanceRecorder()
+        // ── Reasoning 控制（阶段 2-4）：预算 + 门控 + 重复检测 ──
+        // Runtime 拥有"何时停止 reasoning"的最终控制权；模型只负责产出内容。
+        let reasoningRuntime = ReasoningRuntime()
+        // run 结束时（正常返回 / 提前 return / break 都算）聚合发布一次指标。
+        // 只做观测与打印，不参与控制流；也不写盘、不影响任何返回内容。
+        defer {
+            let m = perfRecorder.metrics(
+                totalLatencyMs: Date().timeIntervalSince(perfRunStart) * 1000)
+            lastMetrics = m
+            print(perfRecorder.summaryLine(m))
+        }
 
         var workingHistory = history
         var allToolCalls: [ChatMessage.ToolCall] = []
@@ -381,6 +405,17 @@ final class AgentService: ObservableObject {
             iteration += 1
             liveIteration = iteration
 
+            // 性能观测：本轮累积器。defer 会在本轮任一出口（continue / break / return）
+            // 自动提交，因此埋点不会污染下面的控制流。
+            let perfIterStart = Date()
+            var perfIter = AgentIterationAccumulator(iteration: iteration)
+            defer {
+                if !perfIter.aborted {
+                    perfRecorder.record(perfIter.snapshot(
+                        latencyMs: Date().timeIntervalSince(perfIterStart) * 1000))
+                }
+            }
+
             // 每轮**开始**时存一次档。
             //
             // 为什么必须有这一步，而不只在"被取消/生成失败"时存：
@@ -411,12 +446,21 @@ final class AgentService: ObservableObject {
             // 提示词分化（v0.3.45）：云端模型 → 全量工具目录 + 英文强化指令；
             // 本地模型 → 压缩目录（12 工具 + 短描述）+ 中文指令。
             let useCloud = llm.hasCloudSelection
-            let promptMessages = withToolInstructions(
-                history: Self.trimmedHistory(workingHistory),
+            let promptAssembly = withToolInstructions(
+                history: Self.trimmedHistory(workingHistory,
+                                             compaction: optimizations.historyCompaction),
                 tools: liveTools,
-                useCloud: useCloud
+                useCloud: useCloud,
+                routing: optimizations.toolRouting
             )
+            let promptMessages = promptAssembly.messages
+            // 观测：本轮 prompt 成本 + 工具目录成本 + 暴露工具数
+            perfIter.inputTokens = TokenEstimator.tokens(messages: promptMessages)
+            perfIter.toolSchemaTokens = promptAssembly.toolSchemaTokens
+            perfIter.exposedToolCount = promptAssembly.exposedToolCount
 
+            let genStart = Date()
+            var firstTokenAt: Date?
             var raw = ""
             do {
                 if let bridge {
@@ -424,8 +468,29 @@ final class AgentService: ObservableObject {
                     let stream = llm.streamChat(history: promptMessages, settings: settings)
                     for try await token in stream {
                         try Task.checkCancellation()
+                        if firstTokenAt == nil { firstTokenAt = Date() }
                         raw += token
                         bridge.appendToken(iterationID!, token)
+
+                        // ── Reasoning 早停（阶段 2-3，可由开关关闭以复现 baseline）──
+                        // Runtime 拥有停止权：一旦产出可执行的内容，就不再陪它继续生成。
+                        // 1) 结束暗号：云/本地都安全 —— 暗号之后的文本本来也会被丢弃。
+                        if optimizations.reasoningControl, token.contains("]"),
+                           raw.range(of: Self.endSignal, options: .caseInsensitive) != nil {
+                            reasoningRuntime.markFinalReady()
+                            appendStep(.thinking, "已产生最终答案信号，提前结束本轮生成")
+                            break
+                        }
+                        // 2) 完整合法工具调用：仅本地「一轮一调用」契约下早停。
+                        //    云端一轮可能发多个独立调用，截断会丢掉后续调用，绝不早停。
+                        if optimizations.reasoningControl, !useCloud, token.contains("}") {
+                            if case .call = Self.parseToolOutcome(
+                                from: Self.stripThinkTags(raw), tools: liveTools) {
+                                reasoningRuntime.markToolReady()
+                                appendStep(.thinking, "已产生合法工具调用，提前结束本轮 reasoning")
+                                break
+                            }
+                        }
                     }
                 } else {
                     raw = try await llm.complete(messages: promptMessages, settings: settings)
@@ -442,6 +507,8 @@ final class AgentService: ObservableObject {
                 let transient = RetryPolicy.isTransient(error)
                 if transient, retryStreak < 2 {
                     retryStreak += 1
+                    // 观测：本轮作废（重试），不记入指标
+                    perfIter.aborted = true
                     let wait = RetryPolicy.delay(attempt: retryStreak)
                     appendStep(.thinking, "本轮生成中断（\(shortReason(error))），"
                               + "\(String(format: "%.1f", wait))s 后自动重试")
@@ -465,11 +532,18 @@ final class AgentService: ObservableObject {
             // 这一轮生成成功——把连续失败计数清零（否则三次零散失败会被误判成"连续失败"）
             retryStreak = 0
 
+            // 观测：本轮 TTFT / 生成耗时 / 输出与 reasoning token / KV 复用
+            let genEnd = Date()
+            perfIter.generationMs = genEnd.timeIntervalSince(genStart) * 1000
+            perfIter.ttftMs = (firstTokenAt ?? genEnd).timeIntervalSince(genStart) * 1000
+            perfIter.recordGeneration(raw: raw, kvStats: llm.lastKVCacheReuse)
+
             // 1) 结束暗号优先：在【原始文本】上检测，避免答案被裹在 <think> 内时
             //    被提前剥离思考块而连暗号一起丢失。命中后再对最终答案单独剥离思考块，
             //    保证正文干净、不被当成"思考内容"吞掉。
             if let pre = Self.extractFinalAnswer(from: raw) {
                 let answer = Self.stripThinkTags(pre)
+                reasoningRuntime.markFinalReady()
                 appendStep(.finalAnswer, "检测到结束暗号，输出最终回答")
                 if let id = iterationID { bridge?.endIteration(id) }
                 return (answer, allToolCalls)
@@ -497,6 +571,9 @@ final class AgentService: ObservableObject {
                 continue
             }
             if case .call(let firstCall) = outcome {
+                // Reasoning 门控：已确定动作 → 结束 reasoning。重置预算与重复检测，
+                // 让"下一步"从最小预算重新开始（阶段 2 的渐进式预算语义）。
+                reasoningRuntime.registerAction()
                 // 本地 / 云端在这里**分叉**，两边的行为差异是有意的、必须保持（原因见下面两个分支）：
                 //   云端 useCloud == true  → 一轮可发多个独立调用：逐个授权 → 并发执行 → 按原顺序回填
                 //   本地 useCloud == false → 一轮只执行第一个调用（冻结契约，行为与改造前完全一致）
@@ -652,7 +729,8 @@ final class AgentService: ObservableObject {
                             let raw = outcome.result
                             // 每个结果**各自**截断（limitResult）、**各自**包成外部数据块（wrapToolOutput）：
                             // 一轮多调用时漏包任何一个，就等于给提示词注入留下一个未标记的入口。
-                            let limited = Self.limitResult(raw)
+                            let limited = Self.limitResult(raw, toolName: r.name,
+                                                          useReducer: optimizations.resultReduction)
                             r.result = limited
                             // 成败由**返回文本的约定前缀**决定，而不是"执行过程没抛异常"。
                             // 之前这里无条件写 .complete：于是 `note` 回一句
@@ -705,6 +783,15 @@ final class AgentService: ObservableObject {
                     if orderedRecords.contains(where: { $0.name == "create_plugin" && $0.status == .complete }) {
                         liveTools = Self.currentToolCatalog()
                         appendStep(.thinking, "已刷新工具目录：新安装的插件工具本轮即可调用")
+                    }
+
+                    // 观测：本轮以工具调用结束；统计回填进上下文的工具结果 token 与执行耗时
+                    perfIter.endedWithToolCall = true
+                    for tm in toolMessages {
+                        perfIter.toolResultTokens += TokenEstimator.tokens(in: tm.content)
+                    }
+                    for r in orderedRecords {
+                        if let d = r.durationMs, d > 0 { perfIter.toolExecutionMs += Double(d) }
                     }
 
                     // assistant 侧只回填**一条**消息（带本轮全部 record）：这些调用本来就是同一个
@@ -836,7 +923,8 @@ final class AgentService: ObservableObject {
 
                     let outcome = await BuiltInTools.executeWithFallbacks(toolName: call.name, argumentsJSON: argsJSON)
                     let result = outcome.text
-                    let limited = Self.limitResult(result)
+                    let limited = Self.limitResult(result, toolName: call.name,
+                                                  useReducer: optimizations.resultReduction)
                     record.result = limited
                     // 同并发路径：失败与否看返回文本的约定前缀（ToolResultFormat），
                     // 不看"有没有抛异常" —— 工具的失败是**正常返回**的错误文案。
@@ -850,6 +938,9 @@ final class AgentService: ObservableObject {
                     let ended = Date()
                     record.finishedAt = ended
                     record.durationMs = Int(ended.timeIntervalSince(began) * 1000)
+                    // 观测：本轮以工具调用结束；统计结果 token 与执行耗时
+                    perfIter.endedWithToolCall = true
+                    perfIter.addToolResult(limited, durationMs: record.durationMs)
                     allToolCalls.append(record)
                     appendStep(.result, "\(call.name) → \(limited)")
                     if let id = iterationID { bridge?.attachToolCall(id, record) }
@@ -875,6 +966,9 @@ final class AgentService: ObservableObject {
                     // 与并发路径一致：拒绝是**用户的选择**，不是工具故障，必须能和真实报错分开统计。
                     record.errorCode = "denied"
                     record.finishedAt = Date()
+                    // 观测：模型确实发起了调用（被拒绝也占一轮动作）
+                    perfIter.endedWithToolCall = true
+                    perfIter.toolResultTokens += TokenEstimator.tokens(in: "用户拒绝执行该工具，请根据情况换用其他工具或直接回答。")
                     allToolCalls.append(record)
                     appendStep(.result, "\(call.name) 已被用户拒绝")
                     if let id = iterationID { bridge?.attachToolCall(id, record) }
@@ -897,7 +991,31 @@ final class AgentService: ObservableObject {
 
                 workingHistory.append(ChatMessage(role: .assistant, content: content))
 
-                // 若看起来是想调工具但 JSON 写坏了，顺带纠正格式
+                // ── Reasoning 门控（阶段 2-4，可由开关关闭以复现 baseline）──
+                // 这是一轮"纯思考"：既没产出结束暗号，也没产出合法工具调用。
+                // 把本轮的 reasoning 文本与 token 交给 Runtime，由它决定：
+                //   · 是否累计超预算 → 强制动作
+                //   · 是否检测到重复推理 → 强制动作
+                // 控制权在 Runtime（不要求模型自己觉得"想够了"）。
+                //
+                // reasoning token 口径：优先用显式 ` thinking` 块的 token；**没有 think 标签时
+                // 用本轮正文的 token** —— 本地冻结契约的提示词并不要求输出 think 标签，
+                // 模型经常直接吐一段纯思考正文。若只认 think 块，累计永远是 0，
+                // 预算/门控对本地模型会完全失效（而本地模型正是 reasoning 过长的主要场景）。
+                let reasoningTurnTokens = perfIter.reasoningTokens > 0
+                    ? perfIter.reasoningTokens
+                    : TokenEstimator.tokens(in: content)
+                let reasonGate: ReasoningGateState = optimizations.reasoningControl
+                    ? reasoningRuntime.registerReasoningTurn(text: content,
+                                                            tokens: reasoningTurnTokens)
+                    : .thinking
+                if reasonGate == .budgetExceeded || reasonGate == .repetitionDetected {
+                    let why = reasonGate == .repetitionDetected ? "重复推理" : "推理超预算"
+                    appendStep(.thinking, "\(why)：强制进入动作/收尾")
+                }
+
+                // 若看起来是想调工具但 JSON 写坏了，顺带纠正格式；
+                // 否则若门控已触发，用强制动作指令替换普通"继续"提示。
                 let hint: String
                 if Self.looksLikeToolCall(content, tools: liveTools),
                    Self.looksLikeBrokenJSON(content) {
@@ -908,6 +1026,8 @@ final class AgentService: ObservableObject {
                     - 得出最终结论时，先输出 \(Self.endSignal)，再输出最终回答正文
                     请继续。
                     """
+                } else if let forced = reasoningRuntime.forcedActionDirective() {
+                    hint = forced
                 } else {
                     hint = """
                     继续。若需调用工具，只输出工具 JSON；
@@ -1016,7 +1136,11 @@ final class AgentService: ObservableObject {
     /// 局限（如实标注）：仍按**消息条数**而非 token 数裁剪。一条 2000 字的工具结果
     /// 和一句"你好"都算 1 条，所以真实占用可能远超预期。要做到 token 级需要分词器，
     /// 那是下一步的事。
-    private static func trimmedHistory(_ history: [ChatMessage]) -> [ChatMessage] {
+    private static func trimmedHistory(_ raw: [ChatMessage],
+                                       compaction: Bool = true) -> [ChatMessage] {
+        // 阶段 9：先把旧工具交互压缩成 Task State（短任务/未超阈值时原样返回）。
+        // 只读生成 prompt，不改动 `workingHistory` 本身，因此不影响存档与 UI 步骤面板。
+        let history = compaction ? ToolHistoryCompactor.compact(raw) : raw
         if history.count <= maxWorkingMessages { return history }
 
         var system: ChatMessage?
@@ -1091,11 +1215,23 @@ final class AgentService: ObservableObject {
             + PluginManager.shared.installedToolDefinitions()
     }
 
+    /// `withToolInstructions` 的产物：渲染好的消息 + profiling 用的工具目录成本。
+    ///
+    /// 为什么要一起返回：工具目录被拼进 system 消息后，就无法再单独量出它占了多少 token。
+    /// 在这里顺手量是最省事、也最准确的位置（不重复 selection 逻辑，不会漂移）。
+    private struct PromptAssembly {
+        let messages: [ChatMessage]
+        let toolSchemaTokens: Int
+        let exposedToolCount: Int
+    }
+
     private func withToolInstructions(
         history: [ChatMessage],
         tools: [AgentToolDefinition],
-        useCloud: Bool
-    ) -> [ChatMessage] {
+        useCloud: Bool,
+        /// 阶段 5-7 的工具路由配置（由 `AgentOptimizations` 传入；baseline 时关闭）。
+        routing: ToolRoutingConfig = ToolRoutingConfig()
+    ) -> PromptAssembly {
         let maxTools = useCloud ? tools.count : 12
         let maxDesc = useCloud ? Int.max : 150
 
@@ -1128,23 +1264,35 @@ final class AgentService: ObservableObject {
             print("[agent] 本地模型工具目录已满（\(maxTools)），丢弃 \(dropped) 个：\(droppedNames)"
                   + "。需要这些工具请切换到云端模型。")
         }
-        let catalog = selected.prefix(maxTools).map { tool -> String in
-            var desc = tool.description
-            if desc.count > maxDesc { desc = String(desc.prefix(maxDesc)) + "…" }
-            var lines = "- \(tool.name): \(desc)"
-            if !tool.parameters.isEmpty {
-                let params = tool.parameters.map { name, schema -> String in
-                    var s = "  - \(name) (\(schema.type))"
-                    if !schema.description.isEmpty { s += ": \(schema.description)" }
-                    if let enums = schema.enumValues, !enums.isEmpty {
-                        s += " [可选: \(enums.joined(separator: " / "))]"
-                    }
-                    return s
-                }.joined(separator: "\n")
-                lines += "\n  参数:\n\(params)"
+        // 工具目录渲染（阶段 5-7）：
+        //   - 本地（useCloud == false）：**冻结契约，逐字保持** ——
+        //     12 工具 + 描述截 150 字 + 参数明细。绝不能改（训练数据照它逐字生成）。
+        //   - 云端（useCloud == true）：先由 ToolRouter 依据本轮请求 / 已用工具挑出候选，
+        //     再用 compact schema 渲染，显著降低 tool schema token。
+        //     **无明确信号时不裁剪**，只换成 compact 表达 —— 工具集合不变，命中率零风险。
+        //   - 二者都只影响"发给模型的目录文本"；Tool Executor / 解析仍用完整 liveTools。
+        //
+        // 本地之所以不套路由：本地目录本来就是压缩过的 12 个，且顺序是训练契约；
+        // 任何裁剪/重排都会让已训好的适配器看到它没见过的目录。
+        let catalogTools: [AgentToolDefinition]
+        let catalog: String
+        if useCloud {
+            let routed = ToolRouter.route(
+                request: Self.latestUserRequest(in: history),
+                tools: selected,
+                recentlyUsed: Self.recentlyUsedToolNames(in: history),
+                config: routing)
+            catalogTools = routed.tools
+            catalog = routed.catalog
+            if routed.routed {
+                print("[agent] ToolRouter 暴露 \(routed.exposedCount)/\(selected.count) 个工具（compact schema）")
             }
-            return lines
-        }.joined(separator: "\n")
+        } else {
+            catalogTools = Array(selected.prefix(maxTools))
+            catalog = catalogTools
+                .map { ToolSchemaFormatter.fullText($0, descriptionLimit: maxDesc) }
+                .joined(separator: "\n")
+        }
 
         let instruction: String
         if useCloud {
@@ -1310,7 +1458,30 @@ final class AgentService: ObservableObject {
         } else {
             messages.insert(ChatMessage(role: .system, content: effectiveInstruction), at: 0)
         }
-        return messages
+        return PromptAssembly(
+            messages: messages,
+            toolSchemaTokens: TokenEstimator.tokens(in: catalog),
+            exposedToolCount: catalogTools.count
+        )
+    }
+
+    /// 最近一条 user 消息的正文（工具路由的"请求信号"来源）。
+    /// 取最后一条而不是第一条：多轮对话里最近的诉求才决定这一轮该暴露哪些工具。
+    private static func latestUserRequest(in history: [ChatMessage]) -> String {
+        for m in history.reversed() where m.role == .user {
+            return m.content
+        }
+        return ""
+    }
+
+    /// 本 run 已经调用过的工具名（从 assistant 消息携带的 toolCalls 收集）。
+    /// 路由时这些工具永远保留 —— 已经在用的工具绝不能因为重新路由而被隐藏。
+    private static func recentlyUsedToolNames(in history: [ChatMessage]) -> Set<String> {
+        var names = Set<String>()
+        for m in history where m.role == .assistant {
+            for c in m.toolCalls { names.insert(c.name) }
+        }
+        return names
     }
 
     // MARK: - 工具调用解析
@@ -1517,13 +1688,23 @@ final class AgentService: ObservableObject {
         """
     }
 
-    /// 截断过长的工具结果，避免撑爆上下文。
-    private static func limitResult(_ result: String, maxLength: Int = 2000) -> String {
+    /// 压缩过长的工具结果，避免撑爆上下文（阶段 8：委托给 `ToolResultReducer`）。
+    ///
+    /// 改造前这里只做「头 60% + 尾 40%」的平截；对中段藏错误、JSON/ MCP 结果里
+    /// 大量重复 metadata 这两类实际情况都不友好。现在按内容形态分流：
+    /// JSON 结构化瘦身 / 错误行优先保留 / 普通文本去重后头尾，短结果逐字不变。
+    /// `maxLength` 默认仍为 2000，保持与改造前一致的上限，确保行为不回退。
+    ///
+    /// `useReducer == false`（baseline）时退回改造前的头尾平截，供 A/B 对比。
+    private static func limitResult(_ result: String,
+                                    toolName: String = "",
+                                    maxLength: Int = 2000,
+                                    useReducer: Bool = true) -> String {
+        if useReducer {
+            return ToolResultReducer.reduce(result, toolName: toolName, maxChars: maxLength)
+        }
+        // ── baseline：改造前的平截逻辑（逐字保留，仅用于对比/回滚）──
         if result.count <= maxLength { return result }
-        // **头尾保留**，而不是只留头部。
-        // 为什么：很多工具最有用的信息在**尾部** —— shell/ssh 的报错、HTTP 响应的结论、
-        // 命令输出的最后几行。平截会把它们整段丢掉，模型据此得出错误结论。
-        // 同时把"省略了多少字"写清楚（原来只写"已截断"，模型不知道丢了多少、是否需要重取）。
         let headLen = maxLength * 6 / 10
         let tailLen = maxLength - headLen - 40
         let omitted = result.count - headLen - tailLen
