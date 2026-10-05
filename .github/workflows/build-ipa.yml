@@ -153,7 +153,8 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             COMPILER_INDEX_STORE_ENABLE=NO \
-            -skipMacroValidation
+            -skipMacroValidation \
+            -skipPackagePluginValidation
 
       # 检测是否配置了签名 Secrets
       - name: Check signing availability
