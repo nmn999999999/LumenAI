@@ -84,8 +84,11 @@ jobs:
       - name: Fetch iOS frameworks
         env:
           GH_TOKEN: ${{ github.token }}
-          FW_TAG: ${{ inputs.frameworks_tag }}
-          FW_ASSET: ${{ inputs.frameworks_asset }}
+          # `inputs` 只在 workflow_dispatch 时有值；push 事件下为空，
+          # 直接引用会得到空字符串（已实测：FW_TAG/FW_ASSET 为空 → 下载失败）。
+          # `||` 兜住默认值，两种触发方式都能取到正确值。
+          FW_TAG: ${{ inputs.frameworks_tag || 'ios-frameworks' }}
+          FW_ASSET: ${{ inputs.frameworks_asset || 'ios-frameworks.tar.gz' }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/fw
