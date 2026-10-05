@@ -69,13 +69,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 选择镜像上最新的 Xcode（需 ≥ 26 以支持 Liquid Glass / Icon Composer）
-      - name: Select latest Xcode
+      # 固定到与**本地构建一致**的 Xcode 版本。
+      #
+      # 为什么不能直接用"最新"：本地出包用的是 Xcode 26.1
+      # （IPA 的 Info.plist: DTXcode=2610 / DTXcodeBuild=17B55 / SDK iphoneos26.1=23B77）。
+      # runner 上最新是 26.6（Swift 6.3.3），其 Swift 6 严格并发检查更严，
+      # 会把本地能编过的代码判为 error —— 实测 LiveActivityManager 里
+      # `activity.update/end` 被报 "sending 'activity' risks causing data races"。
+      # 固定版本后，"本地能编 = CI 能编"，且**不必改任何 App 代码**。
+      - name: Select Xcode (pinned to local toolchain)
+        env:
+          PINNED_XCODE: Xcode_26.1.app
         run: |
+          set -euo pipefail
           ls /Applications | grep Xcode || true
-          LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
-          echo "Using $LATEST"
-          sudo xcode-select -s "$LATEST"
+          if [ -d "/Applications/$PINNED_XCODE" ]; then
+            TARGET="/Applications/$PINNED_XCODE"
+          else
+            TARGET=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+            echo "::warning::runner 上没有 $PINNED_XCODE，回退到 $TARGET；若因并发检查报错，需另找该版本镜像"
+          fi
+          echo "Using $TARGET"
+          sudo xcode-select -s "$TARGET"
           xcodebuild -version
           swift --version
 
