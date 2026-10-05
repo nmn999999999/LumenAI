@@ -387,6 +387,32 @@ struct ProvidersView: View {
                     }
                 }
             }
+            NavigationLink {
+                SkillsView()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "wand.and.stars")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                        .frame(width: 34, height: 34)
+                        .background(.tint.opacity(0.12), in: .rect(cornerRadius: 9))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("技能")
+                            .font(.subheadline.weight(.semibold))
+                        Text("可复用提示词模板，参数化工作流，一键生成")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if SkillStore.shared.updatableCount > 0 {
+                        Text("\(SkillStore.shared.updatableCount) 可更新")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.purple.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.purple)
+                    }
+                }
+            }
         } header: {
             Text("扩展")
         }

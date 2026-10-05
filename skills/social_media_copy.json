@@ -1,0 +1,84 @@
+{
+  "id": "social_media_copy",
+  "name": "社交媒体文案",
+  "version": "1.0.0",
+  "description": "适配不同平台的社交媒体文案，自动优化标签和格式",
+  "author": "LumenAI Team",
+  "category": "creative",
+  "tags": ["社交媒体", "营销", "文案"],
+  "icon": "paintbrush.fill",
+  "color": "#FF2D55",
+  "minAppVersion": "0.3.77",
+  "isBuiltIn": false,
+  "isEnabled": true,
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-01T00:00:00Z",
+  "useCount": 0,
+  "promptTemplate": "请为{{platform}}平台创作社交媒体文案：\n\n品牌/产品：{{brandProduct}}\n\n核心卖点：{{keySellingPoints}}\n\n目标受众：{{targetAudience}}\n\n发布目的：{{postPurpose}}\n\n语气风格：{{toneStyle}}\n\n请生成：\n1. 主文案（{{wordLimit}}字以内）\n2. 相关话题标签\n3. 视觉建议\n4. 发布时间建议\n5. 互动引导文案\n\n注意事项：{{specialNotes}}",
+  "parameters": [
+    {
+      "id": "param-1",
+      "name": "platform",
+      "label": "社交平台",
+      "type": "select",
+      "description": "目标社交媒体平台",
+      "defaultValue": "微信朋友圈",
+      "isRequired": true,
+      "enumValues": ["微信朋友圈", "微博", "小红书", "抖音", "B站", "LinkedIn", "Twitter", "Instagram"]
+    },
+    {
+      "id": "param-2",
+      "name": "brandProduct",
+      "label": "品牌/产品",
+      "type": "string",
+      "description": "需要推广的品牌或产品",
+      "isRequired": true
+    },
+    {
+      "id": "param-3",
+      "name": "keySellingPoints",
+      "label": "核心卖点",
+      "type": "multiline",
+      "description": "产品的核心卖点和特点",
+      "isRequired": true
+    },
+    {
+      "id": "param-4",
+      "name": "targetAudience",
+      "label": "目标受众",
+      "type": "string",
+      "description": "文案的目标人群",
+      "defaultValue": "年轻消费者",
+      "isRequired": false
+    },
+    {
+      "id": "param-5",
+      "name": "postPurpose",
+      "label": "发布目的",
+      "type": "select",
+      "description": "发帖的主要目的",
+      "defaultValue": "品牌推广",
+      "isRequired": false,
+      "enumValues": ["品牌推广", "产品销售", "活动宣传", "内容分享", "用户互动", "危机公关"]
+    },
+    {
+      "id": "param-6",
+      "name": "toneStyle",
+      "label": "语气风格",
+      "type": "select",
+      "description": "文案的语气和风格",
+      "defaultValue": "专业友好",
+      "isRequired": false,
+      "enumValues": ["专业友好", "活泼有趣", "正式严肃", "亲切温暖", "幽默轻松"]
+    },
+    {
+      "id": "param-7",
+      "name": "wordLimit",
+      "label": "字数限制",
+      "type": "number",
+      "description": "文案的字数限制",
+      "defaultValue": "200",
+      "isRequired": false
+    }
+  ]
+}

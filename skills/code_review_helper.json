@@ -1,0 +1,47 @@
+{
+  "id": "code_review_helper",
+  "name": "代码审查助手",
+  "version": "1.0.0",
+  "description": "智能代码审查，自动发现潜在问题和优化建议",
+  "author": "LumenAI Team",
+  "category": "coding",
+  "tags": ["代码审查", "最佳实践", "安全"],
+  "icon": "chevron.left.forwardslash.chevron.right",
+  "color": "#007AFF",
+  "minAppVersion": "0.3.77",
+  "isBuiltIn": false,
+  "isEnabled": true,
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-01T00:00:00Z",
+  "useCount": 0,
+  "promptTemplate": "请作为一名资深代码审查专家，审查以下代码：\n\n{{language}} 语言的代码：\n```{{language}}\n{{code}}\n```\n\n审查重点：\n1. 代码质量和可读性\n2. 潜在的 bug 和安全问题\n3. 性能优化建议\n4. 最佳实践遵循情况\n5. {{focusArea}}\n\n请提供详细的审查报告，包含问题等级（严重/中等/轻微）和具体的改进建议。",
+  "parameters": [
+    {
+      "id": "param-1",
+      "name": "language",
+      "label": "编程语言",
+      "type": "string",
+      "description": "代码使用的编程语言",
+      "defaultValue": "Swift",
+      "isRequired": true
+    },
+    {
+      "id": "param-2",
+      "name": "code",
+      "label": "待审查代码",
+      "type": "multiline",
+      "description": "需要审查的代码内容",
+      "isRequired": true
+    },
+    {
+      "id": "param-3",
+      "name": "focusArea",
+      "label": "重点关注区域",
+      "type": "select",
+      "description": "特别关注的代码区域",
+      "defaultValue": "整体",
+      "isRequired": false,
+      "enumValues": ["整体", "性能", "安全性", "可维护性", "代码规范"]
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "id": "writing_assistant",
+  "name": "写作助手",
+  "version": "1.0.0",
+  "description": "多风格写作模板，支持公文、邮件、演讲稿等多种格式",
+  "author": "LumenAI Team",
+  "category": "writing",
+  "tags": ["写作", "公文", "邮件"],
+  "icon": "pencil.and.outline",
+  "color": "#34C759",
+  "minAppVersion": "0.3.77",
+  "isBuiltIn": false,
+  "isEnabled": true,
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-01T00:00:00Z",
+  "useCount": 0,
+  "promptTemplate": "请根据以下要求生成{{documentType}}：\n\n主题：{{topic}}\n\n目标读者：{{audience}}\n\n语气风格：{{tone}}\n\n主要内容要点：\n{{keyPoints}}\n\n要求：\n- 字数约{{wordCount}}字\n- 采用{{format}}格式\n- {{specialRequirements}}\n\n请确保内容专业、清晰、有条理。",
+  "parameters": [
+    {
+      "id": "param-1",
+      "name": "documentType",
+      "label": "文档类型",
+      "type": "select",
+      "description": "需要生成的文档类型",
+      "defaultValue": "邮件",
+      "isRequired": true,
+      "enumValues": ["邮件", "公文", "报告", "演讲稿", "提案", "总结"]
+    },
+    {
+      "id": "param-2",
+      "name": "topic",
+      "label": "主题",
+      "type": "string",
+      "description": "文档的主题或标题",
+      "isRequired": true
+    },
+    {
+      "id": "param-3",
+      "name": "audience",
+      "label": "目标读者",
+      "type": "string",
+      "description": "文档的阅读对象",
+      "defaultValue": "通用",
+      "isRequired": false
+    },
+    {
+      "id": "param-4",
+      "name": "tone",
+      "label": "语气风格",
+      "type": "select",
+      "description": "文本的语气风格",
+      "defaultValue": "正式",
+      "isRequired": false,
+      "enumValues": ["正式", "友好", "专业", "幽默", "说服性"]
+    },
+    {
+      "id": "param-5",
+      "name": "keyPoints",
+      "label": "主要内容要点",
+      "type": "multiline",
+      "description": "需要包含的关键点和信息",
+      "isRequired": true
+    },
+    {
+      "id": "param-6",
+      "name": "wordCount",
+      "label": "目标字数",
+      "type": "number",
+      "description": "大约字数要求",
+      "defaultValue": "500",
+      "isRequired": false
+    }
+  ]
+}

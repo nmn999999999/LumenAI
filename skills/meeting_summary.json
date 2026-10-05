@@ -1,0 +1,71 @@
+{
+  "id": "meeting_summary",
+  "name": "会议纪要生成器",
+  "version": "1.0.0",
+  "description": "自动生成结构化会议纪要，包含行动项和后续计划",
+  "author": "LumenAI Team",
+  "category": "productivity",
+  "tags": ["会议", "纪要", "行动项"],
+  "icon": "doc.text.fill",
+  "color": "#5856D6",
+  "minAppVersion": "0.3.77",
+  "isBuiltIn": false,
+  "isEnabled": true,
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-01T00:00:00Z",
+  "useCount": 0,
+  "promptTemplate": "请根据以下会议记录生成结构化会议纪要：\n\n会议信息：\n- 会议主题：{{meetingTopic}}\n- 会议时间：{{meetingTime}}\n- 参会人员：{{attendees}}\n- 会议类型：{{meetingType}}\n\n会议记录：\n{{meetingNotes}}\n\n请生成包含以下内容的会议纪要：\n1. 会议概述\n2. 讨论要点总结\n3. 决策和共识\n4. 行动项（负责人、截止日期、优先级）\n5. 后续跟进事项\n\n格式要求：{{formatRequirement}}",
+  "parameters": [
+    {
+      "id": "param-1",
+      "name": "meetingTopic",
+      "label": "会议主题",
+      "type": "string",
+      "description": "会议的主要主题",
+      "isRequired": true
+    },
+    {
+      "id": "param-2",
+      "name": "meetingTime",
+      "label": "会议时间",
+      "type": "string",
+      "description": "会议召开的时间",
+      "isRequired": true
+    },
+    {
+      "id": "param-3",
+      "name": "attendees",
+      "label": "参会人员",
+      "type": "multiline",
+      "description": "参会人员名单",
+      "isRequired": true
+    },
+    {
+      "id": "param-4",
+      "name": "meetingType",
+      "label": "会议类型",
+      "type": "select",
+      "description": "会议的性质",
+      "defaultValue": "例会",
+      "isRequired": false,
+      "enumValues": ["例会", "项目评审", "战略讨论", "客户会议", "培训", "其他"]
+    },
+    {
+      "id": "param-5",
+      "name": "meetingNotes",
+      "label": "会议记录",
+      "type": "multiline",
+      "description": "会议讨论的详细记录",
+      "isRequired": true
+    },
+    {
+      "id": "param-6",
+      "name": "formatRequirement",
+      "label": "格式要求",
+      "type": "string",
+      "description": "输出格式的特殊要求",
+      "defaultValue": "标准格式",
+      "isRequired": false
+    }
+  ]
+}

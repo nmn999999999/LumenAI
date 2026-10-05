@@ -1,0 +1,100 @@
+{
+  "skills": [
+    {
+      "id": "code_review_helper",
+      "name": "代码审查助手",
+      "version": "1.0.0",
+      "description": "智能代码审查，自动发现潜在问题和优化建议",
+      "author": "LumenAI Team",
+      "category": "coding",
+      "tags": ["代码审查", "最佳实践", "安全"],
+      "icon": "chevron.left.forwardslash.chevron.right",
+      "color": "#007AFF",
+      "minAppVersion": "0.3.77",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": {
+        "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/skills/code_review_helper.json"
+      }
+    },
+    {
+      "id": "writing_assistant",
+      "name": "写作助手",
+      "version": "1.0.0",
+      "description": "多风格写作模板，支持公文、邮件、演讲稿等多种格式",
+      "author": "LumenAI Team",
+      "category": "writing",
+      "tags": ["写作", "公文", "邮件"],
+      "icon": "pencil.and.outline",
+      "color": "#34C759",
+      "minAppVersion": "0.3.77",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": {
+        "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/skills/writing_assistant.json"
+      }
+    },
+    {
+      "id": "data_analysis_expert",
+      "name": "数据分析专家",
+      "version": "1.0.0",
+      "description": "快速数据分析，生成统计报告和可视化建议",
+      "author": "LumenAI Team",
+      "category": "analysis",
+      "tags": ["数据分析", "统计", "报告"],
+      "icon": "chart.bar.doc.horizontal",
+      "color": "#FF9500",
+      "minAppVersion": "0.3.77",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": {
+        "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/skills/data_analysis_expert.json"
+      }
+    },
+    {
+      "id": "meeting_summary",
+      "name": "会议纪要生成器",
+      "version": "1.0.0",
+      "description": "自动生成结构化会议纪要，包含行动项和后续计划",
+      "author": "LumenAI Team",
+      "category": "productivity",
+      "tags": ["会议", "纪要", "行动项"],
+      "icon": "doc.text.fill",
+      "color": "#5856D6",
+      "minAppVersion": "0.3.77",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": {
+        "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/skills/meeting_summary.json"
+      }
+    },
+    {
+      "id": "study_plan_generator",
+      "name": "学习计划生成器",
+      "version": "1.0.0",
+      "description": "个性化学习计划，按目标生成可执行的学习路径",
+      "author": "LumenAI Team",
+      "category": "learning",
+      "tags": ["学习", "计划", "教育"],
+      "icon": "graduationcap.fill",
+      "color": "#AF52DE",
+      "minAppVersion": "0.3.77",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": {
+        "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/skills/study_plan_generator.json"
+      }
+    },
+    {
+      "id": "social_media_copy",
+      "name": "社交媒体文案",
+      "version": "1.0.0",
+      "description": "适配不同平台的社交媒体文案，自动优化标签和格式",
+      "author": "LumenAI Team",
+      "category": "creative",
+      "tags": ["社交媒体", "营销", "文案"],
+      "icon": "paintbrush.fill",
+      "color": "#FF2D55",
+      "minAppVersion": "0.3.77",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": {
+        "manifest": "https://raw.githubusercontent.com/nmn999999999/LumenAI/main/skills/social_media_copy.json"
+      }
+    }
+  ]
+}

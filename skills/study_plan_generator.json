@@ -1,0 +1,74 @@
+{
+  "id": "study_plan_generator",
+  "name": "学习计划生成器",
+  "version": "1.0.0",
+  "description": "个性化学习计划，按目标生成可执行的学习路径",
+  "author": "LumenAI Team",
+  "category": "learning",
+  "tags": ["学习", "计划", "教育"],
+  "icon": "graduationcap.fill",
+  "color": "#AF52DE",
+  "minAppVersion": "0.3.77",
+  "isBuiltIn": false,
+  "isEnabled": true,
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-01T00:00:00Z",
+  "useCount": 0,
+  "promptTemplate": "请为{{learnerType}}生成个性化学习计划：\n\n学习目标：{{learningGoal}}\n\n当前水平：{{currentLevel}}\n\n可用时间：每周{{weeklyHours}}小时，持续{{duration}}\n\n学习偏好：{{learningStyle}}\n\n特殊要求：{{specialRequirements}}\n\n请提供：\n1. 学习路径大纲（按阶段划分）\n2. 详细的学习任务分解\n3. 每周/每日学习安排\n4. 学习资源推荐\n5. 进度跟踪和评估方法\n6. 常见问题和解决方案",
+  "parameters": [
+    {
+      "id": "param-1",
+      "name": "learnerType",
+      "label": "学习者类型",
+      "type": "string",
+      "description": "学习者的身份或背景",
+      "defaultValue": "成人学习者",
+      "isRequired": true
+    },
+    {
+      "id": "param-2",
+      "name": "learningGoal",
+      "label": "学习目标",
+      "type": "string",
+      "description": "具体的学习目标和期望达到的能力",
+      "isRequired": true
+    },
+    {
+      "id": "param-3",
+      "name": "currentLevel",
+      "label": "当前水平",
+      "type": "string",
+      "description": "学习者在该领域的当前水平",
+      "defaultValue": "初学者",
+      "isRequired": false
+    },
+    {
+      "id": "param-4",
+      "name": "weeklyHours",
+      "label": "每周学习时间（小时）",
+      "type": "number",
+      "description": "每周可投入的学习时间",
+      "defaultValue": "10",
+      "isRequired": true
+    },
+    {
+      "id": "param-5",
+      "name": "duration",
+      "label": "学习周期",
+      "type": "select",
+      "description": "总的学习时间",
+      "defaultValue": "3个月",
+      "isRequired": false,
+      "enumValues": ["1个月", "3个月", "6个月", "1年", "长期"]
+    },
+    {
+      "id": "param-6",
+      "name": "learningStyle",
+      "label": "学习偏好",
+      "type": "string",
+      "description": "偏好的学习方式",
+      "defaultValue": "理论结合实践",
+      "isRequired": false
+    }
+  ]
+}

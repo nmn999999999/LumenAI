@@ -1,0 +1,54 @@
+{
+  "id": "data_analysis_expert",
+  "name": "数据分析专家",
+  "version": "1.0.0",
+  "description": "快速数据分析，生成统计报告和可视化建议",
+  "author": "LumenAI Team",
+  "category": "analysis",
+  "tags": ["数据分析", "统计", "报告"],
+  "icon": "chart.bar.doc.horizontal",
+  "color": "#FF9500",
+  "minAppVersion": "0.3.77",
+  "isBuiltIn": false,
+  "isEnabled": true,
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-01T00:00:00Z",
+  "useCount": 0,
+  "promptTemplate": "请分析以下数据并生成分析报告：\n\n数据来源：{{dataSource}}\n\n数据描述：{{dataDescription}}\n\n分析目的：{{analysisPurpose}}\n\n请完成以下分析任务：\n1. 数据概况统计\n2. 关键指标分析\n3. 异常值检测\n4. 趋势和模式识别\n5. {{analysisDepth}}的深入分析\n\n请提供：\n- 总结性洞察\n- 统计指标和可视化建议\n- 业务建议\n- 后续行动建议",
+  "parameters": [
+    {
+      "id": "param-1",
+      "name": "dataSource",
+      "label": "数据来源",
+      "type": "string",
+      "description": "数据的来源或收集方式",
+      "isRequired": true
+    },
+    {
+      "id": "param-2",
+      "name": "dataDescription",
+      "label": "数据描述",
+      "type": "multiline",
+      "description": "数据的具体内容或示例",
+      "isRequired": true
+    },
+    {
+      "id": "param-3",
+      "name": "analysisPurpose",
+      "label": "分析目的",
+      "type": "string",
+      "description": "进行数据分析的具体目的",
+      "isRequired": true
+    },
+    {
+      "id": "param-4",
+      "name": "analysisDepth",
+      "label": "分析深度",
+      "type": "select",
+      "description": "期望的分析深度",
+      "defaultValue": "中级",
+      "isRequired": false,
+      "enumValues": ["基础", "中级", "高级", "专家级"]
+    }
+  ]
+}
