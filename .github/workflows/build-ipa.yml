@@ -1,33 +1,60 @@
 # ============================================================
-# LocalAI — 云端 IPA 构建工作流（由 Windows 触发）
+# LumenAI — 云端 IPA 构建工作流
 #
 # 用法：
-#   1. 将本仓库推送到 GitHub（公开仓库免费额度无限）
+#   1. 先把三个 xcframework 打包上传到一个 Release（见下方「框架包」）
 #   2. Actions 页 → Build IPA → Run workflow
-#   3. 完成后在 Artifacts 下载 localai-unsigned.ipa
-#   4. Windows 上用 Sideloadly / AltServer 对该 IPA 签名并安装
+#   3. 完成后在 Artifacts 下载 LumenAI-unsigned.ipa
+#   4. 用 Sideloadly / AltStore 对该 IPA 自签并安装
 #
-# 可选自动签名：配置仓库 Secrets
+# 可选自动签名：配置仓库 Secrets（四个都给才会产出 signed 包）
 #   P12_BASE64              证书 p12 的 base64（base64 -w0 cert.p12）
 #   P12_PASSWORD            证书密码
 #   MOBILEPROVISION_BASE64  描述文件 base64
 #   SIGN_IDENTITY           如 "Apple Distribution: Your Name (TEAMID)"
-# 配置后工作流会额外产出 localai-signed.ipa，可直接安装。
+#
+# ── 框架包（本工作流成立的前提）────────────────────────────
+# 仓库里**没有** llama / ssh / SherpaOnnxC 三个 xcframework（.gitignore 掉了，
+# 它们是本地交叉编译产物，见 build_llama_xcframework.sh）。CI checkout 后一个都没有，
+# 直接编译必然失败 —— 这就是之前 push 触发"30 秒必挂"的原因。
+#
+# 所以本工作流第一步会从 Release 拉一个框架包再解压到仓库根目录。
+# 在本地有这三个框架的机器上（仓库根目录）执行：
+#
+#   tar -czf ios-frameworks.tar.gz llama.xcframework ssh.xcframework SherpaOnnxC.xcframework
+#   gh release create ios-frameworks --title "iOS Frameworks" \
+#     --notes "CI 构建依赖的 xcframework（llama/ssh/SherpaOnnxC）" ios-frameworks.tar.gz
+#
+# 之后（更新框架时换 tag 或 --clobber 重传）：
+#   gh release upload ios-frameworks ios-frameworks.tar.gz --clobber
+#
+# tag / 资产名可在 Run workflow 时改，默认 ios-frameworks / ios-frameworks.tar.gz。
 # ============================================================
 
 name: Build IPA
 
 # 触发方式：**仅手动**。
 #
-# 原来还有 push 触发，但它必然失败 —— 三个 xcframework（llama / ssh / SherpaOnnxC）
-# 都不在 git 里（.gitignore 掉了，由本地脚本重建），CI checkout 后一个框架都没有；
-# 加上 workflow 里的工程名还是过期的 `LocalAI.xcodeproj`（实际是 LumenAI）。
-# 实测：9-6、9-12 与本日的推送全部 30 秒内失败。本项目走**本地构建**。
-# 若要恢复 push 触发，把下面两行加回来即可：
-#   push:
-#     branches: [main]
+# 为什么不做 push 触发：本工程依赖三个不在 git 里的 xcframework，历史上 push 触发
+# （9-6、9-12 等）全部在 30 秒内失败。现在框架由下面的拉取步骤提供，技术上可以恢复
+# push 触发，但没必要每次 push 都烧一遍 macOS 额度 —— 需要出包时手动跑即可。
+# 若要恢复：取消下面 push 段的注释。
 on:
   workflow_dispatch:
+    inputs:
+      frameworks_tag:
+        description: "框架包所在的 Release tag"
+        required: false
+        default: ios-frameworks
+      frameworks_asset:
+        description: "框架包资产名"
+        required: false
+        default: ios-frameworks.tar.gz
+  # push:
+  #   branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -39,7 +66,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 选择镜像上最新的 Xcode（需 ≥ 26 以支持 Liquid Glass API）
+      # 选择镜像上最新的 Xcode（需 ≥ 26 以支持 Liquid Glass / Icon Composer）
       - name: Select latest Xcode
         run: |
           ls /Applications | grep Xcode || true
@@ -49,24 +76,70 @@ jobs:
           xcodebuild -version
           swift --version
 
-      # 由 project.yml 生成 .xcodeproj（内含 LLM.swift SPM 依赖声明）
+      # 拉取并解压框架包到仓库根目录（project.yml 按 $(SRCROOT)/*.xcframework 引用）。
+      # 必须在 xcodegen generate **之前**：XcodeGen 会校验 framework 路径是否存在。
+      - name: Fetch iOS frameworks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FW_TAG: ${{ inputs.frameworks_tag }}
+          FW_ASSET: ${{ inputs.frameworks_asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fw
+          if ! gh release download "$FW_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$FW_ASSET" \
+                --dir /tmp/fw --clobber; then
+            echo "::error::拉取框架包失败：tag=$FW_TAG asset=$FW_ASSET。"
+            echo "::error::请先按工作流头部注释，把 llama/ssh/SherpaOnnxC 打成 $FW_ASSET 传到该 Release。"
+            exit 1
+          fi
+          tar -xzf "/tmp/fw/$FW_ASSET" -C "$GITHUB_WORKSPACE"
+
+          # 容错：若资产里包了一层目录导致没落在根上，就地找出来搬平。
+          for fw in llama.xcframework ssh.xcframework SherpaOnnxC.xcframework; do
+            if [ ! -d "$GITHUB_WORKSPACE/$fw" ]; then
+              hit=$(find "$GITHUB_WORKSPACE" -maxdepth 3 -type d -name "$fw" | head -1 || true)
+              if [ -n "$hit" ]; then
+                echo "搬运 $hit -> $GITHUB_WORKSPACE/$fw"
+                mv "$hit" "$GITHUB_WORKSPACE/$fw"
+              fi
+            fi
+          done
+
+          missing=0
+          for fw in llama.xcframework ssh.xcframework SherpaOnnxC.xcframework; do
+            if [ -d "$GITHUB_WORKSPACE/$fw" ]; then
+              echo "✅ $fw  $(du -sh "$GITHUB_WORKSPACE/$fw" | cut -f1)"
+            else
+              echo "::error::框架包解压后仍缺少 $fw"
+              missing=1
+            fi
+          done
+          [ "$missing" = "0" ] || exit 1
+
+      # 由 project.yml 生成 .xcodeproj（内含 SPM 依赖声明）。
+      # 注意：工程名是 LumenAI（不是历史遗留的 LocalAI）。
       - name: Generate Xcode project
         run: |
           brew install xcodegen
           xcodegen generate
+          ls -d LumenAI.xcodeproj
 
       - name: Resolve SPM dependencies
         run: |
           xcodebuild -resolvePackageDependencies \
-            -project LocalAI.xcodeproj
+            -project LumenAI.xcodeproj
 
-      # 无证书编译真机包（未签名 .app）
+      # 无证书编译真机包（未签名 .app）。
+      # speech-swift 的 4-bit 放行补丁由 scheme 的 preAction 自动执行（见 project.yml），
+      # 这里不需要单独跑。
       - name: Build (unsigned, device)
         run: |
           set -o pipefail
           xcodebuild \
-            -project LocalAI.xcodeproj \
-            -scheme LocalAI \
+            -project LumenAI.xcodeproj \
+            -scheme LumenAI \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
@@ -106,7 +179,7 @@ jobs:
           SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
           PROFILE_B64: ${{ secrets.MOBILEPROVISION_BASE64 }}
         run: |
-          APP="build/Build/Products/Release-iphoneos/LocalAI.app"
+          APP="build/Build/Products/Release-iphoneos/LumenAI.app"
           echo "$PROFILE_B64" | base64 --decode > /tmp/app.mobileprovision
           cp /tmp/app.mobileprovision "$APP/embedded.mobileprovision"
           codesign --force --options runtime \
@@ -120,8 +193,8 @@ jobs:
         run: |
           rm -rf Payload
           mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/LocalAI.app Payload/
-          zip -qry localai-signed.ipa Payload
+          cp -R build/Build/Products/Release-iphoneos/LumenAI.app Payload/
+          zip -qry LumenAI-signed.ipa Payload
           rm -rf Payload
 
       # ---------- 未签名产物（供 Sideloadly / AltStore 签名）----------
@@ -129,16 +202,16 @@ jobs:
         run: |
           rm -rf Payload
           mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/LocalAI.app Payload/
-          zip -qry localai-unsigned.ipa Payload
+          cp -R build/Build/Products/Release-iphoneos/LumenAI.app Payload/
+          zip -qry LumenAI-unsigned.ipa Payload
           rm -rf Payload
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: localai-ipa
+          name: LumenAI-ipa
           path: |
-            localai-unsigned.ipa
-            localai-signed.ipa
+            LumenAI-unsigned.ipa
+            LumenAI-signed.ipa
           if-no-files-found: ignore
           retention-days: 14
