@@ -203,21 +203,28 @@ jobs:
       # 无证书编译真机包（未签名 .app）。
       # speech-swift 的 4-bit 放行补丁由 scheme 的 preAction 自动执行（见 project.yml），
       # 这里不需要单独跑。
+      #
+      # 一次跑**两个变体**：合规版（Release）与自签增强版（ReleaseTap，多一个 SIMULATE_TAP）。
+      # 两个变体共用同一个 derivedDataPath —— SPM 依赖只解析一次，
+      # 产物按配置名分目录（Release-iphoneos / ReleaseTap-iphoneos），互不覆盖。
       - name: Build (unsigned, device)
         run: |
           set -o pipefail
-          xcodebuild \
-            -project LumenAI.xcodeproj \
-            -scheme LumenAI \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            -skipMacroValidation \
+          COMMON=(
+            -project LumenAI.xcodeproj
+            -destination 'generic/platform=iOS'
+            -derivedDataPath build
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+            COMPILER_INDEX_STORE_ENABLE=NO
+            -skipMacroValidation
             -skipPackagePluginValidation
+          )
+          echo "=== 变体 1/2：合规版 (LumenAI / Release) ==="
+          xcodebuild -scheme LumenAI -configuration Release "${COMMON[@]}"
+          echo "=== 变体 2/2：Tap 版 (LumenAI-Tap / ReleaseTap) ==="
+          xcodebuild -scheme LumenAI-Tap -configuration ReleaseTap "${COMMON[@]}"
 
       # 检测是否配置了签名 Secrets
       - name: Check signing availability
@@ -249,39 +256,57 @@ jobs:
           SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
           PROFILE_B64: ${{ secrets.MOBILEPROVISION_BASE64 }}
         run: |
-          APP="build/Build/Products/Release-iphoneos/LumenAI.app"
           echo "$PROFILE_B64" | base64 --decode > /tmp/app.mobileprovision
-          cp /tmp/app.mobileprovision "$APP/embedded.mobileprovision"
-          codesign --force --options runtime \
-            --sign "$SIGN_IDENTITY" \
-            --timestamp \
-            "$APP"
-          codesign --verify --strict "$APP" && echo "✅ 签名校验通过"
+          for CFG in Release ReleaseTap; do
+            APP="build/Build/Products/${CFG}-iphoneos/LumenAI.app"
+            cp /tmp/app.mobileprovision "$APP/embedded.mobileprovision"
+            codesign --force --options runtime \
+              --sign "$SIGN_IDENTITY" \
+              --timestamp \
+              "$APP"
+            codesign --verify --strict "$APP" && echo "✅ ${CFG} 签名校验通过"
+          done
 
       - name: Package signed IPA
         if: steps.signcheck.outputs.signed == 'true'
         run: |
-          rm -rf Payload
-          mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/LumenAI.app Payload/
-          zip -qry LumenAI-signed.ipa Payload
-          rm -rf Payload
+          for CFG in Release ReleaseTap; do
+            NAME=$([ "$CFG" = "ReleaseTap" ] && echo LumenAI-Tap || echo LumenAI)
+            rm -rf Payload && mkdir Payload
+            cp -R "build/Build/Products/${CFG}-iphoneos/LumenAI.app" Payload/
+            zip -qry "${NAME}-signed.ipa" Payload
+            rm -rf Payload
+          done
 
       # ---------- 未签名产物（供 Sideloadly / AltStore 签名）----------
       - name: Package unsigned IPA
         run: |
-          rm -rf Payload
-          mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/LumenAI.app Payload/
-          zip -qry LumenAI-unsigned.ipa Payload
-          rm -rf Payload
+          for CFG in Release ReleaseTap; do
+            NAME=$([ "$CFG" = "ReleaseTap" ] && echo LumenAI-Tap || echo LumenAI)
+            rm -rf Payload && mkdir Payload
+            cp -R "build/Build/Products/${CFG}-iphoneos/LumenAI.app" Payload/
+            zip -qry "${NAME}-unsigned.ipa" Payload
+            rm -rf Payload
+          done
+          ls -la *.ipa
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: LumenAI-ipa
+          name: LumenAI-compliant
           path: |
             LumenAI-unsigned.ipa
             LumenAI-signed.ipa
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # 自签增强版单独一个 artifact，免得和上架版混在一起被误传 App Store。
+      - name: Upload artifacts (Tap)
+        uses: actions/upload-artifact@v4
+        with:
+          name: LumenAI-Tap
+          path: |
+            LumenAI-Tap-unsigned.ipa
+            LumenAI-Tap-signed.ipa
           if-no-files-found: ignore
           retention-days: 14
