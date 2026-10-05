@@ -121,6 +121,19 @@ final class AgentService: ObservableObject {
                          + " Do not promise to remember anything; say it must be enabled in Settings first.")
         }
 
+        // 内置 git（跑在 shell 里）。必须点名两件事，否则模型会走向两个相反的错：
+        //   · "iPhone 上没有 git" → 直接放弃版本管理，哪怕用户明确要求提交；
+        //   · 拿真 git 的完整子命令去试（push / merge / git config）→ 反复失败还找不到原因。
+        // 所以能力边界（有哪几个子命令、对象格式是真 git 兼容、没有远端操作）写在同一条里。
+        if tools.contains(where: { $0.name == "shell" }) {
+            lines.append("- Version control: `shell` includes a built-in `git` subset"
+                         + " (init/add/status/commit/log/diff/show/branch/checkout/rev-parse"
+                         + " cat-file). Repositories are **real git compatible** (objects, index,"
+                         + " refs), but there is no network side: no push/pull/fetch/merge/rebase,"
+                         + " and no `git config`/`git --version`. Tell the user plainly when they"
+                         + " ask for a remote operation.")
+        }
+
         // 用户文件工作区。为什么值得单列一条：它是**唯一**能让模型"动手改东西"的地方，
         // 而模型对它的默认假设是错的 —— 它会以为自己在通用文件系统上（写 `/tmp/x.txt`、
         // 读 `~/Documents/...`），于是列出不存在的路径、或者干脆声称改好了。

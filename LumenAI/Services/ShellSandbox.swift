@@ -4,7 +4,7 @@ import Foundation
 /// 不依赖真实 `/bin/sh` —— iOS 没有 shell 二进制可调用。本沙箱:
 /// - 解析简单 shell 命令(支持 `;` 串联 / `|` 管道 / `>` `>>` 重定向 / `&&` `||` 链)
 /// - 路径解析限定在 `appHome/shellbox/` 子树下,任何命令访问越界路径一律转回沙箱根
-/// - 内置 18 个核心命令(文件/文本/系统)
+/// - 内置 19 个核心命令(文件/文本/系统),外加内置纯 Swift `git` 子集(见 GitLite/)
 /// - 通配符 `*` `?` 在参数展开时支持
 ///
 /// 用法:`ShellSandbox.run("ls -l *.txt | head -5")` 即可串起命令链。
@@ -446,12 +446,27 @@ enum ShellSandbox {
         case "dirname":  return dirnameCmd(args)
         case "du":       return duCmd(args)
         case "lz4":      return lz4Cmd(args, stdin: stdin)
+        case "git":      return gitCmd(args)
         case "clear":    return ("", 0)
         case "help", "--help", "-h":
             return (helpText(), 0)
         default:
             return ("未知命令: \(cmd)\n(输入 help 查看支持列表)\n", 127)
         }
+    }
+
+    // MARK: - git (内置纯 Swift git 子集)
+
+    /// `git` 子命令入口。
+    ///
+    /// 为什么不调系统 git：iOS 上**没有** `git` 二进制，`posix_spawn` 也拿不到可执行文件，
+    /// 所以只能内置实现。业务逻辑全在 `GitLite`（GitRepo / GitLiteShell），
+    /// 那边不依赖本文件，可以单独拎出来用真 `git fsck` 做格式一致性验证。
+    ///
+    /// 路径解析复用 `resolvePath`（同一套 `~` / 相对路径 / 越界回退规则），
+    /// 这样 `git add ~/x` 与 `cat ~/x` 的行为完全一致，不会出现"shell 认得、git 不认得"。
+    private static func gitCmd(_ args: [String]) -> (text: String, exitCode: Int) {
+        GitLiteShell.run(args: args, cwd: cwd, resolve: { resolvePath($0) })
     }
 
     // MARK: - lz4 (LZ4 压缩/解压, 内置纯 Swift 块编解码器)
@@ -764,6 +779,19 @@ enum ShellSandbox {
           lz4 -c/-d <src> [dst]   LZ4 压缩/解压(内置纯 Swift 实现)
           lz4 -i                  内存压缩演示 / lz4 -v <file> 压缩统计
           help                    本帮助
+
+        git (内置纯 Swift 子集, 对象/索引格式与真实 git 一致):
+          git init [路径]           新建仓库
+          git add <path...>         暂存(-A 全部)
+          git status                工作区/暂存区状态
+          git commit -m <信息>      提交(首次前先 add)
+          git log [-n N|--oneline]  提交历史
+          git diff [--cached]       改动对比
+          git show [rev]            查看提交
+          git branch [名字]         分支列表/新建
+          git checkout <分支>       切换(-b 新建)
+          详见: git help
+          ⚠ 无 push/pull/fetch/merge/rebase(需要远端与进程)
 
         语法:
           ; 顺序执行  && 成功才继续  || 失败才继续
