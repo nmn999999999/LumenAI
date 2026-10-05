@@ -59,6 +59,12 @@ on:
 permissions:
   contents: read
 
+# 连续 push 时只保留最新一次构建：macOS runner 排队 + 编译各要十几分钟，
+# 旧提交那次已经没有产物价值，留着只是占队列。
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build & Package
@@ -114,6 +120,27 @@ jobs:
           swift --version
           echo "=== iphoneos SDK ==="
           xcodebuild -showsdks | grep -i iphoneos || true
+
+      # ── 跑构建前先过一遍代码检查 ──────────────────────────────
+      # 目的：把"秒级能发现的问题"挡在编译之前。整包编译要十几分钟，
+      # 若合并进来的分支带了语法残缺，等 build 步骤才报等于白等一轮。
+      #
+      # swiftc -parse 只做语法解析、**不做类型检查**，因此不需要 xcframework，
+      # 也不需要 SPM 包 —— 可以放在拉框架之前。类型/链接问题仍由下面的 build 步骤兜底。
+      - name: Pre-build code check
+        run: |
+          set -euo pipefail
+          COUNT=$(find LumenAI LumenAIWidget -name '*.swift' | wc -l | tr -d ' ')
+          echo "=== Swift 语法解析：$COUNT 个文件 ==="
+          find LumenAI LumenAIWidget -name '*.swift' -print0 \
+            | xargs -0 xcrun swiftc -parse
+          echo "✅ Swift 语法全部通过"
+
+          # project.yml 的 YAML 合法性：有 pyyaml 就提前校验（xcodegen 那步也会再校验一次），
+          # 没有就跳过 —— 它缺席不该让整个构建挂掉。
+          echo "=== project.yml YAML 校验 ==="
+          python3 -c "import yaml; yaml.safe_load(open('project.yml')); print('✅ project.yml YAML 合法')" \
+            || echo "::notice::跳过 project.yml YAML 校验（本机无 pyyaml）"
 
       # 拉取并解压框架包到仓库根目录（project.yml 按 $(SRCROOT)/*.xcframework 引用）。
       # 必须在 xcodegen generate **之前**：XcodeGen 会校验 framework 路径是否存在。
