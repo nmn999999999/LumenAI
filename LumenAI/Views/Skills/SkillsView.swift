@@ -254,7 +254,7 @@ struct FilteredSkillsView: View {
                             .frame(width: 44, height: 44)
                             .overlay(
                                 Image(systemName: skill.manifest.icon ?? skill.manifest.category.systemImage)
-                                    .foregroundStyle(.accent)
+                                    .foregroundStyle(Color.accentColor)
                             )
 
                         VStack(alignment: .leading, spacing: 4) {

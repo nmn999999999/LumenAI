@@ -5,6 +5,13 @@ struct SkillCreationView: View {
     enum Mode {
         case create
         case edit(SkillStore.InstalledSkill)
+
+        /// `InstalledSkill` 不是 Equatable，Mode 无法隐式合成 `==`；
+        /// 调用点要的只是"是不是新建"，用显式判断即可。
+        var isCreate: Bool {
+            if case .create = self { return true }
+            return false
+        }
     }
 
     let mode: Mode
@@ -23,7 +30,6 @@ struct SkillCreationView: View {
     @State private var showingParameterSheet = false
 
     @State private var toast: String?
-    @State private var showingToast = false
 
     init(mode: Mode = .create) {
         self.mode = mode
@@ -112,7 +118,7 @@ struct SkillCreationView: View {
                     }
                 }
             }
-            .navigationTitle(mode == .create ? "新建技能" : "编辑技能")
+            .navigationTitle(mode.isCreate ? "新建技能" : "编辑技能")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -130,7 +136,7 @@ struct SkillCreationView: View {
             .sheet(isPresented: $showingParameterSheet) {
                 ParameterEditView(parameters: $parameters)
             }
-            .toast(isPresented: $showingToast, message: toast ?? "")
+            .toast($toast)
         }
         .onAppear {
             if case .edit(let skill) = mode {
@@ -162,7 +168,7 @@ struct SkillCreationView: View {
 
     private func saveSkill() {
         let skillManifest = SkillManifest(
-            id: mode == .create ? UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(24).description : getExistingID(),
+            id: mode.isCreate ? UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(24).description : getExistingID(),
             name: name,
             version: "1.0.0",
             description: descriptionText,
@@ -176,14 +182,12 @@ struct SkillCreationView: View {
 
         do {
             try skillStore.save(skillManifest)
-            toast = "技能\(mode == .create ? "创建" : "更新")成功"
-            showingToast = true
+            toast = "技能\(mode.isCreate ? "创建" : "更新")成功"
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 dismiss()
             }
         } catch {
             toast = "保存失败: \(error.localizedDescription)"
-            showingToast = true
         }
     }
 
@@ -288,7 +292,7 @@ struct ParameterEditView: View {
                     editingParam = parameters.last
                 } label: {
                     Label("添加参数", systemImage: "plus")
-                        .foregroundStyle(.accent)
+                        .foregroundStyle(Color.accentColor)
                 }
             }
             .navigationTitle("管理参数")

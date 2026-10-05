@@ -43,7 +43,7 @@ struct SkillsMarketView: View {
             }
         }
         .searchable(text: $searchText, prompt: "搜索技能")
-        .toast(message: toast)
+        .toast($toast)
         .task {
             if skillStore.remoteIndex.isEmpty {
                 await skillStore.checkForUpdates()
@@ -89,7 +89,7 @@ struct SkillsMarketView: View {
                 } label: {
                     Text("查看全部技能")
                         .font(.subheadline)
-                        .foregroundStyle(.accent)
+                        .foregroundStyle(Color.accentColor)
                         .frame(maxWidth: .infinity)
                         .padding()
                 }
@@ -220,7 +220,7 @@ struct MarketSkillCard: View {
                         .frame(width: 36, height: 36)
                         .overlay(
                             Image(systemName: update.entry.icon ?? update.entry.category.systemImage)
-                                .foregroundStyle(.accent)
+                                .foregroundStyle(Color.accentColor)
                         )
                     Spacer()
                     if installingID == update.id {
@@ -275,7 +275,7 @@ struct MarketSkillRow: View {
                     .frame(width: 48, height: 48)
                     .overlay(
                         Image(systemName: update.entry.icon ?? update.entry.category.systemImage)
-                            .foregroundStyle(.accent)
+                            .foregroundStyle(Color.accentColor)
                     )
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -329,7 +329,7 @@ struct CategoryCard: View {
             VStack(spacing: 8) {
                 Image(systemName: category.systemImage)
                     .font(.system(size: 28))
-                    .foregroundStyle(.accent)
+                    .foregroundStyle(Color.accentColor)
                 Text(category.displayName)
                     .font(.caption)
                     .fontWeight(.medium)
@@ -355,7 +355,7 @@ struct InstalledSkillRow: View {
                     .frame(width: 48, height: 48)
                     .overlay(
                         Image(systemName: skill.manifest.icon ?? skill.manifest.category.systemImage)
-                            .foregroundStyle(.accent)
+                            .foregroundStyle(Color.accentColor)
                     )
 
                 VStack(alignment: .leading, spacing: 4) {

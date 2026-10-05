@@ -430,9 +430,3 @@ final class SkillStore: ObservableObject {
         }.map { $0.manifest }
     }
 }
-
-// MARK: - 远程索引模型
-
-struct SkillIndex: Codable, Sendable {
-    var skills: [SkillIndexEntry]
-}

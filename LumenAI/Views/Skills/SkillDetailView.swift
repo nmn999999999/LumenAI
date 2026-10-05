@@ -65,7 +65,7 @@ struct SkillDetailView: View {
                 applySkill(renderedPrompt)
             }
         }
-        .toast(message: toast)
+        .toast($toast)
     }
 
     // MARK: - 头部区域
@@ -78,7 +78,7 @@ struct SkillDetailView: View {
                 .overlay(
                     Image(systemName: skill.manifest.icon ?? skill.manifest.category.systemImage)
                         .font(.system(size: 36))
-                        .foregroundStyle(.accent)
+                        .foregroundStyle(Color.accentColor)
                 )
 
             Text(skill.manifest.author ?? "未知作者")
