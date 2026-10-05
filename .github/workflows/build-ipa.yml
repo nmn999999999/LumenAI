@@ -33,12 +33,14 @@
 
 name: Build IPA
 
-# 触发方式：**仅手动**。
+# 触发方式：手动 + push（main / trae 分支）。
 #
-# 为什么不做 push 触发：本工程依赖三个不在 git 里的 xcframework，历史上 push 触发
-# （9-6、9-12 等）全部在 30 秒内失败。现在框架由下面的拉取步骤提供，技术上可以恢复
-# push 触发，但没必要每次 push 都烧一遍 macOS 额度 —— 需要出包时手动跑即可。
-# 若要恢复：取消下面 push 段的注释。
+# 为什么恢复 push 触发：框架已由下面的拉取步骤提供，push 不再必然失败（历史上 8-30~9-30
+# 那些 push 触发全挂，是因为当时 checkout 后没有任何 xcframework）。
+# 另一个原因：手动 workflow_dispatch 要求 token 带 workflow scope，而该 scope 在本环境
+# 无法保持（gh auth refresh 拿到后会被重置，实测 dispatch 又变 403）；
+# push 事件由 Git 推送本身触发，不依赖任何 token scope，更可靠。
+# 公开仓库 Actions 分钟数免费，代价只是每次 push 跑一遍构建。
 on:
   workflow_dispatch:
     inputs:
@@ -50,8 +52,9 @@ on:
         description: "框架包资产名"
         required: false
         default: ios-frameworks.tar.gz
-  # push:
-  #   branches: [main]
+  push:
+    # 只跑 main 与 trae/* 分支，避免任何临时分支的推送都触发整包构建。
+    branches: [main, 'trae/**']
 
 permissions:
   contents: read
