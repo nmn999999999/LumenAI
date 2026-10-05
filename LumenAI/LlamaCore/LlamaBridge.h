@@ -36,6 +36,15 @@ const char * llama_bridge_last_error(llama_bridge * b);
 // Safe to call from any thread while llama_bridge_chat() is running.
 void llama_bridge_stop(llama_bridge * b);
 
+// Report the KV-cache reuse statistics of the most recent llama_bridge_chat().
+// *reused_tokens : prompt tokens served from the previous turn's KV prefix
+//                  (i.e. NOT re-decoded this turn).
+// *total_prompt_tokens : total prompt tokens of this turn.
+// Either out pointer may be NULL. Safe to call from any thread.
+void llama_bridge_last_kv_stats(llama_bridge * b,
+                                int * reused_tokens,
+                                int * total_prompt_tokens);
+
 // Run one chat turn.
 //   messages_json    : JSON array of {"role":"system"|"user"|"assistant"|"tool","content":"..."}
 //   settings_json    : {"temp":f,"top_k":i,"top_p":f,"max_tokens":i}

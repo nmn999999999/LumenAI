@@ -29,12 +29,19 @@ protocol LLMEngine: AnyObject, Sendable {
     var modelURL: URL { get }
     /// 该引擎是否具备图片理解能力（本地=加载了 mmproj 多模态投影器）。
     var supportsVision: Bool { get }
+    /// 最近一次生成的 KV-cache 前缀复用统计（本地 llama.cpp 才有；云端/演示为 nil）。
+    var lastKVCacheReuse: KVCacheReuseStats? { get }
     /// 流式生成。messages 为渲染好的对话；images 可为空（多模态时使用）。
     func stream(
         messages: [EngineMessage],
         settings: ModelSettings,
         images: [CGImage]
     ) -> AsyncThrowingStream<String, Error>
+}
+
+extension LLMEngine {
+    /// 默认无 KV 复用信息（演示引擎 / 未来的远端引擎）。
+    var lastKVCacheReuse: KVCacheReuseStats? { nil }
 }
 
 struct EngineMessage: Sendable {
@@ -88,6 +95,12 @@ final class LLMService: ObservableObject {
     var isApiMode: Bool {
         if case .apiMode = state { return true }
         return false
+    }
+
+    /// 最近一次生成的 KV-cache 前缀复用统计（仅本地引擎有值；云端为 nil）。
+    /// 供 Agent 性能观测读取 —— 前缀复用率是"每轮是否重算全部历史"的直接证据。
+    var lastKVCacheReuse: KVCacheReuseStats? {
+        engine?.lastKVCacheReuse
     }
 
     var loadedModelName: String? {

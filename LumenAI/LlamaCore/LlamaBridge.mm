@@ -52,6 +52,11 @@ struct llama_bridge {
     /// 有了它就能只解码"这次和上次不一样"的那一段。
     std::vector<llama_token> cached_tokens;
 
+    // 最近一次 prompt 解码的 KV 前缀复用统计（供上层 profiling 读取）。
+    // reused = 命中上一轮前缀、未重新解码的 token 数；total = 本轮 prompt token 总数。
+    int last_kv_reused = 0;
+    int last_kv_total  = 0;
+
     // 采样随机数生成器（跨 token 复用，避免每 token 重置种子导致采样可预测）
     std::mt19937 rng{std::random_device{}()};
 
@@ -210,6 +215,13 @@ const char * llama_bridge_last_error(llama_bridge * b) {
 
 void llama_bridge_stop(llama_bridge * b) {
     if (b) b->stop = true;
+}
+
+void llama_bridge_last_kv_stats(llama_bridge * b,
+                                int * reused_tokens,
+                                int * total_prompt_tokens) {
+    if (reused_tokens)       *reused_tokens = b ? b->last_kv_reused : 0;
+    if (total_prompt_tokens) *total_prompt_tokens = b ? b->last_kv_total : 0;
 }
 
 // ---- sampling (temperature + top-k + top-p) ----
@@ -426,6 +438,8 @@ int llama_bridge_chat(llama_bridge * b,
         // 硬做前缀复用会把图像特征的位置算错。这里求稳。
         llama_memory_clear(llama_get_memory(b->ctx), true);
         b->cached_tokens.clear();
+        b->last_kv_reused = 0;   // 多模态全量重编码：无前缀复用
+        b->last_kv_total  = 0;
         mtmd::bitmaps bitmaps;
         for (auto & p : img_paths) {
             auto res = mtmd_helper_bitmap_init_from_file(b->mctx, p.c_str(), false);
@@ -490,7 +504,9 @@ int llama_bridge_chat(llama_bridge * b,
     // ----- text-only path -----
     std::vector<llama_token> toks = common_tokenize(b->ctx, formatted, add_bos, true);
     // 护栏：prompt 的 token 数不得超过上下文窗口，否则 common_batch_add 越界触发 abort。
-    // 超出时丢弃最旧的 token、保留最近的上下文（本桥为无状态，每轮重编码完整历史）。
+    // 超出时丢弃最旧的 token、保留最近的上下文。
+    // 注意：这里是"**全量重编码 + 前缀复用**"两条路：前缀能复用时不会重编码历史，
+    // 只有前缀对不上（换会话 / 换工具集）或被护栏截断时才从头重算。
     if (b->n_ctx > 0 && (int)toks.size() > b->n_ctx) {
         toks.erase(toks.begin(), toks.end() - b->n_ctx);
     }
@@ -499,6 +515,19 @@ int llama_bridge_chat(llama_bridge * b,
     // 做法：求"这次 prompt"与"上次 prompt"的最长公共前缀 L，删掉 KV 里 L 之后的部分，
     // 只解码 `toks[L...]`（位置从 L 开始编号）。system 提示词 + 工具目录 + 已经
     // 对话过的历史都属于公共前缀 —— 它们**一次都不会被重算**。
+    //
+    // ── STATIC PREFIX / DYNAMIC CONTEXT 的布局约定（阶段 10）──
+    // 上层（AgentService.withToolInstructions）保证 prompt 的时间序布局为：
+    //   [STATIC] system（身份 / agent 协议 / 工具目录）→ [DYNAMIC] user → assistant/tool 历史
+    // 其中 STATIC 部分在一次 run 内保持逐字不变：
+    //   · 工具目录由 ToolRouter 选出，而选择只依赖"本轮用户请求 + 已用工具"；
+    //     已用工具必然是**已被暴露过**的工具（模型只能调用它看到的），
+    //     因此选择在 run 内自然收敛、不再变化 —— 不会因为"多调了一个工具"而每轮翻新前缀。
+    //   · 环境段只读设置真源，run 内不变。
+    // 结果：整个 STATIC PREFIX 天然落在公共前缀里，工具集变化不会让前缀整体失效。
+    // 唯一会改变 STATIC 的时机是 create_plugin 在本轮装出新工具（那本来就该刷新目录），
+    // 属于一次性失效，符合预期。
+    // 会话隔离仍由每个 session 独立的 bridge 实例保证（cached_tokens 是实例字段）。
     size_t lcp = 0;
     {
         llama_memory_t mem = llama_get_memory(b->ctx);
@@ -521,6 +550,9 @@ int llama_bridge_chat(llama_bridge * b,
         } else {
             llama_memory_clear(mem, true);
         }
+        // profiling：记录本轮前缀复用情况（即使解码失败也如实反映"本来能复用多少"）
+        b->last_kv_reused = (int)lcp;
+        b->last_kv_total  = (int)toks.size();
     }
     // ⚠️ 必须加锁：log_lines 会被另一个线程（取日志的 UI 路径）读取，
     // 裸 push_back 是数据竞争（本工程用 ThreadSanitizer 跑过，不留这种）。

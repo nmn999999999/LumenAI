@@ -14,6 +14,14 @@ final class LlamaSwiftEngine: LLMEngine, @unchecked Sendable {
     private var bridge: OpaquePointer?          // llama_bridge *
     private var lastError: String?
 
+    /// 最近一次生成的 KV 前缀复用统计（跨线程读：C 桥在后台线程写，profiling 在主 actor 读）。
+    private let kvStatsLock = NSLock()
+    private var _lastKVCacheReuse: KVCacheReuseStats?
+    var lastKVCacheReuse: KVCacheReuseStats? {
+        kvStatsLock.lock(); defer { kvStatsLock.unlock() }
+        return _lastKVCacheReuse
+    }
+
     // iOS 上 Metal 后端存在兼容性问题（解码失败/输出退化），默认纯 CPU 推理最稳定。
     // 需要加速可在「设置」里调高 GPU 层数。
     private let nGpuLayers: Int32
@@ -73,6 +81,12 @@ final class LlamaSwiftEngine: LLMEngine, @unchecked Sendable {
         Task.detached {
             llama_bridge_free(b)
         }
+    }
+
+    /// 记录本次生成的 KV 复用统计（线程安全）。
+    private func storeKVCacheReuse(reused: Int, total: Int) {
+        kvStatsLock.lock(); defer { kvStatsLock.unlock() }
+        _lastKVCacheReuse = KVCacheReuseStats(reusedTokens: reused, totalPromptTokens: total)
     }
 
     // 自动探测同目录下的 mmproj 文件
@@ -165,6 +179,11 @@ final class LlamaSwiftEngine: LLMEngine, @unchecked Sendable {
                 let fwd = Unmanaged<TokenForwarder>.fromOpaque(ud).takeUnretainedValue()
                 fwd.flush()
                 Unmanaged<TokenForwarder>.fromOpaque(ud).release()
+                // 采集本次生成的 KV 前缀复用统计（profiling 用；失败也不影响主流程）
+                var reused: Int32 = 0
+                var total: Int32 = 0
+                llama_bridge_last_kv_stats(b, &reused, &total)
+                self.storeKVCacheReuse(reused: Int(reused), total: Int(total))
                 if rc != 0 {
                     let err = String(cString: llama_bridge_last_error(b))
                     continuation.finish(throwing: LLMError.generationFailed(err))
