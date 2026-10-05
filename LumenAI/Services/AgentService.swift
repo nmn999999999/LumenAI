@@ -101,12 +101,25 @@ final class AgentService: ObservableObject {
                        + " web, and do not call web_search. If the task needs live information, say"
                        + " so and tell the user it can be enabled in Settings.")
 
-        // 长期记忆：note 是唯一接口
+        // 长期记忆：两条通道分工不同，必须说清楚 —— 模型最容易犯的错是
+        // "把长内容存进 memory"（那会每一轮都占上下文）和"以为自己失忆了"（没意识到已注入）。
+        let hasMemory = tools.contains { $0.name == "memory" }
         let hasNote = tools.contains { $0.name == "note" }
-        lines.append(hasNote
-                     ? "- Long-term memory: available via the `note` tool (shared across conversations)."
-                     : "- Long-term memory: **NOT available** — the `note` tool is not enabled."
-                       + " Do not promise to remember anything; say it must be enabled in Settings first.")
+        if hasMemory {
+            lines.append("- Long-term memory: your saved entries may already be injected above as"
+                         + " `## 长期记忆` (nothing there yet means nothing is saved). Write stable user"
+                         + " facts with `memory save`; manage with `memory list` / `memory delete`."
+                         + " Entries are short (≤80 chars) on purpose — anything long or task-specific"
+                         + " belongs in `note` instead.")
+        }
+        if hasNote {
+            lines.append("- Notes: `note` is an on-demand notebook across conversations (NOT injected"
+                         + " into the prompt). Use it for long or task-specific material.")
+        }
+        if !hasMemory && !hasNote {
+            lines.append("- Long-term memory: **NOT available** — neither `memory` nor `note` is enabled."
+                         + " Do not promise to remember anything; say it must be enabled in Settings first.")
+        }
 
         // 用户文件工作区。为什么值得单列一条：它是**唯一**能让模型"动手改东西"的地方，
         // 而模型对它的默认假设是错的 —— 它会以为自己在通用文件系统上（写 `/tmp/x.txt`、

@@ -86,11 +86,20 @@ final class PersonaStore: ObservableObject {
         }
 
         if settings.memoryEnabled {
-            let entries = memory.filter(\.enabled)
-            if !entries.isEmpty {
-                parts.append("## 长期记忆（来自之前对话，请记住并在回答时考虑）\n" + entries.map {
-                    "- \($0.content.replacingOccurrences(of: "\n", with: " "))"
-                }.joined(separator: "\n"))
+            // 按**字符预算**注入：从最新往回取，直到用满为止，最后再翻回时间顺序。
+            // 记忆是每次都进 system prompt 的，没有预算就等于让旧记忆悄悄吃光上下文 ——
+            // 而且它是 STATIC 段，一旦膨胀每一轮都要重算，直接拖垮首 token。
+            var lines: [String] = []
+            var used = 0
+            for entry in memory.reversed().filter(\.enabled) {
+                let line = "- \(entry.content)"
+                if used + line.count > Self.injectionCharBudget { break }
+                used += line.count
+                lines.append(line)
+            }
+            if !lines.isEmpty {
+                parts.append("## 长期记忆（来自之前对话，请记住并在回答时考虑）\n"
+                             + lines.reversed().joined(separator: "\n"))
             }
         }
 
@@ -179,6 +188,75 @@ final class PersonaStore: ObservableObject {
             added += 1
         }
         return added
+    }
+
+    // MARK: - 面向 `memory` 工具的读写入口
+    //
+    // 与 UI、自动提炼**共用同一份 memory 数组**（didSet → persist），不另起存储：
+    // 两套存储迟早出现"模型写了、界面上看不到"的分裂，而记忆这种东西一旦用户看不见，
+    // 就无法验证它到底记了什么 —— 那比没有记忆更糟。
+
+    // 三个常量标 nonisolated：工具执行器在 actor 外读它们（`executeMemory` 的参数校验），
+    // 不标就得为读一个 Int 跳一次 MainActor —— 冷路径白跑一趟。
+    /// 单条上限。记忆是**每次对话都注入 system prompt** 的，不是笔记仓库，
+    /// 长文会让 prompt 无限膨胀；要长内容请用 `note` 工具（按需读取，不进 prompt）。
+    nonisolated static let maxEntryLength = 80
+    /// 条数上限：同样为 prompt 体积兜底（60 × 80 字 ≈ 4.8k 字 ≈ 1.2k token 最坏情况）。
+    nonisolated static let maxEntries = 60
+    /// 注入预算：超出就只注入**最近**的那些，宁可丢旧的也不能让 system prompt 失控。
+    nonisolated static let injectionCharBudget = 4000
+
+    /// 归一化：去首尾、换行压成空格、连续空白合并、截断到上限。
+    nonisolated static func normalize(_ raw: String) -> String {
+        let flat = raw
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard flat.count > maxEntryLength else { return flat }
+        return String(flat.prefix(maxEntryLength))
+    }
+
+    func listEntries() -> [MemoryEntry] { memory }
+
+    /// 写入一条记忆。`created == false` 表示命中了已有条目（去重），没写新的。
+    @discardableResult
+    func saveEntry(_ raw: String) -> (entry: MemoryEntry, created: Bool)? {
+        let text = Self.normalize(raw)
+        guard !text.isEmpty else { return nil }
+        // 去重口径与 mergeMemories 一致：相等或互为子串都算同一条。
+        let key = text.lowercased()
+        if let dup = memory.first(where: {
+            let e = $0.content.lowercased()
+            return e == key || e.contains(key) || key.contains(e)
+        }) { return (dup, false) }
+        let entry = MemoryEntry(content: text)
+        memory.append(entry)
+        // 超限丢最旧的：新的比旧的更可能还有用，而 prompt 预算是硬约束。
+        if memory.count > Self.maxEntries {
+            memory.removeFirst(memory.count - Self.maxEntries)
+        }
+        return (entry, true)
+    }
+
+    /// 按 id 删除，支持**唯一前缀**匹配（列表里展示的是短 id，见 memory 工具）。
+    /// 返回被删内容；找不到或前缀有歧义返回 nil。
+    @discardableResult
+    func deleteEntry(id: String) -> String? {
+        let hits = memory.filter { entry in
+            let full = entry.id.uuidString.lowercased()
+            return full == id.lowercased() || full.hasPrefix(id.lowercased())
+        }
+        // 前缀撞车时宁可拒绝也不猜：删错一条记忆是不可逆的。
+        guard hits.count == 1, let idx = memory.firstIndex(where: { $0.id == hits[0].id })
+        else { return nil }
+        return memory.remove(at: idx).content
+    }
+
+    /// 短 id：uuid 前 8 位。60 条内唯一性足够，且能省下每行 28 个字符 ——
+    /// 列表是要进模型上下文的（上限 2000 字），id 太长会把真正的记忆内容挤掉。
+    nonisolated static func shortID(_ entry: MemoryEntry) -> String {
+        String(entry.id.uuidString.lowercased().prefix(8))
     }
 
     // MARK: - 持久化

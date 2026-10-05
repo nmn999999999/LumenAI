@@ -1592,7 +1592,10 @@ struct ChatView: View {
         guard SettingsStorage.shared.settings.autoExtractMemory else { return }
         let conv = chatStore.currentOrNew
         let userCount = conv.messages.filter { $0.role == .user }.count
-        guard userCount >= 3, canChat else { return }
+        // 阈值 2 而不是 3：两轮对话就足够提炼出"用户是谁/在乎什么"，而记忆的价值全在
+        // **早** —— 第三轮才记，用户前两轮暴露的偏好已经漏掉了；且现在有了 `memory` 工具，
+        // 模型自己也会写，双通道下提取只是兜底，早点跑没有额外代价。
+        guard userCount >= 2, canChat else { return }
         let messages = conv.messages
         memoryExtractTask = Task {
             defer { memoryExtractTask = nil }

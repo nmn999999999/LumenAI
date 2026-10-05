@@ -336,6 +336,9 @@ struct SettingsView: View {
     // MARK: - 长期记忆（note 工具）
 
     @ObservedObject private var noteStore = NoteStore.shared
+    // memory 工具的存储（与注入 prompt 的是同一份）。分开观察会导致：工具写进去了，
+    // 这张卡片不刷新，用户以为 AI 没记住 —— 而记忆这种东西必须"看得见"才敢信。
+    @ObservedObject private var personaStore = PersonaStore.shared
     @State private var showClearMemoryConfirm = false
     @State private var expandedNote: String?
 
@@ -353,15 +356,52 @@ struct SettingsView: View {
                 HStack {
                     SectionHeader(title: "长期记忆", systemImage: "brain.head.profile")
                     Spacer()
-                    if !noteStore.notes.isEmpty {
-                        Text("\(noteStore.notes.count) 条 · \(noteStore.totalCharacters) 字")
+                    let memCount = personaStore.memory.count
+                    if memCount > 0 || !noteStore.notes.isEmpty {
+                        Text("\(memCount) 条自动注入 · \(noteStore.notes.count) 条笔记")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
 
+                // ── memory：每轮对话都会注入 prompt 的那部分（有条数/长度上限）──
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("自动注入：每次对话都带上的用户事实与偏好。AI 可用 `memory` 工具自己增删，这里能看到并纠正。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if personaStore.memory.isEmpty {
+                        Text("暂无。AI 在对话里主动记住、或自动提炼出的内容会出现在这里。")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        ForEach(personaStore.memory) { entry in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text(entry.content)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 0)
+                                Button(role: .destructive) {
+                                    personaStore.deleteEntry(id: entry.id.uuidString)
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                }
+                .padding(.bottom, 4)
+
+                Divider()
+
+                // ── note：不进 prompt、按需读取的笔记本（原有区块）──
                 if noteStore.notes.isEmpty {
-                    Text("还没有记忆。在对话里让 AI「记住…」时会写到这里（note 工具）。")
+                    Text("还没有笔记。在对话里让 AI「记住…」时会写到这里（note 工具）。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -375,6 +415,10 @@ struct SettingsView: View {
                         noteRow(note)
                     }
 
+                }
+
+                // 放在 if/else 之外：笔记为空但自动注入记忆不为空时，也得能清空。
+                if !personaStore.memory.isEmpty || !noteStore.notes.isEmpty {
                     Button(role: .destructive) {
                         showClearMemoryConfirm = true
                     } label: {
@@ -390,11 +434,12 @@ struct SettingsView: View {
             titleVisibility: .visible
         ) {
             Button("全部清空", role: .destructive) {
+                personaStore.memory = []
                 noteStore.deleteAll()
             }
             Button(t("取消"), role: .cancel) {}
         } message: {
-            Text("AI 将不再记得这些内容，且无法恢复。对话记录不受影响。")
+            Text("AI 将不再记得这些内容（自动注入的记忆与笔记都会清空），且无法恢复。对话记录不受影响。")
         }
     }
 

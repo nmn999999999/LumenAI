@@ -350,6 +350,29 @@ enum BuiltInTools {
             // 如果将来审批能细到 (工具, op)，save/delete 应该改成 true。
             requiresApproval: false,
         ),
+        // ── memory：模型主动读写的**全局长期记忆**（与 UI、自动提炼同一份存储）──
+        //
+        // 与 `note` 的分工（刻意并存，不是重复实现）：
+        //   · `memory` = 跨对话的稳定事实/偏好，**每次对话都注入 system prompt**、自动生效；
+        //                 因此必须短（≤80 字）、有条数上限、进 prompt 就有体积代价。
+        //   · `note`   = 按需读取的笔记本，不进 prompt，可以很长。
+        // 在描述里就把这条边界写死：否则模型会把任务细节、长文档往 memory 里塞，
+        // 而那等于让它们每一轮都占着上下文。
+        //
+        // 审批沿用 `note` 的结论（false）：授权是工具级的，设 true 会让纯读的 list 也弹窗，
+        // 造成审批疲劳；写入范围仅 App 私有目录，且「设置 → 长期记忆」可见可删。
+        AgentToolDefinition(
+            id: "memory",
+            name: "memory",
+            description: "长期记忆（跨对话，会自动注入每次对话的上下文）：list 列出、save 写入、delete 删除。只存用户稳定事实与偏好（≤80字/条）；任务细节或长文本请用 note",
+            parameters: [
+                "op": .init(type: "string", description: "操作（必填）", enumValues: ["list", "save", "delete"]),
+                "content": .init(type: "string", description: "记忆内容（save 必填）：一句话稳定事实，≤80字", enumValues: nil),
+                "id": .init(type: "string", description: "记忆短 id（delete 必填，由 list 返回）", enumValues: nil),
+                "limit": .init(type: "number", description: "list 返回的最大条数（可选，默认 20）", enumValues: nil)
+            ],
+            requiresApproval: false,
+        ),
         // ⚠️ `todo` **刻意不进** `BuiltInTools.defaultEnabledNames`（见本文件末尾那份清单）。
         //
         // 那份 12 个工具的有序清单是**本地 Qwen3-1.7B 的训练契约**：训练数据
@@ -663,6 +686,7 @@ enum BuiltInTools {
         case "json_format":     return executeJsonFormat(arguments: arguments)
         case "url_codec":       return executeUrlCodec(arguments: arguments)
         case "note":            return await executeNote(arguments: arguments)
+        case "memory":          return await executeMemory(arguments: arguments)
         case "todo":            return await executeTodo(arguments: arguments)
         case "clipboard":       return executeClipboard(arguments: arguments)
         case "file_op":         return executeFileOp(arguments: arguments)
@@ -1241,6 +1265,80 @@ enum BuiltInTools {
         // 所以显式跳一次主线程。笔记都是小文本文件，这点 I/O 放主线程没有影响。
         return await MainActor.run {
             NoteStore.shared.perform(op: op, name: rawName, content: content)
+        }
+    }
+
+    /// `memory` 工具：读写**全局长期记忆**（PersonaStore.memory）。
+    ///
+    /// 与 `note` 的差别不只是存储位置：memory 的内容会进 system prompt（STATIC 段），
+    /// 所以它的返回值也要短 —— list 最多回 20 条、每行短 id + 正文，
+    /// 否则工具结果本身就把上下文撑爆了，而它本该是"被读取的资料"。
+    private static func executeMemory(arguments: [String: Any]) async -> String {
+        // op 必填、不给默认值（同 `todo`，异于 `note`）：
+        // memory 的写入是**每次对话都会带上**的持久副作用，让"漏传 op"静默落进某个分支
+        // 比直接报错危险。报错文案会把可选值列给模型，一次就够它改对。
+        let opRead = enumeratedArgument(
+            arguments, "op", label: "操作",
+            allowed: allowedValues(tool: "memory", parameter: "op", fallback: ["list", "save", "delete"]),
+            default: nil)
+        guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
+
+        let content = arguments["content"] as? String ?? ""
+        let rawID = (arguments["id"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // 在**闭包外**把参数读成 Sendable 原子类型（Int/String）：
+        // `arguments` 是 `[String: Any]`，`Any` 不是 Sendable，整个字典传进
+        // `MainActor.run` 的闭包会撞 Swift 6 的 sending 检查（与 todos 那段同理）。
+        // limit 默认 20：按 80 字正文 + 8 字 id 估算 ≈ 1900 字，正好压在工具结果
+        // 2000 字截断线之内 —— 超出会被悄悄砍掉最后几条，模型会以为记忆不存在。
+        let limitArg = arguments["limit"]
+        let limitRaw = (limitArg as? Int)
+            ?? Int(limitArg as? String ?? "")
+            ?? 20
+        let limit = min(max(limitRaw, 1), PersonaStore.maxEntries)
+
+        // PersonaStore 是 @MainActor（SwiftUI 的数据源），这里显式跳主线程；
+        // 它只改内存数组 + 异步落盘，主线程开销可忽略。
+        return await MainActor.run { () -> String in
+            let store = PersonaStore.shared
+            switch op {
+            case "list":
+                let all = store.listEntries()
+                guard !all.isEmpty else { return "（暂无记忆）" }
+                let shown = Array(all.suffix(limit).reversed())
+                let head = all.count > shown.count
+                    ? "共 \(all.count) 条，显示最近 \(shown.count) 条（旧的用 limit 再取）：\n"
+                    : ""
+                return head + shown.map {
+                    "\(PersonaStore.shortID($0)) \($0.content)"
+                }.joined(separator: "\n")
+
+            case "save":
+                let text = PersonaStore.normalize(content)
+                guard !text.isEmpty else {
+                    return "错误: content 为空，未写入。save 必须给出一句话（≤\(PersonaStore.maxEntryLength) 字）。"
+                }
+                guard let result = store.saveEntry(content) else {
+                    return "错误: 写入失败，请重试"
+                }
+                if result.created {
+                    return "已记住：\(result.entry.content)（现有 \(store.listEntries().count)/\(PersonaStore.maxEntries) 条）"
+                }
+                // 命中去重：如实告诉模型"没新增"，否则它会以为写进去了、下次还重复写。
+                return "已有相近记忆，未重复写入：\(result.entry.content)"
+
+            case "delete":
+                guard !rawID.isEmpty else {
+                    return "错误: delete 需要 id（先用 list 获取短 id）"
+                }
+                guard let removed = store.deleteEntry(id: rawID) else {
+                    return "错误: 找不到 id 为 \(rawID) 的记忆（可能已被删或前缀有歧义），先用 list 核对"
+                }
+                return "已删除：\(removed)"
+
+            default:
+                return "错误: 不支持的 op: \(op)"
+            }
         }
     }
 

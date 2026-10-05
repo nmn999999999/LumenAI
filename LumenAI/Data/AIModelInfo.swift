@@ -430,7 +430,7 @@ struct ModelSettings: Codable, Sendable {
         ttsSpeed: Double = 1.0,
         language: String = "zh",
         keepScreenOn: Bool = false,
-        memoryEnabled: Bool = false,
+        memoryEnabled: Bool = true,
         worldBookEnabled: Bool = false,
         instructionEnabled: Bool = false,
         promptStrategy: String = "auto",
@@ -438,7 +438,7 @@ struct ModelSettings: Codable, Sendable {
         kvCacheQuantize: Bool = false,
         autoCheckUpdate: Bool = true,
         grayOptIn: Bool = false,
-        autoExtractMemory: Bool = false,
+        autoExtractMemory: Bool = true,
         s3Endpoint: String = "",
         s3Bucket: String = "",
         s3AccessKey: String = "",
@@ -513,6 +513,7 @@ struct ModelSettings: Codable, Sendable {
              cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsProviderID, ttsKokoroVoice, ttsSpeed, language,
              keepScreenOn, memoryEnabled, worldBookEnabled, instructionEnabled,
              promptStrategy, useMetalAuto, kvCacheQuantize, autoCheckUpdate, grayOptIn, autoExtractMemory,
+             memoryDefaultsV2,
              s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region,
              sshHost, sshPort, sshUser, sshAuthType, sshPassword, sshPrivateKey, sshPassphrase
     }
@@ -554,7 +555,19 @@ struct ModelSettings: Codable, Sendable {
         ttsSpeed = try c.decodeIfPresent(Double.self, forKey: .ttsSpeed) ?? 1.0
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? "zh"
         keepScreenOn = try c.decodeIfPresent(Bool.self, forKey: .keepScreenOn) ?? false
-        memoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .memoryEnabled) ?? false
+        // 长期记忆的默认值在 0.3.79 从 false 翻成 true（产品决定：记忆默认全开）。
+        //
+        // 只改 ?? 后面那个字面量是**没用的**：老存档里这两个键一直存在（旧行为就是随存档
+        // 写入 false），decodeIfPresent 会如实读出 false，永远走不到兜底分支。
+        // 所以用 memoryDefaultsV2 当"迁移已完成"的标记：没标记 = 老存档 → 一次性强制翻成
+        // true；翻完随存档写入标记，之后用户再手动关掉就尊重存档值，不会每次启动都被翻回来。
+        let memoryV2 = try c.decodeIfPresent(Bool.self, forKey: .memoryDefaultsV2) ?? false
+        memoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .memoryEnabled) ?? true
+        autoExtractMemory = try c.decodeIfPresent(Bool.self, forKey: .autoExtractMemory) ?? true
+        if !memoryV2 {
+            memoryEnabled = true
+            autoExtractMemory = true
+        }
         worldBookEnabled = try c.decodeIfPresent(Bool.self, forKey: .worldBookEnabled) ?? false
         instructionEnabled = try c.decodeIfPresent(Bool.self, forKey: .instructionEnabled) ?? false
         promptStrategy = try c.decodeIfPresent(String.self, forKey: .promptStrategy) ?? "auto"
@@ -562,7 +575,8 @@ struct ModelSettings: Codable, Sendable {
         kvCacheQuantize = try c.decodeIfPresent(Bool.self, forKey: .kvCacheQuantize) ?? false
         autoCheckUpdate = try c.decodeIfPresent(Bool.self, forKey: .autoCheckUpdate) ?? true
         grayOptIn = try c.decodeIfPresent(Bool.self, forKey: .grayOptIn) ?? false
-        autoExtractMemory = try c.decodeIfPresent(Bool.self, forKey: .autoExtractMemory) ?? false
+        // autoExtractMemory 的解码已上移到 memoryEnabled 旁边（与迁移逻辑放在一起），
+        // 这里不能再读一遍 —— 否则 ?? false 会把上面刚迁好的 true 又盖回去。
         s3Endpoint = try c.decodeIfPresent(String.self, forKey: .s3Endpoint) ?? ""
         s3Bucket = try c.decodeIfPresent(String.self, forKey: .s3Bucket) ?? ""
         s3AccessKey = try c.decodeIfPresent(String.self, forKey: .s3AccessKey) ?? ""
@@ -617,6 +631,8 @@ struct ModelSettings: Codable, Sendable {
         try c.encode(autoCheckUpdate, forKey: .autoCheckUpdate)
         try c.encode(grayOptIn, forKey: .grayOptIn)
         try c.encode(autoExtractMemory, forKey: .autoExtractMemory)
+        // 记忆默认值迁移标记：读档时据此判断要不要把老存档翻成新默认 true（见 init(from:)）。
+        try c.encode(true, forKey: .memoryDefaultsV2)
         try c.encode(s3Endpoint, forKey: .s3Endpoint)
         try c.encode(s3Bucket, forKey: .s3Bucket)
         try c.encode(s3AccessKey, forKey: .s3AccessKey)
