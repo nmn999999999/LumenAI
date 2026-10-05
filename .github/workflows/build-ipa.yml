@@ -69,30 +69,51 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 固定到与**本地构建一致**的 Xcode 版本。
+      # 选一个与**本地构建工具链一致**的 Xcode：本地是 Xcode 26.1
+      # （IPA 的 Info.plist: DTXcode=2610 / DTXcodeBuild=17B55 / SDK iphoneos26.1=23B77），Swift 6.2.x。
       #
-      # 为什么不能直接用"最新"：本地出包用的是 Xcode 26.1
-      # （IPA 的 Info.plist: DTXcode=2610 / DTXcodeBuild=17B55 / SDK iphoneos26.1=23B77）。
-      # runner 上最新是 26.6（Swift 6.3.3），其 Swift 6 严格并发检查更严，
+      # 为什么要固定、而不是用"最新"：runner 上最新是 26.6（Swift 6.3.3），其严格并发检查
       # 会把本地能编过的代码判为 error —— 实测 LiveActivityManager 里
-      # `activity.update/end` 被报 "sending 'activity' risks causing data races"。
-      # 固定版本后，"本地能编 = CI 能编"，且**不必改任何 App 代码**。
-      - name: Select Xcode (pinned to local toolchain)
-        env:
-          PINNED_XCODE: Xcode_26.1.app
+      # `activity.update/end` 报 "sending 'activity' risks causing data races"。
+      #
+      # 但又不能只按版本号挑：runner 镜像里 Xcode_26.1.app **未随附 iOS 平台**
+      # （实测：error: iOS 26.1 is not installed ... download the platform from Xcode > Settings > Components）。
+      # 所以这里挑「Swift 6.2 且确实带 iOS SDK」的最高版本；若一个都没有，再给 26.1 补装 iOS 平台。
+      - name: Select Xcode (match local Swift 6.2 + iOS SDK)
         run: |
           set -euo pipefail
-          ls /Applications | grep Xcode || true
-          if [ -d "/Applications/$PINNED_XCODE" ]; then
-            TARGET="/Applications/$PINNED_XCODE"
-          else
-            TARGET=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
-            echo "::warning::runner 上没有 $PINNED_XCODE，回退到 $TARGET；若因并发检查报错，需另找该版本镜像"
+          echo "=== 已安装 Xcode / Swift / iOS SDK ==="
+          for app in /Applications/Xcode*.app; do
+            sdk_dir="$app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs"
+            sdk=$(ls "$sdk_dir" 2>/dev/null | head -1)
+            sv=$("$app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift" --version 2>/dev/null \
+                 | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p')
+            echo "$(basename "$app") | swift ${sv:-?} | iOS SDK: ${sdk:-<无>}"
+          done
+
+          TARGET=""
+          while IFS= read -r app; do
+            [ -d "$app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs" ] || continue
+            sv=$("$app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift" --version 2>/dev/null | head -1)
+            case "$sv" in
+              *"version 6.2"*) TARGET="$app" ;;
+            esac
+          done < <(ls -d /Applications/Xcode*.app | sort -V)
+
+          if [ -z "$TARGET" ]; then
+            TARGET="/Applications/Xcode_26.1.app"
+            [ -d "$TARGET" ] || TARGET=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+            echo "::warning::没有『Swift 6.2 + iOS SDK』的 Xcode，退到 $TARGET 并尝试补装 iOS 平台"
+            sudo xcode-select -s "$TARGET"
+            sudo xcodebuild -downloadPlatform iOS 2>&1 | tail -10 || true
           fi
+
           echo "Using $TARGET"
           sudo xcode-select -s "$TARGET"
           xcodebuild -version
           swift --version
+          echo "=== iphoneos SDK ==="
+          xcodebuild -showsdks | grep -i iphoneos || true
 
       # 拉取并解压框架包到仓库根目录（project.yml 按 $(SRCROOT)/*.xcframework 引用）。
       # 必须在 xcodegen generate **之前**：XcodeGen 会校验 framework 路径是否存在。
