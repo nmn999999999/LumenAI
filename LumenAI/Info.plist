@@ -29,5 +29,11 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>shortcuts</string>
+		<string>itms-apps</string>
+		<string>prefs</string>
+	</array>
 </dict>
 </plist>
