@@ -103,31 +103,17 @@ struct MessageBubble: View {
 
         case .assistant:
             // 布局修正：先把 frame(maxWidth:) 放在最外层，再加 padding 缩进；所有子组件
-            // （ThinkSection / Markdown / toolCallChips / 速度时间戳）都被这个宽度约束，
+            // （分段内容 / ThinkSection / Markdown / toolCallChips / 速度时间戳）都被这个宽度约束，
             // 思考块或长工具结果展开时不会越过 bubbleMaxWidth 与下一条气泡/右侧贴边重叠。
             VStack(alignment: .leading, spacing: 8) {
-                if settings.settings.showToolCalls {
-                    toolCallChips
-                }
-                if settings.settings.showThinking, let think = message.thinkContent, !think.isEmpty {
-                    ThinkSection(think: think, isThinking: message.isThinking)
-                }
                 // 生成/多模态图片（assistant）：/draw 云端生图的结果气泡
                 if !message.images.isEmpty {
                     generatedImageBlock
                 }
-                let displayText = message.isAgentRound ? AgentService.cleanDisplayText(message.visibleContent) : message.visibleContent
-                if !displayText.isEmpty {
-                    MarkdownView(markdown: displayText)
-                        .textSelection(.enabled)                } else if message.isStreaming && message.thinkContent == nil && message.images.isEmpty {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.mini)
-                        Text("思考中…")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 2)
+                if message.isAgentRound {
+                    agentPartsView
+                } else {
+                    nonAgentBody
                 }
                 if !message.isStreaming {
                     HStack(spacing: 8) {
@@ -229,6 +215,89 @@ struct MessageBubble: View {
             }
         }
         #endif
+    }
+
+    /// 普通 assistant 气泡（非 agent 轮次）：chip 在顶、思考在中、正文在底。
+    /// 行为与改造前逐字一致 —— 分段渲染只对 agent 轮次启用。
+    @ViewBuilder
+    private var nonAgentBody: some View {
+        if settings.settings.showToolCalls {
+            toolCallChips
+        }
+        if settings.settings.showThinking, let think = message.thinkContent, !think.isEmpty {
+            ThinkSection(think: think, isThinking: message.isThinking)
+        }
+        let displayText = message.visibleContent
+        if !displayText.isEmpty {
+            MarkdownView(markdown: displayText)
+                .textSelection(.enabled)
+        } else if message.isStreaming && message.thinkContent == nil && message.images.isEmpty {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("思考中…")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    /// Agent 轮次：按模型**真实输出顺序**把思考块、工具 chip、正文交替渲染。
+    ///
+    /// 为什么不再把 chip 全堆在最上面、把 N 轮 think 合成一坨：
+    /// 用户看到的是「一段思考 → 它驱动的那次工具调用 → 下一段思考 → … → 最终回答」，
+    /// 思考与它导致的动作对得上号，逻辑才连贯（改造前是一坨思考 + 一排 chip，
+    /// 无法判断哪段思考对应哪次调用，最终回答也混在里面）。
+    /// 分段来源见 `ChatMessage.agentParts`。
+    @ViewBuilder
+    private var agentPartsView: some View {
+        let parts = message.agentParts
+        // 是否已有任何"用户看得见"的内容（用于决定要不要显示"思考中…"占位）。
+        // 判据必须与下面 ForEach 的渲染条件**同源**，否则会出现"内容已上屏却还转圈"
+        // 或反过来"什么都没有却不给反馈"。
+        let hasVisible = parts.contains { part in
+            switch part {
+            case .think(let text, _):
+                return settings.settings.showThinking && !text.isEmpty
+            case .toolCall(let index):
+                return settings.settings.showToolCalls
+                    && message.toolCalls.indices.contains(index)
+            case .text(let text):
+                return !AgentService.cleanDisplayText(text).isEmpty
+            }
+        }
+        if !hasVisible && message.isStreaming {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("思考中…")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 2)
+        }
+        ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+            switch part {
+            case .think(let text, let closed):
+                if settings.settings.showThinking {
+                    // 只有**末尾那个未闭合**的 think 才算"正在思考"；
+                    // 中间轮次的 think 早已闭合，标成思考中会让它永远转圈。
+                    ThinkSection(think: text, isThinking: closed && message.isStreaming)
+                }
+            case .toolCall(let index):
+                if settings.settings.showToolCalls,
+                   message.toolCalls.indices.contains(index) {
+                    ToolCallChip(call: message.toolCalls[index])
+                }
+            case .text(let text):
+                let cleaned = AgentService.cleanDisplayText(text)
+                if !cleaned.isEmpty {
+                    MarkdownView(markdown: cleaned)
+                        .textSelection(.enabled)
+                }
+            }
+        }
     }
 
     @ViewBuilder

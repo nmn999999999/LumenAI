@@ -14,6 +14,9 @@ struct SettingsView: View {
     @State private var showDeleteConfirm = false
     /// Kokoro 语音模型删除确认（约 175 MB，删了要重下）
     @State private var showKokoroDeleteConfirm = false
+    /// 「Agent 智能体」卡片展示的屏幕自动化能力矩阵（现查现显，与提示词同源）。
+    /// 空 = 尚未探测完成，卡片显示"正在检测…"。
+    @State private var agentCaps: [ComputerCapability] = []
     @FocusState private var focusedField: Field?
     
     private enum Field: Hashable {
@@ -70,6 +73,7 @@ struct SettingsView: View {
                     longTermMemoryCard
                     systemPromptCard
                     toolsCard
+                    agentCard
                     FeaturesCard
                     cloudStorageCard
                     updateCard
@@ -501,6 +505,151 @@ struct SettingsView: View {
     // MARK: - 系统提示词
 
     // MARK: - 工具（可开关，总数上限不变）
+
+    /// 「Agent 智能体」卡片：Agent 优化开关 + 思考预算 + 屏幕自动化能力状态。
+    ///
+    /// 为什么必须有这张卡：`AgentOptimizations` 的四项优化（reasoning 控制 / 工具路由 /
+    /// 结果压缩 / 历史压缩）和思考预算此前**没有任何设置入口** —— 代码里只有
+    /// `.optimized` / `.baseline` 两档，线上永远是全开，用户既看不到也关不掉。
+    /// 现在每一项都落到 `ModelSettings`，由这张卡读写，`ChatView` 发起 run 时
+    /// 用 `AgentOptimizations.from(settings:)` 还原成优化集合。
+    ///
+    /// 右上角的 capability 状态行**现查** `ShortcutEngine.capabilities()`：
+    /// 这是模型在提示词里看到的同一份能力矩阵，用户在这儿看到的若与模型不一致，
+    /// 就说明两边读的不是同一个真源。
+    private var agentCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    SectionHeader(title: "Agent 智能体", systemImage: "cpu")
+                    Spacer()
+                    Text(agentCapabilityBadge)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("控制 Agent 循环的行为。关掉某项会回到该功能上线前的老行为，用于排查问题或省 token。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                agentToggleRow(
+                    isOn: $storage.settings.agentReasoningControl,
+                    title: "思考预算与早停",
+                    caption: "限制单段思考长度（超预算即强制进动作）、检测重复推理、产出工具调用后立即停止生成。关掉则放任模型一直想。")
+                agentToggleRow(
+                    isOn: $storage.settings.agentToolRouting,
+                    title: "工具路由 + 紧凑目录",
+                    caption: "按请求挑出相关工具、用紧凑 schema 渲染，省 tool schema token。关掉则每次全量下发详细目录。")
+                agentToggleRow(
+                    isOn: $storage.settings.agentResultReduction,
+                    title: "工具结果压缩",
+                    caption: "按工具类型分流压缩工具返回，错误优先保留。关掉则原文回填（上下文涨得快）。")
+                agentToggleRow(
+                    isOn: $storage.settings.agentHistoryCompaction,
+                    title: "历史压缩（Task State）",
+                    caption: "把旧的工具交互压成一份任务状态，避免长会话反复重编码。关掉则保留全部原始往返。")
+
+                Divider()
+
+                // 思考预算：收紧 ReasoningBudgetController 的阶梯上限（256→512→1024→2048 逐级放宽）
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("思考预算上限")
+                            .font(.subheadline)
+                        Spacer()
+                        Text("\(storage.settings.agentThinkBudgetTokens) tokens")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.purple)
+                    }
+                    Picker("思考预算上限", selection: $storage.settings.agentThinkBudgetTokens) {
+                        Text("256（最快）").tag(256)
+                        Text("512").tag(512)
+                        Text("1024").tag(1024)
+                        Text("2048（默认）").tag(2048)
+                    }
+                    .pickerStyle(.segmented)
+                    Text("单段思考允许消耗的 token 上限。每次动作（工具调用/回答）之后重新从最低档起算：先在小预算内出动作，确实想不清楚才逐级放宽到上限。数值越小思考越短、越早进工具。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Divider()
+
+                // 屏幕自动化（phone 工具）能力：现查现显，与提示词里的能力矩阵同源
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("屏幕自动化能力（phone 工具）")
+                        .font(.subheadline)
+                    if agentCaps.isEmpty {
+                        Text("正在检测…")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(agentCaps, id: \.line) { cap in
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: agentStatusIcon(cap.status))
+                                    .font(.caption2)
+                                    .foregroundStyle(agentStatusColor(cap.status))
+                                    .frame(width: 14)
+                                Text(cap.line)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    Text("以上是模型在提示词里看到的同一份能力矩阵。tap/swipe/type 在合规版不可用 —— 需要合成触控请在「软件更新」里切到 Tap 通道并重新安装。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .task {
+            agentCaps = await ShortcutEngine.capabilities()
+        }
+    }
+
+    /// 单个 Agent 开关行：左标题+说明，右 Toggle，绑定到 `ModelSettings` 的一个 Bool 字段。
+    private func agentToggleRow(isOn: Binding<Bool>, title: String, caption: String) -> some View {
+        Toggle(isOn: isOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline)
+                Text(caption)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(.purple)
+    }
+
+    private func agentStatusIcon(_ status: ComputerCapabilityStatus) -> String {
+        switch status {
+        case .supported: return "checkmark.circle.fill"
+        case .restricted: return "exclamationmark.circle.fill"
+        case .requiresSpecialEnvironment: return "sparkles"
+        case .unsupported: return "xmark.circle.fill"
+        }
+    }
+
+    private func agentStatusColor(_ status: ComputerCapabilityStatus) -> Color {
+        switch status {
+        case .supported: return .green
+        case .restricted: return .orange
+        case .requiresSpecialEnvironment: return .purple
+        case .unsupported: return .secondary
+        }
+    }
+
+    private var agentCapabilityBadge: String {
+        if agentCaps.contains(where: { $0.kind == .tap && $0.status.isAttemptable }) {
+            return "Tap 可用"
+        }
+        return ShortcutEngine.Variant.displayName
+    }
 
     /// 内置工具的选择界面。
     ///

@@ -1348,7 +1348,11 @@ struct ChatView: View {
             // 断点存档要用：没有这两个 id，续跑时不知道该把内容写回哪条对话的哪条气泡
             conversationID: chatStore.currentOrNew.id,
             bubbleID: bubbleId,
-            resuming: resuming
+            resuming: resuming,
+            // 优化开关由设置页「Agent 智能体」卡片驱动（reasoning 控制 / 工具路由 /
+            // 结果压缩 / 历史压缩 / 思考预算）。不用 `.optimized` 是因为那条路绕过了
+            // 用户设置 —— 一个"关掉"的开关在 run() 里会被默认值重新打开。
+            optimizations: .from(settings: effectiveSettings)
         )
         // run() 退出后清空共享气泡 id,下次发送/agent 时重新创建
         currentAgentMessageID = nil

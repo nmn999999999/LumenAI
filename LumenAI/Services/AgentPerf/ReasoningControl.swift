@@ -34,25 +34,42 @@ enum ReasoningGateState: String, Sendable {
 ///   - 复杂任务确实需要更多思考，所以按"未推进就升档"的方式逐级放宽；
 ///   - 上限 2048 是硬顶，防止无限扩大。
 struct ReasoningBudgetController: Sendable {
-    /// 档位阶梯（token）。
+    /// 档位阶梯（token）。默认最高档 = 2048。
     static let ladder: [Int] = [256, 512, 1024, 2048]
 
-    private(set) var budget: Int = ReasoningBudgetController.ladder[0]
+    /// 本实例实际使用的阶梯（按 `maxBudget` 裁剪，见 init）。
+    let ladder: [Int]
+    private(set) var budget: Int
     private(set) var tierIndex: Int = 0
+
+    /// - Parameter maxBudget: 本段思考允许的 token 上限（设置页「思考预算」）。
+    ///   阶梯被裁成"不超过 maxBudget 的档位 + maxBudget 本身"：
+    ///   · maxBudget = 2048（默认）→ 与原阶梯 [256,512,1024,2048] 完全一致，行为不变；
+    ///   · maxBudget = 512         → [256, 512]，即两档内必须出动作；
+    ///   · maxBudget 小于最小档     → 只有一档 = maxBudget（仍然可用，不崩）。
+    ///   这样"思考更短"是通过**收紧阶梯**实现的，而不是给每轮一刀切的硬截断 ——
+    ///   渐进放宽的语义（没推进才升档）保持不变。
+    init(maxBudget: Int = 2048) {
+        let clamped = max(64, maxBudget)
+        var tiers = Self.ladder.filter { $0 < clamped }
+        tiers.append(clamped)
+        self.ladder = tiers
+        self.budget = tiers[0]
+    }
 
     /// 升一档（到上限即停）。返回是否发生了升档。
     @discardableResult
     mutating func escalate() -> Bool {
-        guard tierIndex < Self.ladder.count - 1 else { return false }
+        guard tierIndex < ladder.count - 1 else { return false }
         tierIndex += 1
-        budget = Self.ladder[tierIndex]
+        budget = ladder[tierIndex]
         return true
     }
 
     /// 回到起点预算（一次成功动作之后：下一段任务从最小预算重新开始）。
     mutating func reset() {
         tierIndex = 0
-        budget = Self.ladder[0]
+        budget = ladder[0]
     }
 
     /// 累计 reasoning 是否已超出当前预算。
@@ -249,12 +266,18 @@ struct ReasoningRepetitionDetector {
 @MainActor
 final class ReasoningRuntime {
 
-    private(set) var budget = ReasoningBudgetController()
+    private(set) var budget: ReasoningBudgetController
     private var detector = ReasoningRepetitionDetector()
     private(set) var cumulativeReasoningTokens = 0
     private(set) var gate: ReasoningGateState = .thinking
     /// 本轮任务内纯 reasoning 的轮数（"空转"的直接度量）。
     private(set) var pureReasoningRounds = 0
+
+    /// - Parameter maxBudget: 单段思考的 token 上限（透传给 `ReasoningBudgetController`）。
+    ///   默认 2048 = 改造前行为；设置页「思考预算」调低后阶梯整体收紧。
+    init(maxBudget: Int = 2048) {
+        self.budget = ReasoningBudgetController(maxBudget: maxBudget)
+    }
 
     /// 一次成功动作（有效工具调用 / 最终答案）之后调用：
     /// 重置累计与重复检测 —— 新的一段任务应从最小预算重新开始。

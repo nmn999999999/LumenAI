@@ -378,6 +378,17 @@ struct ModelSettings: Codable, Sendable {
     var grayOptIn: Bool
     /// 更新通道：true = 下载 Tap 增强版 IPA，false = 稳定版
     var updateTapChannel: Bool
+    // MARK: - Agent 优化开关（设置页「Agent 智能体」卡片；默认值 = 线上现状）
+    /// reasoning 预算 / 门控 / 重复检测 + 早停（关掉 = 改造前"任由模型思考"的行为）
+    var agentReasoningControl: Bool
+    /// 工具路由 + compact schema（关掉 = 全量工具 + 详细 schema）
+    var agentToolRouting: Bool
+    /// 工具结果压缩（按类型分流、错误优先保留）
+    var agentResultReduction: Bool
+    /// 旧工具交互压缩成 Task State
+    var agentHistoryCompaction: Bool
+    /// 单段思考的 token 预算上限（渐进阶梯的最高档；小值 = 思考更短、更快进动作）
+    var agentThinkBudgetTokens: Int
     /// 对话结束后自动提炼长期记忆（世界观/记忆的自动抽取 pipeline）
     var autoExtractMemory: Bool
     // S3 备份配置
@@ -441,6 +452,11 @@ struct ModelSettings: Codable, Sendable {
         autoCheckUpdate: Bool = true,
         grayOptIn: Bool = false,
         updateTapChannel: Bool = false,
+        agentReasoningControl: Bool = true,
+        agentToolRouting: Bool = true,
+        agentResultReduction: Bool = true,
+        agentHistoryCompaction: Bool = true,
+        agentThinkBudgetTokens: Int = 2048,
         autoExtractMemory: Bool = true,
         s3Endpoint: String = "",
         s3Bucket: String = "",
@@ -492,6 +508,11 @@ struct ModelSettings: Codable, Sendable {
         self.autoCheckUpdate = autoCheckUpdate
         self.grayOptIn = grayOptIn
         self.updateTapChannel = updateTapChannel
+        self.agentReasoningControl = agentReasoningControl
+        self.agentToolRouting = agentToolRouting
+        self.agentResultReduction = agentResultReduction
+        self.agentHistoryCompaction = agentHistoryCompaction
+        self.agentThinkBudgetTokens = agentThinkBudgetTokens
         self.autoExtractMemory = autoExtractMemory
         self.s3Endpoint = s3Endpoint
         self.s3Bucket = s3Bucket
@@ -517,6 +538,7 @@ struct ModelSettings: Codable, Sendable {
              cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsProviderID, ttsKokoroVoice, ttsSpeed, language,
              keepScreenOn, memoryEnabled, worldBookEnabled, instructionEnabled,
              promptStrategy, useMetalAuto, kvCacheQuantize, autoCheckUpdate, grayOptIn, updateTapChannel, autoExtractMemory,
+             agentReasoningControl, agentToolRouting, agentResultReduction, agentHistoryCompaction, agentThinkBudgetTokens,
              memoryDefaultsV2,
              s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region,
              sshHost, sshPort, sshUser, sshAuthType, sshPassword, sshPrivateKey, sshPassphrase
@@ -580,6 +602,16 @@ struct ModelSettings: Codable, Sendable {
         autoCheckUpdate = try c.decodeIfPresent(Bool.self, forKey: .autoCheckUpdate) ?? true
         grayOptIn = try c.decodeIfPresent(Bool.self, forKey: .grayOptIn) ?? false
         updateTapChannel = try c.decodeIfPresent(Bool.self, forKey: .updateTapChannel) ?? false
+        agentReasoningControl = try c.decodeIfPresent(Bool.self, forKey: .agentReasoningControl) ?? true
+        agentToolRouting = try c.decodeIfPresent(Bool.self, forKey: .agentToolRouting) ?? true
+        agentResultReduction = try c.decodeIfPresent(Bool.self, forKey: .agentResultReduction) ?? true
+        agentHistoryCompaction = try c.decodeIfPresent(Bool.self, forKey: .agentHistoryCompaction) ?? true
+        agentThinkBudgetTokens = {
+            let v = (try? c.decodeIfPresent(Int.self, forKey: .agentThinkBudgetTokens)) ?? nil
+            // 只接受合理区间：太小会逼模型每轮都被强制收口，太大等于没有预算
+            if let v, v >= 64, v <= 8192 { return v }
+            return 2048
+        }()
         // autoExtractMemory 的解码已上移到 memoryEnabled 旁边（与迁移逻辑放在一起），
         // 这里不能再读一遍 —— 否则 ?? false 会把上面刚迁好的 true 又盖回去。
         s3Endpoint = try c.decodeIfPresent(String.self, forKey: .s3Endpoint) ?? ""
@@ -636,6 +668,11 @@ struct ModelSettings: Codable, Sendable {
         try c.encode(autoCheckUpdate, forKey: .autoCheckUpdate)
         try c.encode(grayOptIn, forKey: .grayOptIn)
         try c.encode(updateTapChannel, forKey: .updateTapChannel)
+        try c.encode(agentReasoningControl, forKey: .agentReasoningControl)
+        try c.encode(agentToolRouting, forKey: .agentToolRouting)
+        try c.encode(agentResultReduction, forKey: .agentResultReduction)
+        try c.encode(agentHistoryCompaction, forKey: .agentHistoryCompaction)
+        try c.encode(agentThinkBudgetTokens, forKey: .agentThinkBudgetTokens)
         try c.encode(autoExtractMemory, forKey: .autoExtractMemory)
         // 记忆默认值迁移标记：读档时据此判断要不要把老存档翻成新默认 true（见 init(from:)）。
         try c.encode(true, forKey: .memoryDefaultsV2)

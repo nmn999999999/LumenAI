@@ -81,7 +81,7 @@ final class AgentService: ObservableObject {
     ///   2. **只列"关掉的"而不是罗列全部**：全量罗列会很长，而长 system 段本身有害
     ///      （这是本地模型上实测到的）。用户关心的是"为什么这个功能不好使"，
     ///      那正好对应"什么是关的"。
-    private static func environmentSection(tools: [AgentToolDefinition]) -> String {
+    private static func environmentSection(tools: [AgentToolDefinition]) async -> String {
         let s = SettingsStorage.shared.settings
         var lines: [String] = ["", "## Current environment (state at this moment)"]
 
@@ -134,18 +134,43 @@ final class AgentService: ObservableObject {
                          + " ask for a remote operation.")
         }
 
-        // 手机操作（phone 工具）。同样必须把**做得到 / 做不到**写清楚：
-        // 合规版只到 URL + 已装快捷指令为止，而且没有"跑完了"的回执 ——
-        // 模型最常犯的错是把"系统接受了 URL"当成"动作已完成"，这句就是冲着它写的。
+        // 手机操作（phone 工具）。必须把**做得到 / 做不到**写清楚，而且这段话必须
+        // 来自**真实能力矩阵**，不能写死 —— 写死的版本曾断言"没有合成触控"，而 Tap 变体上
+        // tap 实际是可执行的：模型据此拒绝执行用户明确要求的点击，功能等于没落地。
+        // `ShortcutEngine.capabilities()` 每次现算（scheme 可用性 / probe 结果会变），
+        // 所以这里读到的一定是当下这一刻的状态。
         if tools.contains(where: { $0.name == "phone" }) {
-            lines.append("- Phone automation: the `phone` tool can launch saved recipes, trigger"
-                         + " user-installed Shortcuts (`shortcuts://`, the system may prompt), open"
-                         + " URLs, and `probe` what this build can actually do. There is **no**"
-                         + " synthetic touch or text injection unless probe says otherwise, and a"
-                         + " successful launch is not a completion receipt — report exactly what"
-                         + " the tool returned. Every step returns requested/executed/verified/status:"
-                         + " `unsupported` means stop and do not retry; `executed_unverified` means"
-                         + " it ran but was not verified — never call that a success.")
+            let caps = await ShortcutEngine.capabilities()
+            lines.append("- Phone automation via the `phone` tool. Build: \(ShortcutEngine.Variant.displayName)."
+                         + " Live capability matrix for THIS build (a `phone`/`op=capability` call"
+                         + " returns exactly these rows):")
+            for cap in caps {
+                lines.append("  - \(cap.line)")
+            }
+            lines.append("  Also available: `op=probe` (full report incl. recipe list & dispatch probe),"
+                         + " `op=list/save/delete/run` (recipes), `op=stats`, `op=capability`."
+                         + " Shortcuts run through `shortcuts://` (the system may prompt the user), and"
+                         + " a successful launch is NOT a completion receipt — report exactly what the"
+                         + " tool returned. Every step returns requested/executed/verified/status:"
+                         + " `unsupported` means this build cannot do it — stop, do not retry, and offer"
+                         + " the alternative listed in the reason instead; `executed_unverified` means it"
+                         + " ran but could not be verified — never call that a success; only"
+                         + " `status=success` may be described as succeeded.")
+            // 合成触控的可见性：模型最容易犯的错是"tap 不在工具列表里 → 自己编一个 tap 工具名"，
+            // 或反过来"看到 tap 就猛调"。把可用性与不确定性在同一条里讲清楚。
+            if caps.contains(where: { $0.kind == .tap && $0.status.isAttemptable }) {
+                lines.append("  Synthetic touch IS available in this build: `op=tap` with normalized"
+                             + " coordinates (x,y in 0...1, origin = top-left of screen). Dispatch is"
+                             + " NOT proof of contact — treat the result as `executed_unverified` unless"
+                             + " the tool reports verification, and confirm the visible effect before"
+                             + " telling the user it worked. `swipe`/`type` have no backend here: expect"
+                             + "`unsupported`, do not retry them.")
+            } else {
+                lines.append("  Synthetic touch is NOT available in this build: `op=tap`/`swipe`/`type`"
+                             + " return `unsupported`. Do not attempt them and do not invent another tool"
+                             + " name to click — route the interaction through `op=run` (a saved recipe or"
+                             + " a user Shortcut) or `op=open`/`op=app` instead.")
+            }
         }
 
         // 用户文件工作区。为什么值得单列一条：它是**唯一**能让模型"动手改东西"的地方，
@@ -369,7 +394,8 @@ final class AgentService: ObservableObject {
         let perfRecorder = AgentPerformanceRecorder()
         // ── Reasoning 控制（阶段 2-4）：预算 + 门控 + 重复检测 ──
         // Runtime 拥有"何时停止 reasoning"的最终控制权；模型只负责产出内容。
-        let reasoningRuntime = ReasoningRuntime()
+        // 预算上限来自优化集合（设置页「思考预算」→ AgentOptimizations.thinkBudgetMax）。
+        let reasoningRuntime = ReasoningRuntime(maxBudget: optimizations.thinkBudgetMax)
         // run 结束时（正常返回 / 提前 return / break 都算）聚合发布一次指标。
         // 只做观测与打印，不参与控制流；也不写盘、不影响任何返回内容。
         defer {
@@ -486,7 +512,7 @@ final class AgentService: ObservableObject {
             // 提示词分化（v0.3.45）：云端模型 → 全量工具目录 + 英文强化指令；
             // 本地模型 → 压缩目录（12 工具 + 短描述）+ 中文指令。
             let useCloud = llm.hasCloudSelection
-            let promptAssembly = withToolInstructions(
+            let promptAssembly = await withToolInstructions(
                 history: Self.trimmedHistory(workingHistory,
                                              compaction: optimizations.historyCompaction),
                 tools: liveTools,
@@ -1271,7 +1297,7 @@ final class AgentService: ObservableObject {
         useCloud: Bool,
         /// 阶段 5-7 的工具路由配置（由 `AgentOptimizations` 传入；baseline 时关闭）。
         routing: ToolRoutingConfig = ToolRoutingConfig()
-    ) -> PromptAssembly {
+    ) async -> PromptAssembly {
         let maxTools = useCloud ? tools.count : 12
         let maxDesc = useCloud ? Int.max : 150
 
@@ -1344,6 +1370,13 @@ final class AgentService: ObservableObject {
             - Tools are your ONLY interface to anything outside this conversation. If no tool covers something, say so instead of simulating an outcome.
             - Shell runs in the app sandbox rooted at ~/Documents/shellbox; OS/system APIs and shell network access are unavailable. Network tools are HTTPS + allowlist only — a refusal there is policy, not a transient failure: do not retry, tell the user what was blocked.
 
+            ## Thinking blocks vs. the answer (partition)
+            - Put your reasoning inside a thinking block and nothing else there. The text the user reads must NEVER sit inside a thinking block, and a thinking block must never contain the final answer.
+            - Tool-call JSON goes OUTSIDE the thinking block, after its closing tag. JSON left inside a thinking block is discarded and that call never runs.
+            - Keep each thinking block SHORT: one or two sentences that pick the next step. Think BETWEEN tool calls — after reading a result, before the next call — instead of writing one long monologue up front. A short fresh think after each result is the expected rhythm.
+            - Never restate the thinking in the answer. Lead with the conclusion; do not narrate "I first checked ... then I ...".
+            - If a thinking block is still open, close it before emitting anything else.
+
             ## When to call a tool
             - Call when the answer needs facts you do not have, a computation you must not guess, or an action only the device can perform. Do NOT call when you already know the answer, when the user is chatting/greeting/asking an opinion, or when the conversation already contains what you need. Prefer the narrowest dedicated tool (calc, time, JSON lookup) over a generic shell command.
             - Independent calls may be emitted together; a call depending on an earlier result must wait for it. A call is executed only once its result is back. Never repeat an identical call (same tool, same arguments): the result cannot change, and the loop aborts the whole task after three identical consecutive calls.
@@ -1360,6 +1393,12 @@ final class AgentService: ObservableObject {
             - `todo` op=set replaces the ENTIRE list: send every item every time as `{content, status}` (pending / in_progress / completed) — never only what changed.
             - Exactly one in_progress at a time; on finishing a step, mark it completed and the next in_progress in the same call. Update as you go — the user watches it live, so a stale list lies. Items are one concrete checkable sentence in the user's language (no "step 1" placeholders).
             - Done = last item completed; blocked/failed = leave it in_progress and say in your answer where you are stuck. Never mark completed what you did not finish. `todo` records progress; it never does the work, never replaces a real tool call, and never replaces the final answer.
+
+            ## Phone & screen automation (phone tool)
+            - Ops: probe / capability (what THIS build can do), list / save / delete / run (recipes and user-installed Shortcuts), stats, open (URL), app, wait, screenshot, tap, swipe, type.
+            - Capability-first: the environment section below prints the live matrix for this build. Trust it. unsupported = do not attempt and do not retry; offer the alternative named in its reason instead. executed_unverified = it ran but is unverified; report exactly what the tool returned. Only status=success may be called a success.
+            - Coordinates are normalized: x and y in 0...1, origin = top-left of the screen. Never pass pixel values.
+            - Never invent a tool name to touch the screen. tap / swipe / type are the only interaction ops, and only when the matrix says this build has them.
 
             ## Autonomy & confirmation
             - Act on your own for read-only, reversible, in-scope work: searching, fetching, reading, calculating.
@@ -1389,7 +1428,7 @@ final class AgentService: ObservableObject {
               registerTool({ name: "char_count_cn", description: "统计文本的总字符数与去空格字符数，返回 JSON", parameters: { text: { type: "string", description: "要统计的文本" } }, run: function (args) { var s = String(args.text == null ? "" : args.text); return JSON.stringify({ total: s.length, nonSpace: s.split(" ").join("").length }); } });
 
             ## Tool Call Protocol
-            To call a tool, output ONLY JSON — no prose, no heading, no code fence:
+            To call a tool, output ONLY JSON — no prose, no heading, no code fence, and outside the thinking block:
 
             {"name": "<tool_name>", "arguments": {"<arg>": <value>}}
 
@@ -1400,7 +1439,7 @@ final class AgentService: ObservableObject {
 
             \(Self.endSignal)
 
-            then immediately the final answer text. Emitting it early ends the task: nothing after it runs, and no further tools are executed. If you still need information, do not emit it.
+            then immediately the final answer text. Emitting it early ends the task: nothing after it runs, and no further tools are executed. If you still need information, do not emit it. Close the thinking block before the signal, and keep the answer self-contained: no thinking tags, no tool JSON, and no end signal inside it.
 
             ## Language
             Answer in the user's language, whatever the language of this prompt or of the tool results.
@@ -1448,9 +1487,13 @@ final class AgentService: ObservableObject {
         // 都是在让已训好的适配器看到它没见过的格式。
         // 所以"把系统状态告诉模型"这件事在本地模型上暂时做不到 —— 要做得等下一轮
         // 重新生成 agent 训练数据（把那一段也写进训练样本）再训一次。
-        let effectiveInstruction = useCloud
-            ? instruction + Self.environmentSection(tools: selected)
-            : instruction
+        // 环境段是 async（要查 phone 真实能力矩阵）；本地分支不加，故不 await。
+        let effectiveInstruction: String
+        if useCloud {
+            effectiveInstruction = instruction + (await Self.environmentSection(tools: selected))
+        } else {
+            effectiveInstruction = instruction
+        }
 
         var messages = history
         if let sysIdx = messages.firstIndex(where: { $0.role == .system }) {

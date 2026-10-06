@@ -33,10 +33,12 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
         let data: Data
         let mimeType: String
 
+        #if canImport(UIKit)
         var cgImage: CGImage? {
             guard let uiImage = UIImage(data: data) else { return nil }
             return uiImage.cgImage
         }
+        #endif
     }
 
     /// 文件附件（工作区内的文件路径 + 元数据，不存二进制）。
@@ -334,6 +336,179 @@ extension ChatMessage {
         guard hasOpen else { return false }
         let hasClose = lower.contains("</think>") || lower.contains("</reasoning>")
         return !hasClose
+    }
+
+    // MARK: - Agent 轮次分段（think / 工具调用 / 正文 按出现顺序穿插）
+
+    /// Agent 气泡里的一个片段。顺序 = 模型真实输出顺序，
+    /// 渲染时按此顺序交替摆放思考块与工具 chip，而不是把所有 think 合并到顶部。
+    enum AgentPart: Equatable, Sendable {
+        /// 一段思考。`closed=false` 表示 `</think>` 还没闭合（流式中 / 被截断）。
+        case think(String, closed: Bool)
+        /// 对应 `message.toolCalls[i]` 的 chip。
+        case toolCall(Int)
+        /// 普通正文（渲染前会过 `AgentService.cleanDisplayText`）。
+        case text(String)
+    }
+
+    /// 把 `content` 切成按序排列的片段，并给每个工具调用 JSON 找到它对应的 chip。
+    ///
+    /// 为什么不能沿用 `parseThinkBlock`：那个函数把**所有** think 合成一个字符串、
+    /// 把所有正文合成另一个 —— 多轮 agent 于是变成"一坨思考 + 一坨正文 + 一排 chip"，
+    /// 思考与它所驱动的那次工具调用完全对不上号（用户反馈的"分区不连贯"）。
+    ///
+    /// 切分规则与**运行时语义**保持一致（见 `AgentService.run`）：
+    ///   · 工具 JSON 必须在 think 块**之外**才会被执行（运行时先 `stripThinkTags` 再解析），
+    ///     所以 think 块内部一律整块当作思考，不去里面找 JSON；
+    ///   · JSON 出现的位置 = 那一轮发生的位置，因此 chip 就渲染在它前面那段思考之后。
+    ///
+    /// chip 对齐用「名字 + 顺序」匹配而不是纯序号：未知工具/被去重的调用在 `content`
+    /// 里有 JSON 却没有 chip，按序号对齐会让后面的 chip 全部错位一格。
+    /// 匹配不到的 JSON 当作正文（随后会被 `cleanDisplayText` 清掉，与现状一致）；
+    /// 没被任何 JSON 用到的 chip 追加到末尾，保证一个都不丢。
+    var agentParts: [AgentPart] {
+        Self.splitAgentParts(content: content, toolCalls: toolCalls)
+    }
+
+    static func splitAgentParts(content: String, toolCalls: [ToolCall]) -> [AgentPart] {
+        guard !content.isEmpty else {
+            return toolCalls.indices.map { .toolCall($0) }
+        }
+        var parts: [AgentPart] = []
+        var rest = Substring(content)
+        var used = Set<Int>()
+        let ws = CharacterSet.whitespacesAndNewlines
+
+        func appendText(_ t: Substring) {
+            let trimmed = t.trimmingCharacters(in: ws)
+            if !trimmed.isEmpty { parts.append(.text(String(trimmed))) }
+        }
+
+        while !rest.isEmpty {
+            let openRange = Self.nextThinkOpen(in: rest)
+            let jsonStart = Self.nextToolJSONStart(in: rest)
+
+            // think 块与 JSON 同时出现时取位置更靠前的那个；位置相同按 think 处理
+            let thinkFirst: Bool = {
+                guard let open = openRange else { return false }
+                guard let json = jsonStart else { return true }
+                return open.lowerBound <= json
+            }()
+            if thinkFirst, let open = openRange {
+                // 整块吃掉，块内不解析 JSON —— 与运行时"先 stripThinkTags 再解析"一致
+                appendText(rest[rest.startIndex..<open.lowerBound])
+                let afterOpen = rest[open.upperBound...]
+                if let close = Self.nextThinkClose(in: afterOpen) {
+                    appendThink(parts: &parts, afterOpen[afterOpen.startIndex..<close.lowerBound], closed: true)
+                    rest = afterOpen[close.upperBound...]
+                } else {
+                    appendThink(parts: &parts, afterOpen, closed: false)
+                    rest = Substring("")
+                }
+                continue
+            }
+            if let start = jsonStart {
+                appendText(rest[rest.startIndex..<start])
+                guard let end = Self.toolJSONEnd(in: rest[start...]) else {
+                    // 未闭合的 JSON（流式中）：当正文，渲染侧会清掉
+                    appendText(rest[start...])
+                    break
+                }
+                let object = rest[start...end]
+                let name = Self.toolJSONName(in: object)
+                if let idx = toolCalls.indices.first(where: {
+                    !used.contains($0) && toolCalls[$0].name == name
+                }) {
+                    used.insert(idx)
+                    parts.append(.toolCall(idx))
+                }
+                rest = rest[rest.index(after: end)...]
+                continue
+            }
+            appendText(rest)
+            break
+        }
+
+        // 没被 JSON 用上的 chip（未知工具 / 去重 / 存量旧档）：补到末尾，别丢
+        for i in toolCalls.indices where !used.contains(i) {
+            parts.append(.toolCall(i))
+        }
+        return parts
+    }
+
+    /// think 块内部文本进片段（空思考不占位，避免流式起手的空块撑出一个空折叠区）。
+    private static func appendThink(parts: inout [AgentPart], _ think: Substring, closed: Bool) {
+        let trimmed = think.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { parts.append(.think(String(trimmed), closed: closed)) }
+    }
+
+    private static func nextThinkOpen(in s: Substring) -> Range<String.Index>? {
+        s.range(of: "<think>", options: [.caseInsensitive])
+            ?? s.range(of: "<reasoning>", options: [.caseInsensitive])
+    }
+
+    private static func nextThinkClose(in s: Substring) -> Range<String.Index>? {
+        s.range(of: "</think>", options: [.caseInsensitive])
+            ?? s.range(of: "</reasoning>", options: [.caseInsensitive])
+    }
+
+    /// 找下一个工具调用 JSON 的起点：`{` + 可选空白 + `"name"`。
+    private static func nextToolJSONStart(in s: Substring) -> String.Index? {
+        var i = s.startIndex
+        while i < s.endIndex {
+            if s[i] == "{" {
+                var j = s.index(after: i)
+                while j < s.endIndex, s[j].isWhitespace { j = s.index(after: j) }
+                if j < s.endIndex, s[j...].hasPrefix("\"name\"") { return i }
+            }
+            i = s.index(after: i)
+        }
+        return nil
+    }
+
+    /// 从 JSON 起点做括号配平，返回最后一个 `}` 的索引（未闭合返回 nil）。
+    private static func toolJSONEnd(in s: Substring) -> String.Index? {
+        var depth = 0
+        var i = s.startIndex
+        var inString = false
+        var escaped = false
+        while i < s.endIndex {
+            let ch = s[i]
+            if inString {
+                if escaped { escaped = false }
+                else if ch == "\\" { escaped = true }
+                else if ch == "\"" { inString = false }
+            } else {
+                switch ch {
+                case "\"": inString = true
+                case "{": depth += 1
+                case "}":
+                    depth -= 1
+                    if depth == 0 { return i }
+                default: break
+                }
+            }
+            i = s.index(after: i)
+        }
+        return nil
+    }
+
+    /// 从工具 JSON 里取出 `"name"` 的字符串值。
+    private static func toolJSONName(in s: Substring) -> String? {
+        guard let key = s.range(of: "\"name\"") else { return nil }
+        var i = key.upperBound
+        while i < s.endIndex, s[i].isWhitespace || s[i] == ":" { i = s.index(after: i) }
+        guard i < s.endIndex, s[i] == "\"" else { return nil }
+        i = s.index(after: i)
+        var name = ""
+        while i < s.endIndex, s[i] != "\"" {
+            if s[i] == "\\", s.index(after: i) < s.endIndex {
+                i = s.index(after: i)
+            }
+            name.append(s[i])
+            i = s.index(after: i)
+        }
+        return name.isEmpty ? nil : name
     }
 
     static func parseThinkBlock(_ content: String) -> (think: String, answer: String) {

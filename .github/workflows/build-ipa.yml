@@ -147,6 +147,18 @@ jobs:
           /tmp/benchmark_verdict_tests
           echo "✅ Benchmark 判定测试全部通过"
 
+          # Agent 气泡分段（think / 工具 chip / 正文 按真实输出顺序穿插）的单元测试。
+          # ChatMessage 纯 Foundation + 条件编译的 UIKit 片段，macOS 上能单独 swiftc 编译。
+          # 这是"思考与工具交替显示"的地基：切分规则必须与运行时语义一致
+          # （工具 JSON 在 think 块之外才会被执行），chip 对齐用「名字 + 顺序」而不是序号 ——
+          # 这两类回归都不会让构建失败，只会让界面上的思考/工具顺序错乱，必须靠测试挡。
+          echo "=== agentParts 分段测试 ==="
+          swiftc -o /tmp/agent_parts_tests \
+            LumenAI/Data/ChatMessage.swift \
+            Tests/agent_parts/main.swift
+          /tmp/agent_parts_tests
+          echo "✅ agentParts 分段测试全部通过"
+
           # project.yml 的 YAML 合法性：有 pyyaml 就提前校验（xcodegen 那步也会再校验一次），
           # 没有就跳过 —— 它缺席不该让整个构建挂掉。
           echo "=== project.yml YAML 校验 ==="
