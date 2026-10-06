@@ -262,7 +262,7 @@ struct SkillMarkdownParser {
         markdown += "用户输入技能相关请求后，AI 将使用上述模板生成专业回复。\n\n"
         
         markdown += "---\n"
-        markdown += "*导出自 LumenAI v0.3.77*\n"
+        markdown += "*导出自 LumenAI v0.3.79*\n"
         
         return markdown
     }
