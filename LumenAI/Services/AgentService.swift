@@ -143,7 +143,9 @@ final class AgentService: ObservableObject {
                          + " URLs, and `probe` what this build can actually do. There is **no**"
                          + " synthetic touch or text injection unless probe says otherwise, and a"
                          + " successful launch is not a completion receipt — report exactly what"
-                         + " the tool returned.")
+                         + " the tool returned. Every step returns requested/executed/verified/status:"
+                         + " `unsupported` means stop and do not retry; `executed_unverified` means"
+                         + " it ran but was not verified — never call that a success.")
         }
 
         // 用户文件工作区。为什么值得单列一条：它是**唯一**能让模型"动手改东西"的地方，

@@ -384,14 +384,18 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "phone",
             name: "phone",
-            description: "操作手机：list 查看配方、run 运行配方/已装快捷指令、save 保存模型编写的配方、delete 删除、probe 实测本机能力。⚠️ 合规版只能打开 URL 与触发快捷指令（系统会弹确认、且没有完成回执），不能直接点击屏幕或输入文字；合成触摸仅 Tap 自签版可用。返回什么就报什么，不要声称用户没确认的动作已完成",
+            description: "操作手机（capability-aware）：probe 查能力矩阵与实测、list/run/save/delete 管理配方、open/app 打开 URL 或 App、wait 等待 UI 稳定、screenshot 截屏、tap/swipe/type 执行交互。每步都返回 JSON 回执 {status, executed, verified}，取值 success / executed_unverified / failed / timeout / unsupported。⚠️ 只有 status=success 才能说「成功」；executed_unverified 只能说「已执行但无法验证」；unsupported 说明本机做不到，改走快捷指令方案，不要重试同一动作。保持短循环：截图→判断→一步动作→验证，不要长篇解释",
             parameters: [
-                "op": .init(type: "string", description: "操作（必填）", enumValues: ["list", "run", "save", "delete", "probe", "tap"]),
+                "op": .init(type: "string", description: "操作（必填）", enumValues: ["probe", "capability", "stats", "list", "run", "save", "delete", "open", "app", "wait", "screenshot", "tap", "swipe", "type"]),
                 "name": .init(type: "string", description: "配方或快捷指令名（run/save/delete/tap 必填；run 时若无同名配方则直接按名字触发快捷指令）", enumValues: nil),
                 "summary": .init(type: "string", description: "一句话说明这条配方干什么（save 可选）", enumValues: nil),
                 "steps": .init(type: "string", description: "配方步骤，每行一条：run <快捷指令名> / open <url> / tap <x> <y>（0..1）/ wait <秒> / # 注释（save 时可选，留空则只按 name 触发快捷指令）", enumValues: nil),
                 "x": .init(type: "number", description: "点击横坐标，0..1 归一化（op=tap 必填，仅 Tap 版有效）", enumValues: nil),
-                "y": .init(type: "number", description: "点击纵坐标，0..1 归一化（op=tap 必填，仅 Tap 版有效）", enumValues: nil)
+                "y": .init(type: "number", description: "纵坐标，0..1 归一化（op=tap/swipe 必填）", enumValues: nil),
+                "x2": .init(type: "number", description: "swipe 终点横坐标，0..1 归一化（op=swipe 必填）", enumValues: nil),
+                "y2": .init(type: "number", description: "swipe 终点纵坐标，0..1 归一化（op=swipe 必填）", enumValues: nil),
+                "ms": .init(type: "number", description: "等待毫秒数，0..30000（op=wait 必填）", enumValues: nil),
+                "text": .init(type: "string", description: "要输入的文本（op=type 必填）", enumValues: nil)
             ],
             requiresApproval: true,
         ),
@@ -1374,7 +1378,9 @@ enum BuiltInTools {
         let opRead = enumeratedArgument(
             arguments, "op", label: "操作",
             allowed: allowedValues(tool: "phone", parameter: "op",
-                                   fallback: ["list", "run", "save", "delete", "probe", "tap"]),
+                                   fallback: ["probe", "capability", "stats", "list", "run", "save",
+                                              "delete", "open", "app", "wait", "screenshot",
+                                              "tap", "swipe", "type"]),
             default: nil)
         guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
 
@@ -1430,7 +1436,61 @@ enum BuiltInTools {
             return await ShortcutEngine.runShortcut(named: name)
 
         case "probe":
-            return await ShortcutEngine.probe()
+            let caps = await ShortcutEngine.capabilities()
+            let matrix = await ShortcutEngine.capabilityText(caps)
+            let report = await ShortcutEngine.probe()
+            let m = await ShortcutEngine.metrics
+            return report
+                + "\n\n## 能力矩阵（capability-first）\n" + matrix
+                + "\n\n## 步骤指标\n" + m.summaryLine
+
+        case "capability":
+            let caps = await ShortcutEngine.capabilities()
+            let text = await ShortcutEngine.capabilityText(caps)
+            let variant = await ShortcutEngine.Variant.displayName
+            let policy = ComputerRetryPolicy.default
+            return "能力矩阵（变体：\(variant)）\n" + text
+                + "\n重试上限 maxRetries=\(policy.maxRetries)，"
+                + "单动作超时 \(policy.actionTimeoutMs)ms，"
+                + "置信度阈值 \(policy.confidenceThreshold) —— 超过就停下汇报，不要无限重试。"
+
+        case "stats":
+            let m = await ShortcutEngine.metrics
+            return "步骤指标：\(m.summaryLine)"
+
+        case "screenshot":
+            return (await ShortcutEngine.execute(.screenshot, attempt: 1)).jsonString
+
+        case "wait":
+            guard let ms = arguments["ms"] as? Double ?? (arguments["ms"] as? Int).map(Double.init) else {
+                return "错误: wait 需要 ms（0..30000）"
+            }
+            return (await ShortcutEngine.execute(.wait(milliseconds: Int(ms)), attempt: 1)).jsonString
+
+        case "open":
+            guard !name.isEmpty else { return "错误: open 需要 name（URL）" }
+            return (await ShortcutEngine.execute(.openURL(name), attempt: 1)).jsonString
+
+        case "app":
+            guard !name.isEmpty else { return "错误: app 需要 name（App 名）" }
+            return (await ShortcutEngine.execute(.openApp(name: name), attempt: 1)).jsonString
+
+        case "type":
+            guard let text = arguments["text"] as? String, !text.isEmpty else {
+                return "错误: type 需要 text"
+            }
+            return (await ShortcutEngine.execute(.type(text: text), attempt: 1)).jsonString
+
+        case "swipe":
+            guard let x, let y else { return "错误: swipe 需要 x/y（起点，0..1）" }
+            guard let x2 = Self.doubleArgument(arguments, "x2"),
+                  let y2 = Self.doubleArgument(arguments, "y2") else {
+                return "错误: swipe 需要 x2/y2（终点，0..1）"
+            }
+            return (await ShortcutEngine.execute(
+                .swipe(from: NormPoint(x: ComputerAction.clamp(x), y: ComputerAction.clamp(y)),
+                       to: NormPoint(x: ComputerAction.clamp(x2), y: ComputerAction.clamp(y2))),
+                attempt: 1)).jsonString
 
         case "tap":
             guard let x, let y else {

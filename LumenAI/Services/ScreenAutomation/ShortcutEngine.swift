@@ -42,35 +42,20 @@ enum ShortcutEngine {
             lines.append(await runShortcut(named: recipe.name))
             return lines.joined(separator: "\n")
         }
-        for (i, action) in recipe.actions.enumerated() {
-            let step = "[\(i + 1)/\(recipe.actions.count)] "
-            switch action {
-            case .runShortcut(let name):
-                let result = await runShortcut(named: name)
-                lines.append(step + result)
-            case .openURL(let raw):
-                let result = await open(raw)
-                lines.append(step + result)
-            case .wait(let seconds):
-                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                lines.append(step + "已等待 \(String(format: "%.1f", seconds)) 秒")
-            case .note(let text):
-                lines.append(step + "注：" + text)
-            case .typeText(let text):
-                #if SIMULATE_TAP
-                lines.append(step + TapBackend.typeText(text))
-                #else
-                lines.append(step + "跳过：合规版没有系统级输入注入。可在快捷指令里用"
-                             + "「输入文本」动作实现，然后把这条改成 run。")
-                #endif
-            case .tap(let x, let y):
-                #if SIMULATE_TAP
-                lines.append(step + TapBackend.tap(normalizedX: x, normalizedY: y))
-                #else
-                lines.append(step + "跳过：合规版不能合成触摸。请把这一步做成快捷指令里的"
-                             + "动作，再用 run 执行；或改用 Tap 自签版。")
-                #endif
+        // 全部动作统一走 execute()：状态机、指标、能力门控只有一份实现，
+        // 配方执行与单步执行看到的回执格式完全一致（否则会出现两套成功判定）。
+        for (i, step) in recipe.actions.enumerated() {
+            let tag = "[\(i + 1)/\(recipe.actions.count)] "
+            if case .note(let text) = step {
+                lines.append(tag + "注：" + text)
+                continue
             }
+            guard let action = computerAction(from: step) else {
+                lines.append(tag + "跳过：无法识别的配方步骤")
+                continue
+            }
+            let r = await execute(action, attempt: 1)
+            lines.append(tag + r.action + " → " + r.status.rawValue + "：" + r.detail)
         }
         return lines.joined(separator: "\n")
     }
@@ -150,5 +135,181 @@ enum ShortcutEngine {
         let count = ShortcutStore.shared.recipes.count
         lines.append("- 已保存配方：\(count) 条")
         return lines.joined(separator: "\n")
+    }
+
+    // MARK: - 能力（capability-first：先问能不能，再谈做不做）
+
+    /// 当前构建 + 当前设备的能力矩阵（每次现算：scheme 可用性、Tap probe 结果都可能变）。
+    static func capabilities() async -> [ComputerCapability] {
+        let shortcutsOK = UIApplication.shared.canOpenURL(
+            URL(string: "shortcuts://run-shortcut?name=probe") ?? URL(string: "shortcuts://x")!)
+        #if SIMULATE_TAP
+        let tapProbed = TapBackend.canDispatch()
+        #else
+        let tapProbed = false
+        #endif
+        return ComputerCapabilityMatrix.make(isTapBuild: Variant.isTapBuild,
+                                             tapProbeAvailable: tapProbed,
+                                             shortcutsAvailable: shortcutsOK)
+    }
+
+    /// 能力矩阵的可读文本（进 probe 报告，也进云端 environmentSection 的素材）。
+    static func capabilityText(_ caps: [ComputerCapability]? = nil) async -> String {
+        let list: [ComputerCapability]
+        if let caps { list = caps } else { list = await capabilities() }
+        return list.map { "  - \($0.line)" }.joined(separator: "\n")
+    }
+
+    // MARK: - 配方动作 → 计算机动作
+
+    /// `ShortcutRecipe.Action`（用户可编辑的配方行）→ `ComputerAction`（能力/状态机里的动作）。
+    /// 转换放在这里而不是 `ComputerAction.swift`：后者必须保持纯 Foundation，
+    /// 才能被单独编译出来测。`.note` 是纯注释，没有对应动作，返回 nil 由调用方单独成行。
+    static func computerAction(from a: ShortcutRecipe.Action) -> ComputerAction? {
+        switch a {
+        case .runShortcut(let name): return .runShortcut(name)
+        case .openURL(let raw): return .openURL(raw)
+        case .wait(let seconds): return .wait(milliseconds: Int(seconds * 1000))
+        case .typeText(let text): return .type(text: text)
+        case .tap(let x, let y): return .tap(x: x, y: y)
+        case .note: return nil
+        }
+    }
+
+    // MARK: - 单步执行（capability 门控 → 执行 → 验证 → 回执）
+
+    /// 步骤级指标（§13：action/verify/retry/unsupported 都要能量出来）。
+    /// 显式标 @MainActor：引擎整体是 MainActor 隔离的，但静态存储属性在 Swift 6 下
+    /// 需要显式标注才被认定为隔离（否则报"非隔离的全局可变状态"）。
+    @MainActor static var metrics = ComputerStepMetrics()
+
+    @MainActor static func resetMetrics() { metrics = ComputerStepMetrics() }
+
+    /// 执行一个动作并返回结构化回执。**这是整套能力的唯一出口**：
+    /// 不支持的动作在这里就被挡掉（unsupported），永远不会走到"假装执行"。
+    static func execute(_ action: ComputerAction, attempt: Int = 1) async -> ComputerActionResult {
+        let caps = await capabilities()
+        guard let cap = ComputerCapabilityMatrix.capability(action.kind, in: caps) else {
+            let r = ComputerActionResult.unsupported(kind: action.kind,
+                                                     reason: "未知动作类别，拒绝执行", attempt: attempt)
+            metrics.record(r)
+            return r
+        }
+        guard cap.status.isAttemptable else {
+            let r = ComputerActionResult.unsupported(kind: action.kind, reason: cap.reason,
+                                                     attempt: attempt)
+            metrics.record(r)
+            return r
+        }
+
+        let start = Date()
+        let elapsed = { Int(Date().timeIntervalSince(start) * 1000) }
+        var r: ComputerActionResult
+
+        switch action {
+        case .wait(let ms):
+            let bounded = min(max(ms, 0), 30_000)   // 上限 30s：防止模型传一个 10 分钟的等待把 run 卡死
+            try? await Task.sleep(nanoseconds: UInt64(bounded) * 1_000_000)
+            r = .executed(kind: .wait, action: action.label,
+                          detail: "已等待 \(bounded)ms", verified: true,
+                          verifyDetail: "本地定时器回调到达（等待类动作的完成本身就是验证）",
+                          attempt: attempt, elapsedMs: elapsed())
+
+        case .openURL(let raw):
+            guard let url = URL(string: raw), let scheme = url.scheme, !scheme.isEmpty else {
+                r = .failed(kind: .openURL, action: action.label,
+                            reason: "不是合法 URL（\(raw)）", attempt: attempt, elapsedMs: elapsed())
+                break
+            }
+            let ok = await openURL(url)
+            r = ok
+                ? .executed(kind: .openURL, action: action.label, detail: "系统接受了 \(raw)",
+                            verified: false, verifyDetail: await noVerifyReason(),
+                            attempt: attempt, elapsedMs: elapsed())
+                : .failed(kind: .openURL, action: action.label,
+                          reason: "系统拒绝打开（scheme 未注册或被策略禁止）",
+                          attempt: attempt, elapsedMs: elapsed())
+
+        case .openApp(let name):
+            // iOS 没有"按名字启动任意 App"的公共 API。可行的只有两条：
+            //   1) 该 App 注册了自己的 URL scheme（名字未必等于 App 名，所以这是**尽力而为**）；
+            //   2) 用户自建一条快捷指令去打开它（用 runShortcut 调用）。
+            // 两条都只有"系统接受"的回执，没有"App 真起来了"的证据。
+            let scheme = name.lowercased().replacingOccurrences(of: " ", with: "")
+            guard let url = URL(string: "\(scheme)://"), let _ = url.scheme else {
+                r = .failed(kind: .openApp, action: action.label,
+                            reason: "名字无法转成 URL scheme", attempt: attempt, elapsedMs: elapsed())
+                break
+            }
+            let ok = await openURL(url)
+            r = ok
+                ? .executed(kind: .openApp, action: action.label,
+                            detail: "系统接受了 \(scheme):// （仅当该 App 注册了同名 scheme 才会真的打开）",
+                            verified: false, verifyDetail: await noVerifyReason(),
+                            attempt: attempt, elapsedMs: elapsed())
+                : .failed(kind: .openApp, action: action.label,
+                          reason: "\(name) 没有可识别的 URL scheme。请让用户建一条「打开 \(name)」"
+                            + "快捷指令，再用 run_shortcut 调它 —— 这是普通 iOS 上唯一可靠的做法",
+                          attempt: attempt, elapsedMs: elapsed())
+
+        case .runShortcut(let name):
+            var allowed = CharacterSet.urlQueryAllowed
+            allowed.remove(charactersIn: "&+=")
+            let encoded = name.addingPercentEncoding(withAllowedCharacters: allowed) ?? name
+            guard let url = URL(string: "shortcuts://run-shortcut?name=\(encoded)") else {
+                r = .failed(kind: .runShortcut, action: action.label,
+                            reason: "快捷指令名无法编码", attempt: attempt, elapsedMs: elapsed())
+                break
+            }
+            let ok = await openURL(url)
+            r = ok
+                ? .executed(kind: .runShortcut, action: action.label,
+                            detail: "已请求系统运行「\(name)」：只代表系统接受，"
+                              + "快捷指令可能弹确认且跑完无回执",
+                            verified: false, verifyDetail: await noVerifyReason(),
+                            attempt: attempt, elapsedMs: elapsed())
+                : .failed(kind: .runShortcut, action: action.label,
+                          reason: "系统拒绝 shortcuts://（未装快捷指令 App 或未声明 scheme）",
+                          attempt: attempt, elapsedMs: elapsed())
+
+        case .screenshot:
+            // capability 门控已经挡住，走到这里说明矩阵有 bug —— 仍然如实报 unsupported。
+            r = .unsupported(kind: .screenshot,
+                             reason: "iOS 无整机截屏公共 API（门控漏过了这一项）", attempt: attempt)
+
+        case .tap(let x, let y):
+            #if SIMULATE_TAP
+            let cx = ComputerAction.clamp(x), cy = ComputerAction.clamp(y)
+            let text = TapBackend.tap(normalizedX: cx, normalizedY: cy)
+            if text.hasPrefix("失败") {
+                r = .failed(kind: .tap, action: action.label, reason: text,
+                            attempt: attempt, elapsedMs: elapsed())
+            } else {
+                // 派发成功 ≠ 屏幕动了：没有截图就没有验证源，只能到 executedUnverified。
+                r = .executed(kind: .tap, action: action.label, detail: text, verified: false,
+                              verifyDetail: await noVerifyReason(),
+                              attempt: attempt, elapsedMs: elapsed())
+            }
+            #else
+            r = .unsupported(kind: .tap, reason: "合规版未编译合成触摸路径", attempt: attempt)
+            #endif
+
+        case .swipe, .type:
+            // 当前没有任何 backend 实现它们（Tap 变体的键盘事件也未接线）。
+            r = .unsupported(kind: action.kind, reason: cap.reason, attempt: attempt)
+        }
+
+        // 验证阶段（§9）：先等 UI 稳定，再看有没有验证源。
+        if r.executed, r.status == .executedUnverified, cap.verify == .probe, action.kind != .wait {
+            try? await Task.sleep(nanoseconds: UInt64(ComputerRetryPolicy.default.settleMs) * 1_000_000)
+        }
+
+        metrics.record(r)
+        return r
+    }
+
+    /// 当前为什么无法验证（原样写进 detail，模型据此必须说"执行了但没验证"）。
+    private static func noVerifyReason() async -> String {
+        "screenshot=unsupported，本机没有屏幕状态可比对，无法自动验证动作是否生效"
     }
 }
