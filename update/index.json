@@ -1,4 +1,9 @@
 {
-  "stable_version": "0.3.77",
-  "stable_ipa": "https://github.com/nmn999999999/LumenAI/releases/download/v0.3.77/LumenAI-v0.3.77.ipa"
+  "stable_version": "0.3.79",
+  "stable_ipa": "https://github.com/nmn999999999/LumenAI/releases/download/v0.3.79/LumenAI-v0.3.79.ipa",
+  "tap": {
+    "version": "0.3.79",
+    "ipa": "https://github.com/nmn999999999/LumenAI/releases/download/v0.3.79/LumenAI-Tap-v0.3.79.ipa",
+    "notes": "Tap 增强版：能力探测通过后开放 tap/swipe/type 合成触控（稳定版包仅 URL + 快捷指令）。"
+  }
 }

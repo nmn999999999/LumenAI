@@ -1397,6 +1397,14 @@ struct SettingsView: View {
                         HStack(spacing: 6) {
                             Text("当前版本 \(updater.currentVersion)")
                                 .font(.subheadline)
+                            if updater.isTap {
+                                Text("Tap 通道")
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.purple.opacity(0.15), in: Capsule())
+                                    .foregroundStyle(.purple)
+                            }
                             if updater.isGray {
                                 Text("灰度通道")
                                     .font(.caption2.weight(.semibold))
@@ -1407,9 +1415,9 @@ struct SettingsView: View {
                             }
                         }
                         if updater.hasUpdate {
-                            Text("发现新版本 \(updater.latestTag ?? "")" + (updater.isGray ? "（灰度）" : ""))
+                            Text("发现新版本 \(updater.latestTag ?? "")" + (updater.isGray ? "（灰度）" : (updater.isTap ? "（Tap）" : "")))
                                 .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(updater.isGray ? .orange : .green)
+                                .foregroundStyle(updater.isGray ? .orange : (updater.isTap ? .purple : .green))
                         } else if updater.lastChecked {
                             if let err = updater.lastError {
                                 // 检查失败与「已是最新」分开显示，避免误导
@@ -1468,6 +1476,21 @@ struct SettingsView: View {
                     Task { await updater.check() }
                 }
 
+                // 更新通道选择：稳定版 / Tap 增强版（决定「下载新版 IPA」拿的是哪个包）
+                Toggle(isOn: $storage.settings.updateTapChannel) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("更新到 Tap 增强版")
+                            .font(.subheadline)
+                        Text("开启后下载 LumenAI-Tap 包（含合成触控能力）；关闭则下载稳定版包")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .tint(.purple)
+                .onChange(of: storage.settings.updateTapChannel) { _, _ in
+                    Task { await updater.check() }
+                }
+
                 if updater.hasUpdate {
                     Divider()
                     VStack(alignment: .leading, spacing: 8) {
@@ -1484,7 +1507,8 @@ struct SettingsView: View {
                                     UIApplication.shared.open(url)
                                     #endif
                                 } label: {
-                                    Label("下载新版 IPA", systemImage: "arrow.down.circle.fill")
+                                    Label(updater.isTap ? "下载 Tap 版 IPA" : "下载新版 IPA",
+                                          systemImage: "arrow.down.circle.fill")
                                         .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(.glassProminent)
@@ -1501,7 +1525,8 @@ struct SettingsView: View {
                                 .buttonStyle(.glass)
                             }
                         }
-                        Text("侧载应用无法自动替换安装：下载 IPA 后请用全能签/自签方式重新安装。")
+                        Text("侧载应用无法自动替换安装：下载 IPA 后请用全能签/自签方式重新安装。"
+                             + (updater.isTap ? "当前通道：Tap 增强版。" : "当前通道：稳定版（可在上方开关切换）。"))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
