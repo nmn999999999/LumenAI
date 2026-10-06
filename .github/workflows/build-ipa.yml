@@ -136,6 +136,17 @@ jobs:
             | xargs -0 xcrun swiftc -parse
           echo "✅ Swift 语法全部通过"
 
+          # Benchmark 成功判定契约的单元测试。纯函数、只依赖 Foundation，
+          # 单独 swiftc 编译即可跑，不需要模拟器 —— 所以没有 test target 也能每次都跑。
+          # 判定规则是 A/B 对比可信度的地基：把 required 从「全都要」改回「命中其一」
+          # 这种悄悄放松的改动，必须在这里被挡下来。
+          echo "=== Benchmark 判定测试 ==="
+          swiftc -o /tmp/benchmark_verdict_tests \
+            LumenAI/Services/AgentPerf/BenchmarkVerdict.swift \
+            Tests/benchmark_verdict/main.swift
+          /tmp/benchmark_verdict_tests
+          echo "✅ Benchmark 判定测试全部通过"
+
           # project.yml 的 YAML 合法性：有 pyyaml 就提前校验（xcodegen 那步也会再校验一次），
           # 没有就跳过 —— 它缺席不该让整个构建挂掉。
           echo "=== project.yml YAML 校验 ==="

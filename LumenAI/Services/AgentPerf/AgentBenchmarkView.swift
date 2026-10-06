@@ -21,9 +21,10 @@ struct AgentBenchmarkView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("""
-                用同一批场景分别跑 baseline（优化全关）与 optimized（优化全开），对比工具命中率、\
-                reasoning / tool schema / tool result token、TTFT 与 P50/P95 延迟。
-                优化不能以降低任务成功率为代价 —— 先看命中率与成功率，再看 token 与延迟。
+                用同一批场景分别跑 baseline（优化全关）与 optimized（优化全开），对比任务成功率、\
+                工具轨迹（重复/无效/错误调用、required 覆盖率）、token、TTFT 与 P50/P95 延迟。
+                成败判定是场景自己的 BenchmarkContract（必须调用哪些工具 + 答案要满足什么），\
+                两个变体走同一份代码 —— 优化不能以降低任务成功率为代价。
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -77,8 +78,15 @@ struct AgentBenchmarkView: View {
     }
 
     private var failuresSection: some View {
-        let failures = report?.samples.filter { !$0.taskSuccess } ?? []
+        let samples = report?.samples ?? []
+        let failures = samples.filter { !$0.taskSuccess && !$0.verdict.isNotApplicable }
+        let notApplicable = samples.filter { $0.verdict.isNotApplicable }
         return VStack(alignment: .leading, spacing: 8) {
+            if !notApplicable.isEmpty {
+                Text("环境不适用（不计入成功率）：\(notApplicable.map(\.scenarioID).joined(separator: ", "))")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
             if failures.isEmpty {
                 Text("全部场景达标 ✓")
                     .font(.subheadline.weight(.medium))
@@ -90,9 +98,15 @@ struct AgentBenchmarkView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("\(s.variant.rawValue) · \(s.scenarioID)")
                             .font(.caption.weight(.semibold))
-                        Text("调用: \(s.calledTools.isEmpty ? "（无）" : s.calledTools.joined(separator: ", "))")
+                        Text("调用: \(s.calledTools.isEmpty ? "（无）" : s.calledTools.joined(separator: ", "))"
+                             + "（\(s.trajectory.toolCallCount) 次，重复 \(s.trajectory.duplicateCallCount)）")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                        if !s.verdict.failureSummary.isEmpty {
+                            Text(s.verdict.failureSummary)
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
                         if !s.answer.isEmpty {
                             Text(String(s.answer.prefix(140)))
                                 .font(.caption2)
@@ -121,6 +135,10 @@ struct AgentBenchmarkView: View {
         let tools = BuiltInTools.allTools
             + MCPService.shared.toolDefinitions
             + PluginManager.shared.installedToolDefinitions()
+        // 外部宇宙（MCP + 插件）：mcp_tool 场景靠它判断"是不是真的调了外部工具"。
+        // 一个都没装时该场景判 notApplicable，报告里单独计数，不混进失败率。
+        let externalNames = MCPService.shared.toolDefinitions.map(\.name)
+            + PluginManager.shared.installedToolDefinitions().map(\.name)
 
         // 保护真实断点存档：`AgentService.run` 正常结束时会对**全局**断点文件调用 clear()。
         // benchmark 不是用户的真实任务，绝不能顺手删掉用户可能还在等的「续跑」存档。
@@ -131,6 +149,7 @@ struct AgentBenchmarkView: View {
         let executor = AgentBenchmarkRunner.agentServiceExecutor(
             settings: settings,
             tools: tools,
+            externalToolNames: externalNames,
             llm: { llm })
 
         let result = await AgentBenchmarkRunner.run(
