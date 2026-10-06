@@ -59,6 +59,9 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: com.lumenai.app
             CFBundleURLSchemes: [lumenai]
+        # 没有这两行，`canOpenURL(shortcuts://…)` 恒为 false —— phone 工具的 probe
+        # 会据此误报"快捷指令不可用"。声明它只影响查询，不等于能绕过系统确认去跑。
+        LSApplicationQueriesSchemes: [shortcuts, itms-apps, prefs]
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

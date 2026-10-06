@@ -373,6 +373,28 @@ enum BuiltInTools {
             ],
             requiresApproval: false,
         ),
+        // ── phone：把"操作手机"这件事变成**有边界、有回执**的能力 ──
+        //
+        // 能力边界写进描述里是必须的，不是谦虚：合规版只能打开 URL / 触发已装快捷指令
+        // （系统还会弹确认），根本没有系统级点击与输入。如果描述里不写死，
+        // 模型会拿"tap 成功"这种不存在的返回值去向用户复述 —— 那是这个工具最危险的失败模式。
+        //
+        // requiresApproval 必须是 true：它会切换到别的 App、跑用户编的自动化。
+        // 这是本仓库里少数几个"读也该批"的工具（`probe` 也会打开 URL 做实测）。
+        AgentToolDefinition(
+            id: "phone",
+            name: "phone",
+            description: "操作手机：list 查看配方、run 运行配方/已装快捷指令、save 保存模型编写的配方、delete 删除、probe 实测本机能力。⚠️ 合规版只能打开 URL 与触发快捷指令（系统会弹确认、且没有完成回执），不能直接点击屏幕或输入文字；合成触摸仅 Tap 自签版可用。返回什么就报什么，不要声称用户没确认的动作已完成",
+            parameters: [
+                "op": .init(type: "string", description: "操作（必填）", enumValues: ["list", "run", "save", "delete", "probe", "tap"]),
+                "name": .init(type: "string", description: "配方或快捷指令名（run/save/delete/tap 必填；run 时若无同名配方则直接按名字触发快捷指令）", enumValues: nil),
+                "summary": .init(type: "string", description: "一句话说明这条配方干什么（save 可选）", enumValues: nil),
+                "steps": .init(type: "string", description: "配方步骤，每行一条：run <快捷指令名> / open <url> / tap <x> <y>（0..1）/ wait <秒> / # 注释（save 时可选，留空则只按 name 触发快捷指令）", enumValues: nil),
+                "x": .init(type: "number", description: "点击横坐标，0..1 归一化（op=tap 必填，仅 Tap 版有效）", enumValues: nil),
+                "y": .init(type: "number", description: "点击纵坐标，0..1 归一化（op=tap 必填，仅 Tap 版有效）", enumValues: nil)
+            ],
+            requiresApproval: true,
+        ),
         // ⚠️ `todo` **刻意不进** `BuiltInTools.defaultEnabledNames`（见本文件末尾那份清单）。
         //
         // 那份 12 个工具的有序清单是**本地 Qwen3-1.7B 的训练契约**：训练数据
@@ -687,6 +709,7 @@ enum BuiltInTools {
         case "url_codec":       return executeUrlCodec(arguments: arguments)
         case "note":            return await executeNote(arguments: arguments)
         case "memory":          return await executeMemory(arguments: arguments)
+        case "phone":           return await executePhone(arguments: arguments)
         case "todo":            return await executeTodo(arguments: arguments)
         case "clipboard":       return executeClipboard(arguments: arguments)
         case "file_op":         return executeFileOp(arguments: arguments)
@@ -1340,6 +1363,101 @@ enum BuiltInTools {
                 return "错误: 不支持的 op: \(op)"
             }
         }
+    }
+
+    /// `phone` 工具：配方管理 + 运行 + 能力探测（+ Tap 版的合成点击）。
+    ///
+    /// 所有"动作是否真的发生"都由 `ShortcutEngine` 判定并原样回传：
+    /// 这里**不补任何乐观文案**。这个工具最坏的失败不是报错，而是让模型
+    /// 向用户复述"已经点过了"—— 那会让用户以为自动化生效了，其实屏幕上什么都没发生。
+    private static func executePhone(arguments: [String: Any]) async -> String {
+        let opRead = enumeratedArgument(
+            arguments, "op", label: "操作",
+            allowed: allowedValues(tool: "phone", parameter: "op",
+                                   fallback: ["list", "run", "save", "delete", "probe", "tap"]),
+            default: nil)
+        guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
+
+        let name = (arguments["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let summary = arguments["summary"] as? String ?? ""
+        let steps = arguments["steps"] as? String ?? ""
+
+        // 闭包外取成 Sendable 原子类型（同 executeMemory 的 sending 约束）。
+        let x = Self.doubleArgument(arguments, "x")
+        let y = Self.doubleArgument(arguments, "y")
+
+        switch op {
+        case "list":
+            return await MainActor.run {
+                let recipes = ShortcutStore.shared.recipes
+                guard !recipes.isEmpty else {
+                    return "（暂无配方。用 save 保存一条，或直接用 run + 快捷指令名触发系统里的指令）"
+                }
+                return recipes.map { r in
+                    "\(r.id.uuidString.prefix(8)) \(r.name) — \(r.summary.isEmpty ? "(无说明)" : r.summary)"
+                        + (r.actions.isEmpty ? "" : "（\(r.actions.count) 步）")
+                }.joined(separator: "\n")
+            }
+
+        case "save":
+            guard !name.isEmpty else {
+                return "错误: save 需要 name（快捷指令名或配方名）"
+            }
+            return await MainActor.run {
+                guard let recipe = ShortcutStore.shared.save(name: name, summary: summary, actionsText: steps) else {
+                    return "错误: 配方名不能为空"
+                }
+                let body = recipe.actions.isEmpty
+                    ? "（未填 steps，之后 run 会直接按名字触发同名快捷指令）"
+                    : "\n\(recipe.actionDescriptions.map { "  · " + $0 }.joined(separator: "\n"))"
+                return "已保存「\(recipe.name)」：\(recipe.summary.isEmpty ? "(无说明)" : recipe.summary)\(body)"
+            }
+
+        case "delete":
+            guard !name.isEmpty else { return "错误: delete 需要 name 或 id" }
+            return await MainActor.run {
+                guard let removed = ShortcutStore.shared.delete(id: name) else {
+                    return "错误: 找不到配方「\(name)」（先用 list 核对）"
+                }
+                return "已删除配方「\(removed)」"
+            }
+
+        case "run":
+            guard !name.isEmpty else { return "错误: run 需要 name" }
+            // 配方优先：有同名配方就按它执行（含 tap/wait/注释），没有就直接触发快捷指令。
+            let recipe = await MainActor.run { ShortcutStore.shared.recipe(id: name) }
+            if let recipe { return await ShortcutEngine.run(recipe) }
+            return await ShortcutEngine.runShortcut(named: name)
+
+        case "probe":
+            return await ShortcutEngine.probe()
+
+        case "tap":
+            guard let x, let y else {
+                return "错误: tap 需要 x 与 y（0..1 归一化坐标）"
+            }
+            let cx = min(max(x, 0), 1), cy = min(max(y, 0), 1)
+            #if SIMULATE_TAP
+            return await MainActor.run { TapBackend.tap(normalizedX: cx, normalizedY: cy) }
+            #else
+            _ = (cx, cy)
+            return """
+            错误: 本构建（合规版）不能合成触摸 —— 这不是参数问题，是版本能力边界。
+            可选做法：把点击做成快捷指令里的动作，再用 run 执行；或改用 LumenAI-Tap 自签版。
+            先用 op=probe 实测本机能力。
+            """
+            #endif
+        default:
+            return "错误: 不支持的 op: \(op)"
+        }
+    }
+
+    /// 从工具参数里读一个浮点数（模型可能发 Double、整数或字符串）。
+    private static func doubleArgument(_ arguments: [String: Any], _ key: String) -> Double? {
+        if let d = arguments[key] as? Double { return d }
+        if let n = arguments[key] as? NSNumber { return n.doubleValue }
+        if let s = arguments[key] as? String { return Double(s) }
+        return nil
     }
 
     /// `todo` 工具：维护当前任务的步骤清单（面板上可见的进度）。

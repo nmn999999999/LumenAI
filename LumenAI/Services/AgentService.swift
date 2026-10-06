@@ -134,6 +134,18 @@ final class AgentService: ObservableObject {
                          + " ask for a remote operation.")
         }
 
+        // 手机操作（phone 工具）。同样必须把**做得到 / 做不到**写清楚：
+        // 合规版只到 URL + 已装快捷指令为止，而且没有"跑完了"的回执 ——
+        // 模型最常犯的错是把"系统接受了 URL"当成"动作已完成"，这句就是冲着它写的。
+        if tools.contains(where: { $0.name == "phone" }) {
+            lines.append("- Phone automation: the `phone` tool can launch saved recipes, trigger"
+                         + " user-installed Shortcuts (`shortcuts://`, the system may prompt), open"
+                         + " URLs, and `probe` what this build can actually do. There is **no**"
+                         + " synthetic touch or text injection unless probe says otherwise, and a"
+                         + " successful launch is not a completion receipt — report exactly what"
+                         + " the tool returned.")
+        }
+
         // 用户文件工作区。为什么值得单列一条：它是**唯一**能让模型"动手改东西"的地方，
         // 而模型对它的默认假设是错的 —— 它会以为自己在通用文件系统上（写 `/tmp/x.txt`、
         // 读 `~/Documents/...`），于是列出不存在的路径、或者干脆声称改好了。
