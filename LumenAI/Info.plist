@@ -35,5 +35,9 @@
 		<string>itms-apps</string>
 		<string>prefs</string>
 	</array>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 </dict>
 </plist>

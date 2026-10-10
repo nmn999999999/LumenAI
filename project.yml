@@ -5,21 +5,12 @@ options:
     iOS: "26.0"
   createIntermediateGroups: true
 
-# ── 构建配置（双变体）──────────────────────────────────────
-# *Tap 后缀的配置 = 自签增强版，编译期多一个 SIMULATE_TAP 条件，
-# 只有它才会编进 HID 触摸注入那套私有 API（见 ScreenAutomation/）。
-#
-# 为什么用编译期而不是运行时开关：合规版的二进制里**根本不允许存在**这些符号，
-# 否则字符串扫描就能发现，App Store 审核必挂。运行时开关做不到这一点。
-#
-# 两个变体共用 bundle id：后装的会覆盖先装的（同 id 无法并存）。
-# 真要同时装两份，得连 widget 的 id 一起改（扩展 id 必须以前缀方式挂在主 App 下），
-# 那会让灵动岛在两个变体间互相顶掉 —— 不值得，先按覆盖来。
+# ── 构建配置 ─────────────────────────────────────
+# 单一变体：合成触摸（tap/tap 变体 / SIMULATE_TAP）已整体移除。
+# 手机操作改为「快捷指令主导 + 实时指导用户操作」的协作模式，不再含私有 API。
 configs:
   Debug: debug
   Release: release
-  DebugTap: debug
-  ReleaseTap: release
 
 settings:
   base:
@@ -62,6 +53,10 @@ targets:
         # 没有这两行，`canOpenURL(shortcuts://…)` 恒为 false —— phone 工具的 probe
         # 会据此误报"快捷指令不可用"。声明它只影响查询，不等于能绕过系统确认去跑。
         LSApplicationQueriesSchemes: [shortcuts, itms-apps, prefs]
+        # 「手机协作」共享通道：让 Documents 在「文件」App 里可见（我的 iPhone/LumenAI），
+        # 快捷指令才能用它读写 inbox/outbox 与进度文件 —— App Group 对快捷指令不可见。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
@@ -105,13 +100,6 @@ targets:
         ENABLE_BITCODE: NO
         # 链接后端框架
         OTHER_LDFLAGS: $(inherited) -framework Metal -framework Accelerate -framework Foundation
-      # *Tap 配置独有：打开触摸注入能力（仅这两个配置会编进 ScreenAutomation 的 HID 后端）。
-      # 用 $(inherited) 是为了不丢掉 XcodeGen 为 Debug 预设的 DEBUG 标志。
-      configs:
-        DebugTap:
-          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIMULATE_TAP"
-        ReleaseTap:
-          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIMULATE_TAP"
 
   # 灵动岛 / 锁屏实时活动扩展。
   LumenAIWidget:
@@ -166,23 +154,6 @@ schemes:
       config: Debug
     archive:
       config: Release
-
-  # 自签增强版：与 LumenAI 完全同源，只是编译配置换成 *Tap（多一个 SIMULATE_TAP）。
-  # preActions 必须照抄一份 —— scheme 的 preAction 不继承，
-  # 漏了它这个变体构建时就不会打 speech-swift 的 4-bit 补丁，CosyVoice 会加载失败。
-  LumenAI-Tap:
-    build:
-      targets:
-        LumenAI: all
-      preActions:
-        - name: 修补 speech-swift（放行 4-bit CosyVoice3 权重）
-          script: |
-            /usr/bin/env python3 "$SRCROOT/scripts/patch-speech-swift.py" || true
-          settingsTarget: LumenAI
-    run:
-      config: DebugTap
-    archive:
-      config: ReleaseTap
 
 # ── SPM 依赖 ─────────────────────────────────────────────
 # speech-swift：Apple Silicon 上的本地语音引擎集合（MLX Swift + Core ML）。

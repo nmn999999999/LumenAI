@@ -313,7 +313,7 @@ final class TodoStore: ObservableObject {
     /// 当前是否应该显示面板（非空即显示）。
     var isActive: Bool { !todos.isEmpty }
 
-    // MARK: - 返回文案（写死，便于将来做训练数据）
+    // MARK: - 返回文案（写死，保持稳定与可读）
 
     private static func header(prefix: String, todos: [Todo]) -> String {
         let done = todos.filter { $0.status == .completed }.count
@@ -334,7 +334,7 @@ final class TodoStore: ObservableObject {
     }
 
     /// 提醒/截断信息**合并成最后一行**（固定前缀 "注意: "），保证正文部分逐条稳定：
-    /// 将来拿这些文本做训练数据时，正文不会被数量不定的提醒行切碎。
+    /// 这样正文不会被数量不定的提醒行切碎。
     private static func noteLine(_ warnings: [String]) -> String? {
         guard !warnings.isEmpty else { return nil }
         return "注意: " + warnings.joined(separator: "；")

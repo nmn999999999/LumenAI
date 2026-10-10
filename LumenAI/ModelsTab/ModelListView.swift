@@ -319,14 +319,7 @@ struct CatalogModelRow: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 6) {
-                            Text(model.name).font(.headline)
-                            // 自训模型单独标出来。列表里 13 个条目长得很像，
-                            // 而只有这一个带陪伴语域与跨对话记忆 —— 不标的话用户只能靠猜。
-                            if model.isSelfTrained {
-                                ModelBadge(text: "自训 · 带记忆", tint: .accentColor)
-                            }
-                        }
+                        Text(model.name).font(.headline)
                         Text(model.description)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -366,14 +359,6 @@ struct CatalogModelRow: View {
                     }
                     .buttonStyle(.glassProminent)
                 }
-            }
-        }
-        // 自训模型加一圈强调色描边：badge 只有几十 pt 宽，在一屏 3~4 张卡片里很难被扫到；
-        // 描边是整张卡的视觉重量，滚动时能直接跳出来。
-        .overlay {
-            if model.isSelfTrained {
-                RoundedRectangle(cornerRadius: 18)
-                    .strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1.5)
             }
         }
     }

@@ -1145,7 +1145,7 @@ struct ChatView: View {
         conv.modelName = providerStore.hasCloudSelection ? providerStore.selectionText : llmService.loadedModelName
         chatStore.upsert(conv)
 
-        let effectiveSettings = effectiveSettings(from: settings, modelName: modelName, providerName: providerName)
+        let effectiveSettings = effectiveSettings(from: settings, modelName: modelName, providerName: providerName, forAgent: isAgentMode)
 
         if isAgentMode {
             // 小模型不支持 Agent：提示并按普通对话发送（v0.3.45）
@@ -1239,7 +1239,7 @@ struct ChatView: View {
         let modelName = providerStore.hasCloudSelection ? providerStore.currentModel : (llmService.loadedModelName ?? "")
         let providerName = providerStore.currentProvider?.name ?? ""
         let settings = effectiveSettings(from: chatSettings.settings,
-                                         modelName: modelName, providerName: providerName)
+                                         modelName: modelName, providerName: providerName, forAgent: true)
 
         let resumed = AgentRunCheckpoint(
             conversationID: cp.conversationID,
@@ -1408,7 +1408,10 @@ struct ChatView: View {
     }
 
     /// 解析助手绑定 + 提示词变量 + 人格注入 + 提示词策略 → 有效设置
-    private func effectiveSettings(from settings: ModelSettings, modelName: String, providerName: String) -> ModelSettings {
+    /// - Parameter forAgent: Agent 模式传 true。Agent 的系统提示词自带「输出风格 / 工作流」
+    ///   约束，再叠加 simple/standard/pro 的「回答风格」会互相打架（例如 simple 要求
+    ///   "一次只回答一个问题、不要表格"，会误伤 agent 的多步工具流程），所以 Agent 模式跳过策略模板。
+    private func effectiveSettings(from settings: ModelSettings, modelName: String, providerName: String, forAgent: Bool = false) -> ModelSettings {
         var effective = settings
         let assistant = assistantStore.current
         // 助手的提示词**只在用户真的改过时**才覆盖全局设置。
@@ -1435,24 +1438,27 @@ struct ChatView: View {
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n\n")
         }
-        // 提示词策略：按模型能力自动适配（本地小模型简洁 / 云端旗舰专业）
-        let resolved = resolveEngine()
-        let useCloud = resolved.provider != nil
-        let strategyModel = useCloud ? resolved.model : (llmService.loadedModelName ?? "")
-        let strategy = PromptStrategyResolver.detect(
-            isCloud: useCloud,
-            modelName: strategyModel,
-            forced: PromptStrategy(rawValue: settings.promptStrategy) ?? .auto
-        )
-        let template = PromptStrategyResolver.template(
-            for: strategy,
-            language: effective.language,
-            assistantName: assistant?.name ?? "AI"
-        )
-        if !template.isEmpty {
-            effective.systemPrompt = [effective.systemPrompt, template]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
+        // 提示词策略：按模型能力自动适配（本地小模型简洁 / 云端旗舰专业）。
+        // ⚠️ Agent 模式跳过：agent 系统提示词已包含完整的输出风格与工作流，叠加策略模板会冲突。
+        if !forAgent {
+            let resolved = resolveEngine()
+            let useCloud = resolved.provider != nil
+            let strategyModel = useCloud ? resolved.model : (llmService.loadedModelName ?? "")
+            let strategy = PromptStrategyResolver.detect(
+                isCloud: useCloud,
+                modelName: strategyModel,
+                forced: PromptStrategy(rawValue: settings.promptStrategy) ?? .auto
+            )
+            let template = PromptStrategyResolver.template(
+                for: strategy,
+                language: effective.language,
+                assistantName: assistant?.name ?? "AI"
+            )
+            if !template.isEmpty {
+                effective.systemPrompt = [effective.systemPrompt, template]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n\n")
+            }
         }
         if let temp = assistant?.temperature {
             effective.temperature = temp

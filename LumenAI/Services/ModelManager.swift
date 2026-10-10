@@ -505,7 +505,7 @@ final class ModelManager: ObservableObject {
         // ⚠️ 「换源」和「重试」是两件不同的事，这里必须分开：
         //   · 重试 = 同一个源再试一次。适用于瞬时错误（超时、连接重置、5xx）。
         //   · 换源 = 这个源根本不行（404 没有这个仓库、403 被拒），换一个。
-        // 混在一起的后果很具体：魔搭没有我们自训模型的镜像，第一个源必然 404；
+        // 混在一起的后果很具体：某个仓库在魔搭没有镜像，第一个源必然 404；
         // 若把 404 当成"可重试"，这里会对着同一个 404 重试三次、每次还退避等待，
         // 用户要白等七八秒才轮到本来能用的 hf-mirror。
         let sourceExhausted = !retryable || item.attempts > RetryPolicy.defaultAttempts

@@ -10,19 +10,11 @@ struct AppUpdateIndex: Codable, Sendable {
     var stableVersion: String
     var stableIpa: String
     var gray: GrayEntry?
-    /// Tap 增强版通道（自签 Tap 变体；用户在设置里选择更新到哪个包）
-    var tap: TapEntry?
 
     struct GrayEntry: Codable, Sendable {
         var enabled: Bool
         /// 灰度比例 0-100（设备分桶命中概率）
         var percent: Int
-        var version: String
-        var ipa: String
-        var notes: String?
-    }
-
-    struct TapEntry: Codable, Sendable {
         var version: String
         var ipa: String
         var notes: String?
@@ -35,8 +27,6 @@ struct AppUpdateResolved: Sendable {
     let ipa: URL?
     let notes: String?
     let isGray: Bool
-    /// 实际选中的是否 Tap 通道（索引没有 tap 条目时会回落稳定版，此处如实反映）
-    var isTap: Bool = false
 }
 
 /// 模块灰度策略（modules/index.json 条目内可选 gray 字段）
@@ -75,9 +65,7 @@ enum UpdatePolicy {
     }
 
     /// 解析对当前设备生效的 App 更新
-    /// - Parameters:
-    ///   - preferTap: 用户在设置里选择更新到 Tap 增强版时为 true（索引无 tap 条目则回落稳定版）
-    static func resolveAppUpdate(_ index: AppUpdateIndex, optInGray: Bool, preferTap: Bool = false) -> AppUpdateResolved {
+    static func resolveAppUpdate(_ index: AppUpdateIndex, optInGray: Bool) -> AppUpdateResolved {
         if let gray = index.gray, gray.enabled, !gray.version.isEmpty,
            inGray(percent: gray.percent, optIn: optInGray) {
             return AppUpdateResolved(
@@ -85,15 +73,6 @@ enum UpdatePolicy {
                 ipa: URL(string: gray.ipa),
                 notes: gray.notes,
                 isGray: true
-            )
-        }
-        if preferTap, let tap = index.tap, !tap.version.isEmpty {
-            return AppUpdateResolved(
-                version: tap.version,
-                ipa: URL(string: tap.ipa),
-                notes: tap.notes,
-                isGray: false,
-                isTap: true
             )
         }
         return AppUpdateResolved(

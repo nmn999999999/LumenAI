@@ -7,7 +7,8 @@ import Foundation
 //       LumenAI/Services/ScreenAutomation/ComputerAction.swift \
 //       Tests/screenautomation/main.swift && /tmp/sa_tests
 //
-// 核心是三条"不许假成功"的不变量（case 3-6），它们是本次改造的验收底线。
+// 核心是三条"不许假成功"的不变量（case 3-6），它们是验收底线。
+// 合成触摸（tap/swipe/type）已整体移除，动作集合只剩 URL / 快捷指令 / 等待。
 
 var failures = 0
 func check(_ name: String, _ cond: Bool, _ extra: String = "") {
@@ -15,18 +16,14 @@ func check(_ name: String, _ cond: Bool, _ extra: String = "") {
     else { failures += 1; print("  ✗ \(name) \(extra)") }
 }
 
-print("== 1. 普通 iOS（合规变体）能力矩阵 ==")
+print("== 1. 能力矩阵（普通 iOS 构建） ==")
 do {
-    let caps = ComputerCapabilityMatrix.make(isTapBuild: false, tapProbeAvailable: false,
-                                             shortcutsAvailable: true)
+    let caps = ComputerCapabilityMatrix.make(shortcutsAvailable: true)
     func st(_ k: ComputerActionKind) -> ComputerCapabilityStatus? {
         ComputerCapabilityMatrix.capability(k, in: caps)?.status
     }
     check("screenshot = unsupported（iOS 无整机截屏公共 API）",
           st(.screenshot) == .unsupported, "\(st(.screenshot)!)")
-    check("tap = unsupported", st(.tap) == .unsupported)
-    check("swipe = unsupported", st(.swipe) == .unsupported)
-    check("type = unsupported", st(.type) == .unsupported)
     check("wait = supported", st(.wait) == .supported)
     check("open_url = supported", st(.openURL) == .supported)
     check("open_app = restricted（要 scheme 或用户自建快捷指令）", st(.openApp) == .restricted)
@@ -35,30 +32,23 @@ do {
           caps.filter { $0.status.isAttemptable }.map(\.kind.rawValue).sorted()
               == ["open_app", "open_url", "run_shortcut", "wait"],
           "\(caps.filter { $0.status.isAttemptable }.map { $0.kind.rawValue })")
+    check("不再有 tap/swipe/type 这三类能力",
+          !ComputerActionKind.allCases.map(\.rawValue).contains("tap")
+              && !ComputerActionKind.allCases.map(\.rawValue).contains("swipe")
+              && !ComputerActionKind.allCases.map(\.rawValue).contains("type"))
 }
 
-print("== 2. 特殊环境（Tap 变体）矩阵 ==")
+print("== 2. shortcuts:// 不可用时降级 ==")
 do {
-    let probed = ComputerCapabilityMatrix.make(isTapBuild: true, tapProbeAvailable: true,
-                                               shortcutsAvailable: true)
-    let notProbed = ComputerCapabilityMatrix.make(isTapBuild: true, tapProbeAvailable: false,
-                                                  shortcutsAvailable: true)
-    check("probe 命中 → tap = requiresSpecialEnvironment",
-          ComputerCapabilityMatrix.capability(.tap, in: probed)?.status == .requiresSpecialEnvironment)
-    check("probe 未命中 → tap = unsupported（本机实测不可用）",
-          ComputerCapabilityMatrix.capability(.tap, in: notProbed)?.status == .unsupported)
-    check("特殊环境能力不混进 supported",
-          ComputerCapabilityMatrix.capability(.tap, in: probed)?.status != .supported)
     check("scheme 不可用 → run_shortcut = restricted",
           ComputerCapabilityMatrix.capability(
             .runShortcut,
-            in: ComputerCapabilityMatrix.make(isTapBuild: false, tapProbeAvailable: false,
-                                              shortcutsAvailable: false))?.status == .restricted)
+            in: ComputerCapabilityMatrix.make(shortcutsAvailable: false))?.status == .restricted)
 }
 
 print("== 3. 不许假成功：unsupported 的不变量 ==")
 do {
-    let r = ComputerActionResult.unsupported(kind: .tap, reason: "合规版没有合成触摸")
+    let r = ComputerActionResult.unsupported(kind: .screenshot, reason: "iOS 无整机截屏公共 API")
     check("executed = false", !r.executed)
     check("verified = false", !r.verified)
     check("status = unsupported", r.status == .unsupported)
@@ -90,8 +80,8 @@ do {
                                           verifyDetail: "定时器回调到达")
     check("executed + verified → success", r.status == .success && r.status.isSuccess)
     check("invariant 成立", r.invariantHolds)
-    let v = ComputerActionResult.verificationFailed(kind: .tap, action: "tap(0.5,0.5)",
-                                                    detail: "重截图后目标未出现")
+    let v = ComputerActionResult.verificationFailed(kind: .openURL, action: "open_url(x)",
+                                                    detail: "目标页面未出现")
     check("验证失败 → verification_failed", v.status == .verificationFailed)
     check("验证失败不能是 success", !v.status.isSuccess)
     check("验证失败 invariant 成立", v.invariantHolds)
@@ -101,8 +91,8 @@ print("== 6. failed / timeout 的不变量 ==")
 do {
     let f = ComputerActionResult.failed(kind: .openURL, action: "open_url(x)",
                                         reason: "系统拒绝")
-    let t = ComputerActionResult.timeout(kind: .tap, action: "tap(0.1,0.1)",
-                                         reason: "15000ms 内无验证信号")
+    let t = ComputerActionResult.timeout(kind: .runShortcut, action: "run_shortcut(x)",
+                                         reason: "15000ms 内无回执")
     check("failed 未执行未验证", !f.executed && !f.verified && f.status == .failed && f.invariantHolds)
     check("timeout 未执行未验证", !t.executed && !t.verified && t.status == .timeout && t.invariantHolds)
     check("failed 不是 success", !f.status.isSuccess && !t.status.isSuccess)
@@ -120,20 +110,20 @@ do {
     check("置信度阈值 0...1", p.confidenceThreshold > 0 && p.confidenceThreshold < 1)
 }
 
-print("== 8. 归一化坐标与动作标签 ==")
+print("== 8. 动作标签映射 ==")
 do {
-    check("clamp(-0.2) = 0", ComputerAction.clamp(-0.2) == 0)
-    check("clamp(1.7) = 1", ComputerAction.clamp(1.7) == 1)
-    check("clamp(0.42) = 0.42", ComputerAction.clamp(0.42) == 0.42)
-    check("tap kind 映射", ComputerAction.tap(x: 0.5, y: 0.5).kind == .tap)
     check("open_app kind 映射", ComputerAction.openApp(name: "Safari").kind == .openApp)
+    check("open_url kind 映射", ComputerAction.openURL("https://x").kind == .openURL)
+    check("run_shortcut kind 映射", ComputerAction.runShortcut("X").kind == .runShortcut)
+    check("wait kind 映射", ComputerAction.wait(milliseconds: 100).kind == .wait)
+    check("screenshot kind 映射", ComputerAction.screenshot.kind == .screenshot)
     check("所有 kind 都有 opName", ComputerActionKind.allCases.allSatisfy { !$0.opName.isEmpty })
 }
 
 print("== 9. 步骤指标 ==")
 do {
     var m = ComputerStepMetrics()
-    m.record(.unsupported(kind: .tap, reason: "x", elapsedMs: 0))
+    m.record(.unsupported(kind: .screenshot, reason: "x", elapsedMs: 0))
     m.record(.executed(kind: .wait, action: "wait", detail: "ok", verified: true,
                        elapsedMs: 120, verifyElapsedMs: 5))
     m.record(.executed(kind: .runShortcut, action: "run", detail: "ok", verified: false,

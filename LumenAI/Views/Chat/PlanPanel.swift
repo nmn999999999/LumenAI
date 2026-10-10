@@ -307,7 +307,7 @@ struct TaskListSheet: View {
 
     /// `todo` 工具是否已启用（只对本地模型有意义，云端模型始终拿全量工具）。
     ///
-    /// 为什么这个页面要关心它：本地模型的工具目录是**训练契约**（12 个、固定顺序），
+    /// 为什么这个页面要关心它：本地模型的工具目录只有 12 个位置（给小模型控制上下文），
     /// `todo` 刻意不在默认清单里，所以本地模型用户看不到任何清单 —— 而他们最容易
     /// 以为"这功能坏了"。与其让他自己去设置里翻，不如在这里把原因和开关一起摆出来。
     private var todoEnabled: Bool { toolStore.isEnabled("todo") }
@@ -376,7 +376,7 @@ struct TaskListSheet: View {
 
                         Label {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("用本地模型需要手动打开 todo 工具。原因是本地模型只喂前 \(toolStore.limit) 个工具，而这份有序清单是它的**训练契约** —— 塞一个它没见过的工具名进去，会让已经训好的行为退化，所以 todo 默认不在里面。")
+                                Text("用本地模型需要手动打开 todo 工具。原因是本地模型只喂前 \(toolStore.limit) 个工具（控制小模型的上下文长度），todo 默认不在这个精简清单里，所以需要手动开启。")
                                     .fixedSize(horizontal: false, vertical: true)
                                 if todoEnabled {
                                     Label("已经打开了", systemImage: "checkmark.circle.fill")

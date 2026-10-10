@@ -2,9 +2,8 @@ import Foundation
 
 /// 模型（或用户）编写的"手机操作步骤"。
 ///
-/// 这是**两个变体共用**的数据结构：合规版只执行其中能安全执行的部分
-/// （打开 URL / 运行已装快捷指令），Tap 版额外能执行 `tap` 这类合成触摸。
-/// 用同一份数据意味着用户在两个变体之间切换时，编好的配方不会作废。
+/// 只包含普通 iOS 上能安全执行的步骤：打开 URL / 运行已装快捷指令 / 等待。
+/// 合成触摸（tap）已整体移除 —— 交互交给快捷指令，或由 Agent 实时指导用户完成。
 struct ShortcutRecipe: Identifiable, Codable, Equatable, Sendable {
 
     var id: UUID
@@ -25,15 +24,11 @@ struct ShortcutRecipe: Identifiable, Codable, Equatable, Sendable {
     }
 
     enum Action: Codable, Equatable, Sendable {
-        /// 运行快捷指令 App 里的一条指令（两个变体都支持）。
+        /// 运行快捷指令 App 里的一条指令。
         case runShortcut(String)
         /// 打开一个 URL（可跳到别的 App，取决于对方注册的 scheme）。
         case openURL(String)
-        /// 在归一化坐标 (0..1) 处点一下 —— **只有 SIMULATE_TAP 变体真能执行**。
-        case tap(x: Double, y: Double)
         case wait(seconds: Double)
-        /// 打一段字（合规版没有系统级输入注入，只作为记录）。
-        case typeText(String)
         /// 纯注释，执行时原样回显。
         case note(String)
     }
@@ -44,9 +39,7 @@ struct ShortcutRecipe: Identifiable, Codable, Equatable, Sendable {
             switch action {
             case .runShortcut(let n): return "运行快捷指令「\(n)」"
             case .openURL(let u): return "打开 \(u)"
-            case .tap(let x, let y): return "点击 (\(Int(x * 1000) / 10)%, \(Int(y * 1000) / 10)%)"
             case .wait(let s): return "等待 \(String(format: "%.1f", s)) 秒"
-            case .typeText(let t): return "输入「\(t)」"
             case .note(let t): return "注：\(t)"
             }
         }
@@ -58,9 +51,7 @@ struct ShortcutRecipe: Identifiable, Codable, Equatable, Sendable {
             switch action {
             case .runShortcut(let n): return "run \(n)"
             case .openURL(let u): return "open \(u)"
-            case .tap(let x, let y): return "tap \(String(format: "%.3f", x)) \(String(format: "%.3f", y))"
             case .wait(let s): return "wait \(String(format: "%.1f", s))"
-            case .typeText(let t): return "type \(t)"
             case .note(let t): return "# \(t)"
             }
         }.joined(separator: "\n")
@@ -80,11 +71,6 @@ struct ShortcutRecipe: Identifiable, Codable, Equatable, Sendable {
         case "wait":
             guard let d = Double(rest.trimmingCharacters(in: .whitespaces)) else { return nil }
             return .wait(seconds: min(max(d, 0), 60))
-        case "type": return rest.isEmpty ? nil : .typeText(rest)
-        case "tap":
-            let xy = rest.split(separator: " ").compactMap { Double($0) }
-            guard xy.count == 2 else { return nil }
-            return .tap(x: min(max(xy[0], 0), 1), y: min(max(xy[1], 0), 1))
         default: return nil
         }
     }

@@ -74,6 +74,7 @@ struct SettingsView: View {
                     systemPromptCard
                     toolsCard
                     agentCard
+                    MobileAgentCard()
                     FeaturesCard
                     cloudStorageCard
                     updateCard
@@ -599,7 +600,7 @@ struct SettingsView: View {
                             }
                         }
                     }
-                    Text("以上是模型在提示词里看到的同一份能力矩阵。tap/swipe/type 在合规版不可用 —— 需要合成触控请在「软件更新」里切到 Tap 通道并重新安装。")
+                    Text("以上是模型在提示词里看到的同一份能力矩阵。合成点击/输入已移除（普通 App 无法获得 IOHID 特权）—— 交互由 Agent 实时指导，或交给快捷指令完成。")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -630,7 +631,6 @@ struct SettingsView: View {
         switch status {
         case .supported: return "checkmark.circle.fill"
         case .restricted: return "exclamationmark.circle.fill"
-        case .requiresSpecialEnvironment: return "sparkles"
         case .unsupported: return "xmark.circle.fill"
         }
     }
@@ -639,16 +639,12 @@ struct SettingsView: View {
         switch status {
         case .supported: return .green
         case .restricted: return .orange
-        case .requiresSpecialEnvironment: return .purple
         case .unsupported: return .secondary
         }
     }
 
     private var agentCapabilityBadge: String {
-        if agentCaps.contains(where: { $0.kind == .tap && $0.status.isAttemptable }) {
-            return "Tap 可用"
-        }
-        return ShortcutEngine.Variant.displayName
+        "仅 URL / 快捷指令"
     }
 
     /// 内置工具的选择界面。
@@ -1546,14 +1542,6 @@ struct SettingsView: View {
                         HStack(spacing: 6) {
                             Text("当前版本 \(updater.currentVersion)")
                                 .font(.subheadline)
-                            if updater.isTap {
-                                Text("Tap 通道")
-                                    .font(.caption2.weight(.semibold))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.purple.opacity(0.15), in: Capsule())
-                                    .foregroundStyle(.purple)
-                            }
                             if updater.isGray {
                                 Text("灰度通道")
                                     .font(.caption2.weight(.semibold))
@@ -1564,9 +1552,9 @@ struct SettingsView: View {
                             }
                         }
                         if updater.hasUpdate {
-                            Text("发现新版本 \(updater.latestTag ?? "")" + (updater.isGray ? "（灰度）" : (updater.isTap ? "（Tap）" : "")))
+                            Text("发现新版本 \(updater.latestTag ?? "")" + (updater.isGray ? "（灰度）" : ""))
                                 .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(updater.isGray ? .orange : (updater.isTap ? .purple : .green))
+                                .foregroundStyle(updater.isGray ? .orange : .green)
                         } else if updater.lastChecked {
                             if let err = updater.lastError {
                                 // 检查失败与「已是最新」分开显示，避免误导
@@ -1625,21 +1613,6 @@ struct SettingsView: View {
                     Task { await updater.check() }
                 }
 
-                // 更新通道选择：稳定版 / Tap 增强版（决定「下载新版 IPA」拿的是哪个包）
-                Toggle(isOn: $storage.settings.updateTapChannel) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("更新到 Tap 增强版")
-                            .font(.subheadline)
-                        Text("开启后下载 LumenAI-Tap 包（含合成触控能力）；关闭则下载稳定版包")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .tint(.purple)
-                .onChange(of: storage.settings.updateTapChannel) { _, _ in
-                    Task { await updater.check() }
-                }
-
                 if updater.hasUpdate {
                     Divider()
                     VStack(alignment: .leading, spacing: 8) {
@@ -1656,8 +1629,7 @@ struct SettingsView: View {
                                     UIApplication.shared.open(url)
                                     #endif
                                 } label: {
-                                    Label(updater.isTap ? "下载 Tap 版 IPA" : "下载新版 IPA",
-                                          systemImage: "arrow.down.circle.fill")
+                                    Label("下载新版 IPA", systemImage: "arrow.down.circle.fill")
                                         .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(.glassProminent)
@@ -1674,8 +1646,7 @@ struct SettingsView: View {
                                 .buttonStyle(.glass)
                             }
                         }
-                        Text("侧载应用无法自动替换安装：下载 IPA 后请用全能签/自签方式重新安装。"
-                             + (updater.isTap ? "当前通道：Tap 增强版。" : "当前通道：稳定版（可在上方开关切换）。"))
+                        Text("侧载应用无法自动替换安装：下载 IPA 后请用全能签/自签方式重新安装。")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }

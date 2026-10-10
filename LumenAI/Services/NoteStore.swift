@@ -14,9 +14,8 @@ import Foundation
 ///
 /// 所以现在：工具和界面都走这一个类，文件读写只有一份实现，界面状态自动跟着变。
 ///
-/// ⚠️ `perform(op:name:content:)` 的返回字符串**必须与训练数据逐字一致**。
-/// lumen3 / lumen4 两个适配器就是照这些字符串练的记忆行为，改一个字都会让
-/// 模型在真实 App 里对不上（`build_lumen_train.py:608-612` 是同一份契约的真源）。
+/// ⚠️ `perform(op:name:content:)` 的返回字符串是**面向模型的文案**：保持简洁、稳定、
+/// 与工具描述一致即可，改动时无需考虑训练数据（自训权重已废弃）。
 @MainActor
 final class NoteStore: ObservableObject {
     static let shared = NoteStore()
@@ -98,7 +97,7 @@ final class NoteStore: ObservableObject {
         raw.replacingOccurrences(of: "/", with: "-")
     }
 
-    /// `note` 工具的全部行为都在这里。返回值与训练数据逐字一致，勿改文案。
+    /// `note` 工具的全部行为都在这里。返回值是面向模型的文案，保持简洁稳定即可。
     func perform(op: String, name rawName: String, content: String) -> String {
         let name = Self.sanitize(rawName)
 

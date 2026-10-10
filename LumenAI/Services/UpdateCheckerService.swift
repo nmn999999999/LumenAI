@@ -21,8 +21,6 @@ final class UpdateCheckerService: ObservableObject {
     @Published private(set) var isGray = false
     /// 灰度比例（有活跃灰度时显示）
     @Published private(set) var grayPercent: Int?
-    /// 当前选中是否 Tap 增强版通道（用户在设置里选择更新哪个包）
-    @Published private(set) var isTap = false
 
     /// 用户是否强制参与灰度（微信式内测开关）
     static let grayOptInKey = "update_gray_opt_in"
@@ -59,11 +57,9 @@ final class UpdateCheckerService: ObservableObject {
         defer { lastChecked = true }
 
         let optIn = UserDefaults.standard.bool(forKey: Self.grayOptInKey)
-        // 更新通道（设置页开关）：true = Tap 增强版
-        let preferTap = SettingsStorage.shared.settings.updateTapChannel
 
         // 1) 灰度索引
-        if await checkGrayIndex(optIn: optIn, preferTap: preferTap) {
+        if await checkGrayIndex(optIn: optIn) {
             lastError = nil
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
             return
@@ -71,7 +67,6 @@ final class UpdateCheckerService: ObservableObject {
 
         // 2) 回退：GitHub releases/latest（无灰度能力）
         isGray = false
-        isTap = false
         grayPercent = nil
         guard let url = URL(string: repoAPI) else {
             lastError = "无效的更新地址"
@@ -101,7 +96,7 @@ final class UpdateCheckerService: ObservableObject {
             }
             downloadURL = nil
             if let assets = json["assets"] as? [[String: Any]] {
-                downloadURL = Self.ipaAsset(from: assets, preferTap: preferTap)
+                downloadURL = Self.ipaAsset(from: assets)
             }
             lastError = nil   // 成功
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
@@ -113,7 +108,7 @@ final class UpdateCheckerService: ObservableObject {
     /// 从灰度索引解析对当前设备生效的版本。返回是否成功（网络/解析均成功）。
     /// v0.3.44 修复：索引漏更新时稳定版会停滞（曾因索引停留在 0.3.41 导致 0.3.42/43 检测不到）。
     /// 稳定版解析后与 GitHub releases/latest 交叉取较大者自愈；灰度版只认索引（灰度版不进 Release）。
-    private func checkGrayIndex(optIn: Bool, preferTap: Bool) async -> Bool {
+    private func checkGrayIndex(optIn: Bool) async -> Bool {
         guard let url = URL(string: UpdatePolicy.indexURL) else { return false }
         var request = URLRequest(url: url)
         request.timeoutInterval = 15
@@ -128,12 +123,11 @@ final class UpdateCheckerService: ObservableObject {
             guard let index = try? decoder.decode(AppUpdateIndex.self, from: data) else {
                 return false
             }
-            let resolved = UpdatePolicy.resolveAppUpdate(index, optInGray: optIn, preferTap: preferTap)
+            let resolved = UpdatePolicy.resolveAppUpdate(index, optInGray: optIn)
 
             if resolved.isGray {
                 // 灰度版：只用索引（灰度版不在 GitHub Release，天然隔离）
                 isGray = true
-                isTap = false
                 grayPercent = index.gray?.enabled == true ? index.gray?.percent : nil
                 latestTag = resolved.version
                 latestName = "\(resolved.version)（灰度）"
@@ -143,16 +137,15 @@ final class UpdateCheckerService: ObservableObject {
                 return true
             }
 
-            // 稳定版 / Tap 版：与 GitHub releases/latest 交叉取较大者（索引漏更时自愈）
+            // 稳定版：与 GitHub releases/latest 交叉取较大者（索引漏更时自愈）
             isGray = false
-            isTap = resolved.isTap
             grayPercent = index.gray?.enabled == true ? index.gray?.percent : nil
             latestTag = resolved.version
-            latestName = resolved.isTap ? "\(resolved.version)（Tap）" : resolved.version
+            latestName = resolved.version
             releaseNotes = resolved.notes
             releaseURL = URL(string: "https://github.com/nmn999999999/LumenAI/releases/latest")
             downloadURL = resolved.ipa
-            if let gh = await fetchGitHubLatest(preferTap: preferTap),
+            if let gh = await fetchGitHubLatest(),
                Self.compare(Self.stripV(gh.tag), resolved.version) > 0 {
                 latestTag = gh.tag
                 latestName = gh.tag
@@ -167,7 +160,7 @@ final class UpdateCheckerService: ObservableObject {
     }
 
     /// 抓取 GitHub releases/latest（供回退与稳定版交叉自愈）
-    private func fetchGitHubLatest(preferTap: Bool) async -> (tag: String, notes: String?, url: URL, ipa: URL?)? {
+    private func fetchGitHubLatest() async -> (tag: String, notes: String?, url: URL, ipa: URL?)? {
         guard let url = URL(string: repoAPI) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 15
@@ -181,29 +174,21 @@ final class UpdateCheckerService: ObservableObject {
         let html = (json["html_url"] as? String).flatMap { URL(string: $0) }
         var ipa: URL?
         if let assets = json["assets"] as? [[String: Any]] {
-            ipa = Self.ipaAsset(from: assets, preferTap: preferTap)
+            ipa = Self.ipaAsset(from: assets)
         }
         return (tag, notes, html ?? url, ipa)
     }
 
-    /// 从 Release assets 里按通道挑 IPA：
-    /// Tap 通道优先 `*-Tap-*.ipa`，稳定版优先非 Tap 的 `*.ipa`；同名候选不存在时回落到任意 `.ipa`
-    /// （保证任一通道下都能拿到可下载链接，不会因为缺某个变体就空手）。
-    static func ipaAsset(from assets: [[String: Any]], preferTap: Bool) -> URL? {
-        var tapURL: URL?
-        var plainURL: URL?
+    /// 从 Release assets 里挑第一个 `.ipa`。
+    static func ipaAsset(from assets: [[String: Any]]) -> URL? {
         for asset in assets {
             let name = (asset["name"] as? String) ?? ""
             guard name.lowercased().hasSuffix(".ipa"),
                   let browserURL = (asset["browser_download_url"] as? String).flatMap({ URL(string: $0) })
             else { continue }
-            if name.lowercased().contains("-tap") {
-                if tapURL == nil { tapURL = browserURL }
-            } else {
-                if plainURL == nil { plainURL = browserURL }
-            }
+            return browserURL
         }
-        return preferTap ? (tapURL ?? plainURL) : (plainURL ?? tapURL)
+        return nil
     }
 
     /// 去掉 tag 的 "v" 前缀

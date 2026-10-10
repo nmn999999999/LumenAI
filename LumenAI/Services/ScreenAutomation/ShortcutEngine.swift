@@ -3,32 +3,14 @@ import UIKit
 
 /// 执行"操作手机"的引擎。
 ///
-/// **合规版**能做到的，和**不能**做到的，必须一开始就写清楚（能力边界就是产品边界）：
+/// 能力边界就是产品边界，一开始就写清楚：
 ///   · 能：打开任意注册了 scheme 的 URL、通过 `shortcuts://run-shortcut?name=` 触发
-///     用户已经装好的快捷指令（系统会弹确认）、读写配方。
-///   · 不能：绕过系统直接合成触摸、给别的 App 输入文字、点系统弹窗。
-///     这些需要 backboardd/IOHID 级别的特权，普通开发者证书拿不到 —— 只有
-///     `SIMULATE_TAP` 变体（自签/TrollStore）才有可能，且**能不能用由 probe 实测说了算**。
+///     用户已经装好的快捷指令（系统会弹确认）、读写配方、等待。
+///   · 不能：合成触摸、给别的 App 输入文字、点系统弹窗、截取整机屏幕。
+///     这些需要 backboardd/IOHID 级特权，普通 App 拿不到；这类动作交给快捷指令，
+///     或由 Agent 实时指导用户完成。
 @MainActor
 enum ShortcutEngine {
-
-    enum Variant {
-        static var isTapBuild: Bool {
-            #if SIMULATE_TAP
-            return true
-            #else
-            return false
-            #endif
-        }
-
-        static var displayName: String {
-            #if SIMULATE_TAP
-            return "Tap（自签，含合成触摸代码）"
-            #else
-            return "合规（仅 URL / 快捷指令）"
-            #endif
-        }
-    }
 
     // MARK: - 运行
 
@@ -108,7 +90,6 @@ enum ShortcutEngine {
     /// 写代码时的"应该可以"没有意义。报告里每一项都必须是**刚刚真的跑过**的结果。
     static func probe() async -> String {
         var lines = ["## 手机操作能力探测"]
-        lines.append("变体：\(Variant.displayName)")
 
         // 1) 快捷指令 URL 能不能被识别
         let shortcutsDeclared: Bool
@@ -122,16 +103,10 @@ enum ShortcutEngine {
           （false 通常意味着未在 LSApplicationQueriesSchemes 声明、或本机没装快捷指令 App；
           真正能不能跑仍以 `phone run` 的 open 回调为准）
         """)
+        lines.append("- 合成触摸/输入：**已移除**。合成点击需要 IOHID 级特权，"
+                     + "普通构建不具备；交互请用快捷指令，或由 Agent 实时指导用户完成。")
 
-        // 2) 合成触摸
-        #if SIMULATE_TAP
-        lines.append(contentsOf: TapBackend.probe().map { "- \($0)" })
-        #else
-        lines.append("- 合成触摸：本变体**未编译**（合规版不包含私有 API 调用）。"
-                     + "要测试真机可行性请用 LumenAI-Tap 包。")
-        #endif
-
-        // 3) 已装配方
+        // 2) 已装配方
         let count = ShortcutStore.shared.recipes.count
         lines.append("- 已保存配方：\(count) 条")
         return lines.joined(separator: "\n")
@@ -139,18 +114,11 @@ enum ShortcutEngine {
 
     // MARK: - 能力（capability-first：先问能不能，再谈做不做）
 
-    /// 当前构建 + 当前设备的能力矩阵（每次现算：scheme 可用性、Tap probe 结果都可能变）。
+    /// 当前构建 + 当前设备的能力矩阵（每次现算：scheme 可用性可能变）。
     static func capabilities() async -> [ComputerCapability] {
         let shortcutsOK = UIApplication.shared.canOpenURL(
             URL(string: "shortcuts://run-shortcut?name=probe") ?? URL(string: "shortcuts://x")!)
-        #if SIMULATE_TAP
-        let tapProbed = TapBackend.canDispatch()
-        #else
-        let tapProbed = false
-        #endif
-        return ComputerCapabilityMatrix.make(isTapBuild: Variant.isTapBuild,
-                                             tapProbeAvailable: tapProbed,
-                                             shortcutsAvailable: shortcutsOK)
+        return ComputerCapabilityMatrix.make(shortcutsAvailable: shortcutsOK)
     }
 
     /// 能力矩阵的可读文本（进 probe 报告，也进云端 environmentSection 的素材）。
@@ -170,8 +138,6 @@ enum ShortcutEngine {
         case .runShortcut(let name): return .runShortcut(name)
         case .openURL(let raw): return .openURL(raw)
         case .wait(let seconds): return .wait(milliseconds: Int(seconds * 1000))
-        case .typeText(let text): return .type(text: text)
-        case .tap(let x, let y): return .tap(x: x, y: y)
         case .note: return nil
         }
     }
@@ -276,27 +242,6 @@ enum ShortcutEngine {
             // capability 门控已经挡住，走到这里说明矩阵有 bug —— 仍然如实报 unsupported。
             r = .unsupported(kind: .screenshot,
                              reason: "iOS 无整机截屏公共 API（门控漏过了这一项）", attempt: attempt)
-
-        case .tap(let x, let y):
-            #if SIMULATE_TAP
-            let cx = ComputerAction.clamp(x), cy = ComputerAction.clamp(y)
-            let text = TapBackend.tap(normalizedX: cx, normalizedY: cy)
-            if text.hasPrefix("失败") {
-                r = .failed(kind: .tap, action: action.label, reason: text,
-                            attempt: attempt, elapsedMs: elapsed())
-            } else {
-                // 派发成功 ≠ 屏幕动了：没有截图就没有验证源，只能到 executedUnverified。
-                r = .executed(kind: .tap, action: action.label, detail: text, verified: false,
-                              verifyDetail: await noVerifyReason(),
-                              attempt: attempt, elapsedMs: elapsed())
-            }
-            #else
-            r = .unsupported(kind: .tap, reason: "合规版未编译合成触摸路径", attempt: attempt)
-            #endif
-
-        case .swipe, .type:
-            // 当前没有任何 backend 实现它们（Tap 变体的键盘事件也未接线）。
-            r = .unsupported(kind: action.kind, reason: cap.reason, attempt: attempt)
         }
 
         // 验证阶段（§9）：先等 UI 稳定，再看有没有验证源。

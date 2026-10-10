@@ -202,7 +202,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "extract_urls",
             name: "extract_urls",
-            description: "从一段文本中提取所有 URL 链接,返回去重列表",
+            description: "从一段文本中提取所有 URL 链接，返回去重列表。要抓取网页内容用 http_get。",
             parameters: [
                 "text": .init(type: "string", description: "要提取链接的文本", enumValues: nil)
             ],
@@ -240,21 +240,21 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "current_time",
             name: "current_time",
-            description: "获取当前日期和时间",
+            description: "获取当前日期和时间（本地时区）。时间戳/日期换算用 timestamp。",
             parameters: [:],
             requiresApproval: false,
         ),
         AgentToolDefinition(
             id: "generate_uuid",
             name: "generate_uuid",
-            description: "生成一个UUID",
+            description: "生成一个随机 UUID(v4)。需要唯一标识（文件名/会话/请求 id）时使用。",
             parameters: [:],
             requiresApproval: false,
         ),
         AgentToolDefinition(
             id: "random_number",
             name: "random_number",
-            description: "生成指定范围内的随机整数",
+            description: "生成指定范围内的随机整数（含端点）。需要不可预测的密钥/密码用 password_generate。",
             parameters: [
                 "min": .init(type: "number", description: "最小值（含），默认 1", enumValues: nil),
                 "max": .init(type: "number", description: "最大值（含），默认 100", enumValues: nil)
@@ -264,7 +264,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "word_count",
             name: "word_count",
-            description: "统计文本的字数、字符数和行数",
+            description: "统计文本的字数、字符数和行数（纯计数，不做理解）。",
             parameters: [
                 "text": .init(type: "string", description: "要统计的文本", enumValues: nil)
             ],
@@ -273,7 +273,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "text_transform",
             name: "text_transform",
-            description: "转换文本格式：大写、小写、反转、Base64编码/解码",
+            description: "文本格式转换：大写、小写、反转、Base64 编码/解码。命名风格（snake/camel）转换用 case_convert。",
             parameters: [
                 "text": .init(type: "string", description: "要转换的文本", enumValues: nil),
                 "transform": .init(type: "string", description: "转换类型", enumValues: ["uppercase", "lowercase", "reverse", "base64_encode", "base64_decode"])
@@ -303,7 +303,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "hash_text",
             name: "hash_text",
-            description: "计算文本的 MD5 / SHA1 / SHA256 摘要",
+            description: "计算文本的 MD5 / SHA1 / SHA256 摘要（十六进制）。用于校验/指纹，不是加密。",
             parameters: [
                 "text": .init(type: "string", description: "要哈希的文本", enumValues: nil),
                 "algorithm": .init(type: "string", description: "算法", enumValues: ["md5", "sha1", "sha256"])
@@ -313,7 +313,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "json_format",
             name: "json_format",
-            description: "格式化或压缩 JSON 字符串",
+            description: "美化或压缩 JSON 字符串（只改格式，不改内容）。按路径取值用 json_query。",
             parameters: [
                 "json": .init(type: "string", description: "要处理的 JSON 字符串", enumValues: nil),
                 "pretty": .init(type: "boolean", description: "是否美化输出（默认 true）", enumValues: nil)
@@ -323,7 +323,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "url_codec",
             name: "url_codec",
-            description: "URL 编码或解码文本",
+            description: "URL 编码(encode)或解码(decode)文本。",
             parameters: [
                 "text": .init(type: "string", description: "要处理的文本", enumValues: nil),
                 "mode": .init(type: "string", description: "模式", enumValues: ["encode", "decode"])
@@ -384,28 +384,22 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "phone",
             name: "phone",
-            description: "操作手机（capability-aware）：probe 查能力矩阵与实测、list/run/save/delete 管理配方、open/app 打开 URL 或 App、wait 等待 UI 稳定、screenshot 截屏、tap/swipe/type 执行交互。每步都返回 JSON 回执 {status, executed, verified}，取值 success / executed_unverified / failed / timeout / unsupported。⚠️ 只有 status=success 才能说「成功」；executed_unverified 只能说「已执行但无法验证」；unsupported 说明本机做不到，改走快捷指令方案，不要重试同一动作。保持短循环：截图→判断→一步动作→验证，不要长篇解释",
+            description: "操作手机 / 操作其他 App（capability-aware，本机构建不能合成点击）：probe 查能力矩阵与实测、capability 查可用动作、list/run/save/delete 管理配方、open/app 打开 URL 或 App、wait 等待 UI 稳定、guide 把操作指引实时展示给用户。⚠️ 点击/输入/切屏本构建无法自动执行：需要交互时用 guide 给出「下一步点哪里 / 输入什么」的指引让用户操作，或把该动作做成快捷指令后用 run 执行。返回 JSON 回执 {status, executed, verified}，取值 success / executed_unverified / failed / timeout / unsupported。只有 status=success 才算成功；executed_unverified 只能说「已执行但未验证」；unsupported 说明本机做不到，不要反复重试同一动作。",
             parameters: [
-                "op": .init(type: "string", description: "操作（必填）", enumValues: ["probe", "capability", "stats", "list", "run", "save", "delete", "open", "app", "wait", "screenshot", "tap", "swipe", "type"]),
-                "name": .init(type: "string", description: "配方或快捷指令名（run/save/delete/tap 必填；run 时若无同名配方则直接按名字触发快捷指令）", enumValues: nil),
+                "op": .init(type: "string", description: "操作（必填）", enumValues: ["probe", "capability", "stats", "list", "run", "save", "delete", "open", "app", "wait", "screenshot", "guide"]),
+                "name": .init(type: "string", description: "配方 / 快捷指令名 / URL / App 名（run/save/delete 用配方名；open 用 URL；app 用 App 名；run 时若无同名配方则直接按名字触发快捷指令）", enumValues: nil),
                 "summary": .init(type: "string", description: "一句话说明这条配方干什么（save 可选）", enumValues: nil),
-                "steps": .init(type: "string", description: "配方步骤，每行一条：run <快捷指令名> / open <url> / tap <x> <y>（0..1）/ wait <秒> / # 注释（save 时可选，留空则只按 name 触发快捷指令）", enumValues: nil),
-                "x": .init(type: "number", description: "点击横坐标，0..1 归一化（op=tap 必填，仅 Tap 版有效）", enumValues: nil),
-                "y": .init(type: "number", description: "纵坐标，0..1 归一化（op=tap/swipe 必填）", enumValues: nil),
-                "x2": .init(type: "number", description: "swipe 终点横坐标，0..1 归一化（op=swipe 必填）", enumValues: nil),
-                "y2": .init(type: "number", description: "swipe 终点纵坐标，0..1 归一化（op=swipe 必填）", enumValues: nil),
+                "steps": .init(type: "string", description: "配方步骤，每行一条：run <快捷指令名> / open <url> / wait <秒> / # 注释（save 时可选，留空则只按 name 触发快捷指令）", enumValues: nil),
                 "ms": .init(type: "number", description: "等待毫秒数，0..30000（op=wait 必填）", enumValues: nil),
-                "text": .init(type: "string", description: "要输入的文本（op=type 必填）", enumValues: nil)
+                "text": .init(type: "string", description: "op=guide 必填：给用户看的下一步操作指引，例如「在设置页点『通用』→『关于本机』」", enumValues: nil)
             ],
             requiresApproval: true,
         ),
         // ⚠️ `todo` **刻意不进** `BuiltInTools.defaultEnabledNames`（见本文件末尾那份清单）。
         //
-        // 那份 12 个工具的有序清单是**本地 Qwen3-1.7B 的训练契约**：训练数据
-        // （`kaggle_pretrain/build_lumen_train.py` 的 `DEFAULT_TOOL_ORDER`）就是照它的顺序和名字
-        // 逐字生成的，模型只见过这 12 个工具。把没训练过的 `todo` 塞进去，等于在它的工具目录里
-        // 放一个陌生的函数名：轻则白占一个配额（挤掉一个它练过的工具），重则诱发格式漂移/幻觉调用，
-        // 已有适配器的行为会实打实地退化。
+        // 默认清单只有 12 个位置，是给本地小模型的核心工具箱（顺序即目录顺序）。
+        // `todo` 属于偏专用的进度工具，把它塞进默认集会挤掉一个更常用的工具
+        // （如 json_query / timestamp）——小模型的上下文里，工具越多单条越容易被忽略。
         //
         // 所以 `todo` 属于"更多工具"：用户可以在「设置 → 工具」里手动勾选启用
         // （那时按 `ToolSettingsStore.setEnabled` 的规则会顶掉一个已启用的内置工具 ——
@@ -441,7 +435,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "clipboard",
             name: "clipboard",
-            description: "读取或设置系统剪贴板",
+            description: "读取(op=get)或覆盖写入(op=set)系统剪贴板。",
             parameters: [
                 "op": .init(type: "string", description: "操作", enumValues: ["get", "set"]),
                 "text": .init(type: "string", description: "要写入剪贴板的内容（set 必填）", enumValues: nil)
@@ -472,7 +466,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "regex_extract",
             name: "regex_extract",
-            description: "使用正则表达式从文本中提取匹配的内容",
+            description: "用正则表达式从文本中提取匹配的内容。简单的查找替换用 find_replace。",
             parameters: [
                 "text": .init(type: "string", description: "要搜索的文本", enumValues: nil),
                 "pattern": .init(type: "string", description: "正则表达式模式", enumValues: nil)
@@ -538,7 +532,7 @@ enum BuiltInTools {
         AgentToolDefinition(
             id: "case_convert",
             name: "case_convert",
-            description: "标识符命名风格转换：snake/camel/Pascal/kebab",
+            description: "标识符命名风格互转：snake / camel / Pascal / kebab。",
             parameters: [
                 "text": .init(type: "string", description: "要转换的标识符", enumValues: nil),
                 "style": .init(type: "string", description: "目标风格", enumValues: ["snake", "camel", "pascal", "kebab"])
@@ -649,7 +643,7 @@ enum BuiltInTools {
         // Modules/，没有用户逐次确认就是"模型任意落盘代码"。卡片是自定义的
         // （PluginInstallApprovalSheet，展示权限与完整源码），不走通用 alert。
         //
-        // ⚠️ 与 todo 一样**不进** defaultEnabledNames（本文件末尾的 12 工具训练契约）：
+        // ⚠️ 与 todo 一样**不进** defaultEnabledNames（本文件末尾的默认 12 工具清单）：
         // 本地小模型既没见过这个工具名，也写不好插件代码。它只出现在云端全量目录里。
         AgentToolDefinition(
             id: "create_plugin",
@@ -924,7 +918,7 @@ enum BuiltInTools {
     }
 
     /// 数字的核心解析。为什么要把数字**字符串**也当数字收下：
-    /// 小参数模型（lumen3/lumen4 这一档）经常把数字写成 `"3"`、`"3.5"`，
+    /// 小参数模型（1B~4B 这一档）经常把数字写成 `"3"`、`"3.5"`，
     /// 老代码的 `as? NSNumber` 对字符串一律失败 → 静默落到默认值。
     /// 所以这里先按 Double 解析字符串，只有真转换不了才报错。
     private static func parseNumber(_ raw: Any, key: String) -> ArgumentRead<Double> {
@@ -1271,15 +1265,12 @@ enum BuiltInTools {
     /// 笔记的读写**全部**交给 `NoteStore` —— 它同时也是「设置 → 长期记忆」界面的数据源。
     /// 两边各写一份 file I/O 的话，模型写完笔记后界面列表不会刷新，用户看到的还是旧列表。
     /// 目录定义也随之收敛成一处（`NoteStore.directory`），不再有两个「同一个目录」的字面量。
-    ///
-    /// 注意：返回的字符串必须与训练数据逐字一致 —— lumen3 / lumen4 就是照这些字符串
-    /// 练出来的记忆行为（真源在 `build_lumen_train.py`），改文案会让模型在真实 App 里对不上。
     private static func executeNote(arguments: [String: Any]) async -> String {
         // op 必须先校验：`NoteStore.perform` 的 default 分支是 list，所以 op 打错（"remove"/"保存"）
         // 会被静默当成"列出笔记"执行 —— 用户说删笔记，工具返回一份笔记清单，
         // 模型看到"有内容返回"就回复"已删除"，用户以为删了，其实一条没动。
         // 这里归一化大小写后只放行声明过的四个 op，其余一律报错并列出可选值。
-        // 没传 op 时的默认值仍然是 "list"（保持旧行为与既有训练数据一致）。
+        // 没传 op 时的默认值仍然是 "list"（保持向后兼容的旧行为）。
         let opRead = enumeratedArgument(
             arguments, "op", label: "操作",
             allowed: allowedValues(tool: "note", parameter: "op", fallback: ["save", "read", "list", "delete"]),
@@ -1369,7 +1360,7 @@ enum BuiltInTools {
         }
     }
 
-    /// `phone` 工具：配方管理 + 运行 + 能力探测（+ Tap 版的合成点击）。
+    /// `phone` 工具：配方管理 + 运行 + 能力探测 + 操作指引（guide）。
     ///
     /// 所有"动作是否真的发生"都由 `ShortcutEngine` 判定并原样回传：
     /// 这里**不补任何乐观文案**。这个工具最坏的失败不是报错，而是让模型
@@ -1379,18 +1370,13 @@ enum BuiltInTools {
             arguments, "op", label: "操作",
             allowed: allowedValues(tool: "phone", parameter: "op",
                                    fallback: ["probe", "capability", "stats", "list", "run", "save",
-                                              "delete", "open", "app", "wait", "screenshot",
-                                              "tap", "swipe", "type"]),
+                                              "delete", "open", "app", "wait", "screenshot", "guide"]),
             default: nil)
         guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
 
         let name = (arguments["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let summary = arguments["summary"] as? String ?? ""
         let steps = arguments["steps"] as? String ?? ""
-
-        // 闭包外取成 Sendable 原子类型（同 executeMemory 的 sending 约束）。
-        let x = Self.doubleArgument(arguments, "x")
-        let y = Self.doubleArgument(arguments, "y")
 
         switch op {
         case "list":
@@ -1430,7 +1416,7 @@ enum BuiltInTools {
 
         case "run":
             guard !name.isEmpty else { return "错误: run 需要 name" }
-            // 配方优先：有同名配方就按它执行（含 tap/wait/注释），没有就直接触发快捷指令。
+            // 配方优先：有同名配方就按它执行（run/open/wait/注释），没有就直接触发快捷指令。
             let recipe = await MainActor.run { ShortcutStore.shared.recipe(id: name) }
             if let recipe { return await ShortcutEngine.run(recipe) }
             return await ShortcutEngine.runShortcut(named: name)
@@ -1447,12 +1433,10 @@ enum BuiltInTools {
         case "capability":
             let caps = await ShortcutEngine.capabilities()
             let text = await ShortcutEngine.capabilityText(caps)
-            let variant = await ShortcutEngine.Variant.displayName
             let policy = ComputerRetryPolicy.default
-            return "能力矩阵（变体：\(variant)）\n" + text
+            return "能力矩阵\n" + text
                 + "\n重试上限 maxRetries=\(policy.maxRetries)，"
-                + "单动作超时 \(policy.actionTimeoutMs)ms，"
-                + "置信度阈值 \(policy.confidenceThreshold) —— 超过就停下汇报，不要无限重试。"
+                + "单动作超时 \(policy.actionTimeoutMs)ms —— 超过就停下汇报，不要无限重试。"
 
         case "stats":
             let m = await ShortcutEngine.metrics
@@ -1475,38 +1459,16 @@ enum BuiltInTools {
             guard !name.isEmpty else { return "错误: app 需要 name（App 名）" }
             return (await ShortcutEngine.execute(.openApp(name: name), attempt: 1)).jsonString
 
-        case "type":
-            guard let text = arguments["text"] as? String, !text.isEmpty else {
-                return "错误: type 需要 text"
+        case "guide":
+            // 「实时指导用户操作」：本构建不能合成点击，交互由用户完成。
+            // 这条指引会进入「手机协作」会话，展示给用户照着做。
+            guard let text = arguments["text"] as? String,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return "错误: guide 需要 text（给用户看的操作指引）"
             }
-            return (await ShortcutEngine.execute(.type(text: text), attempt: 1)).jsonString
+            await MobileAgentBridge.shared.publishGuidance(text)
+            return "已把操作指引展示给用户：\(text)"
 
-        case "swipe":
-            guard let x, let y else { return "错误: swipe 需要 x/y（起点，0..1）" }
-            guard let x2 = Self.doubleArgument(arguments, "x2"),
-                  let y2 = Self.doubleArgument(arguments, "y2") else {
-                return "错误: swipe 需要 x2/y2（终点，0..1）"
-            }
-            return (await ShortcutEngine.execute(
-                .swipe(from: NormPoint(x: ComputerAction.clamp(x), y: ComputerAction.clamp(y)),
-                       to: NormPoint(x: ComputerAction.clamp(x2), y: ComputerAction.clamp(y2))),
-                attempt: 1)).jsonString
-
-        case "tap":
-            guard let x, let y else {
-                return "错误: tap 需要 x 与 y（0..1 归一化坐标）"
-            }
-            let cx = min(max(x, 0), 1), cy = min(max(y, 0), 1)
-            #if SIMULATE_TAP
-            return await MainActor.run { TapBackend.tap(normalizedX: cx, normalizedY: cy) }
-            #else
-            _ = (cx, cy)
-            return """
-            错误: 本构建（合规版）不能合成触摸 —— 这不是参数问题，是版本能力边界。
-            可选做法：把点击做成快捷指令里的动作，再用 run 执行；或改用 LumenAI-Tap 自签版。
-            先用 op=probe 实测本机能力。
-            """
-            #endif
         default:
             return "错误: 不支持的 op: \(op)"
         }
@@ -1570,7 +1532,7 @@ enum BuiltInTools {
             return await MainActor.run { TodoStore.shared.listText() }
         case "clear":
             // 清空当前对话的清单（其它对话不受影响，隔离在 TodoStore 里做）。
-            // 返回文案写死：与 TodoStore 里 set / list 的文案一样，将来要拿去做训练数据。
+            // 返回文案写死：与 TodoStore 里 set / list 的文案保持一致。
             return await MainActor.run {
                 TodoStore.shared.clear()
                 return "已清空任务清单"
@@ -2945,11 +2907,10 @@ extension BuiltInTools {
     /// 代价是把两个较专用的 `csv_table` / `jwt_decode` 移出默认集 —— 它们仍可在
     /// 设置里手动开启，总数上限保持 12 不变。
     ///
-    /// ⚠️ **不要**把 `todo` 加进这份清单。这 12 个名字与顺序是本地模型的训练契约
-    /// （训练数据照它逐字生成，见 `kaggle_pretrain/build_lumen_train.py` 的 `DEFAULT_TOOL_ORDER`
-    /// 与 `ToolSettingsStore`）。给没训练过它的模型塞一个陌生工具名，会白占配额并诱发行为漂移。
-    /// `todo` 归入"更多工具"，由用户在「设置 → 工具」里显式开启；云端模型走全量工具，
-    /// 自动就有它。详细理由写在 `todo` 的工具定义处。
+    /// ⚠️ 把 `todo` 保留在"更多工具"里（默认不启用）。默认清单只有 12 个位置，
+    /// 是给本地小模型的核心工具箱；`todo` 偏专用，塞进去会挤掉一个更常用的工具。
+    /// 用户可在「设置 → 工具」里显式开启；云端模型走全量工具，自动就有它。
+    /// 详细理由写在 `todo` 的工具定义处。
     static let defaultEnabledNames: [String] = [
         "http_get",
         "note",

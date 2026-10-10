@@ -56,26 +56,14 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
     ///
     /// 原因是属主不同名：我们在 HuggingFace 上的账号是 `luozx16`，
     /// 在魔搭上叫 `luozx123`（魔搭的 `luozx16` 不是我们，抢注或占用都无法预知）。
-    /// 原先那句注释写着"我们自训的那个仓库魔搭没有镜像" —— 那是当时的事实，
-    /// 现在两个自训权重都已经镜像到魔搭了，可仓库名仍不是同一个字符串。
     ///
     /// 这里写成**通用映射**（自家账号前缀替换）而不是给某个仓库名做特判，
-    /// 这样以后再加自训权重不用回来改这一处 —— 特判正是那种"下次必忘"的写法。
+    /// 这样以后再加自有仓库不用回来改这一处 —— 特判正是那种"下次必忘"的写法。
     var modelscopeRepo: String {
         let hfOwner = "luozx16/"
         guard repo.hasPrefix(hfOwner) else { return repo }
         return "luozx123/" + repo.dropFirst(hfOwner.count)
     }
-
-    /// 是不是**本项目自己训出来的**权重（而不是通用底座）。
-    ///
-    /// 判据用 repo 归属而不是 id 字符串：id 是我们随手起的名字，改一次这个判断就悄悄失效；
-    /// 而"权重来自本项目自己的仓库"本身就是定义，不受改名影响。
-    ///
-    /// 为什么要这个标记：模型列表里有 13 个条目，用户没理由知道该选哪个。
-    /// 自训的那一个是**唯一带陪伴语域与跨对话记忆**的（其余都是通用底座，
-    /// `note` 工具在它们身上不会真的被调用），所以必须让它一眼可辨。
-    var isSelfTrained: Bool { repo.hasPrefix("luozx16/lumen-") }
 
     /// 估算运行所需内存（GB）：≈ 文件大小 ×1.4 + 1GB（KV 缓存 + 激活 + 系统开销），向上取偶。
     /// 用于模型页「建议内存」提示，避免下完装不上的尴尬。
@@ -91,50 +79,6 @@ struct AIModelInfo: Identifiable, Hashable, Codable {
     }
 
     static let catalog: [AIModelInfo] = [
-        // ⚠️ 这一条是**我们自己训出来的**模型，不是通用底座，所以放在最前面。
-        //
-        // 为什么它直到现在才出现：整条链路缺的是最后一段 —— App 的 llama.cpp 桥接
-        // （LlamaCore/LlamaBridge.mm）**没有** LoRA 加载能力（没有 llama_adapter_lora_init），
-        // 模型页拿到的全是 unsloth 的原版 GGUF。也就是说 lumen3~lumen9 这九代适配器
-        // 从来没有进过手机，用户跑的一直是纯底座 —— 而 `note`（跨对话记忆）这个能力
-        // 恰恰只存在于微调后的权重里，所以"记忆"在真机上一直是 0%。
-        //
-        // 现在补上了：适配器在 Kaggle 上合并进底座 → 转 GGUF → 量化 Q4_K_M →
-        // 传到 HuggingFace（公开仓库，App 走 hf-mirror 镜像可以直接下，不需要鉴权）。
-        // 所以这里给的是**合并后的完整权重**，不能改成"底座 + 适配器"那种形式。
-        AIModelInfo(
-            id: "lumen-1.7b-companion-q4km",
-            name: "LumenAI 1.7B（陪伴 · 记忆）",
-            repo: "luozx16/lumen-local",
-            fileName: "LumenAI-s200-Q4_K_M.gguf",
-            sizeDescription: "~1.1 GB",
-            description: "本项目的自训模型（Qwen3-1.7B + 陪伴/记忆 LoRA 合并后量化）。相比原版底座，它会主动把值得记住的事写进长期记忆、需要时再读回来，说话也更短、更少说教。工具调用与代码能力与底座同级。",
-            templateType: .chatML,
-            supportsMultimodal: false,
-            supportsToolCalling: true
-        ),
-        // 4B 版自训权重。和上面那条是**同一份训练数据、同一套配方**，只有底座规模不同
-        //（Qwen3-1.7B → Qwen3-4B-Instruct-2507），所以两者可以直接对比出"容量"的作用。
-        //
-        // 为什么值得单列一条，而不是把 1.7B 换掉：实测评测的结果很干脆 ——
-        // 同样的数据、同样的步骤，1.7B 的"主动存记忆"只有 0.40，4B 是 **1.00**；
-        // 而 4B 上零说教词、零逐字复读、零冷拒绝，1.7B 那一代这三个毛病都还在。
-        // 也就是说瓶颈一直是**容量**，不是数据；但 4B 要 2.4GB 内存和更长的下载时间，
-        // 所以两条都留着，让用户按机型和网络自己选，而不是替他决定。
-        //
-        // 已核对：GGUF 元数据与 1.7B 逐项比对，分词器、BOS/EOS/PAD（151643/151645/151643）、
-        // 是否自动加减特殊 token 全部一致，所以桥接层的参数**原样复用**，接入是纯目录改动。
-        AIModelInfo(
-            id: "lumen-4b-companion-q4km",
-            name: "LumenAI 4B（陪伴 · 记忆 · 强力）",
-            repo: "luozx16/lumen-local",
-            fileName: "LumenAI-companion-lora-lumen9b-Q4_K_M.gguf",
-            sizeDescription: "~2.4 GB",
-            description: "本项目的自训模型（Qwen3-4B-Instruct-2507 + 陪伴/记忆 LoRA 合并后量化），与 1.7B 版同一份数据、同一套配方。实测「主动把值得记住的事写进长期记忆」的成功率由 1.7B 的 0.40 提升到 1.00，自主读回记忆 0.83，说教词、逐字复读、冷拒绝均为 0。简单说：1.7B 记得住但不总想起来记，4B 会稳定地记、并且回答更自然。需要设备有 6GB 以上可用内存。",
-            templateType: .chatML,
-            supportsMultimodal: false,
-            supportsToolCalling: true
-        ),
         AIModelInfo(
             id: "qwen3-0.6b-q4km",
             name: "Qwen3 0.6B",
@@ -376,8 +320,6 @@ struct ModelSettings: Codable, Sendable {
     var autoCheckUpdate: Bool
     /// 强制参与灰度测试（微信式内测开关；开启后始终走灰度版本）
     var grayOptIn: Bool
-    /// 更新通道：true = 下载 Tap 增强版 IPA，false = 稳定版
-    var updateTapChannel: Bool
     // MARK: - Agent 优化开关（设置页「Agent 智能体」卡片；默认值 = 线上现状）
     /// reasoning 预算 / 门控 / 重复检测 + 早停（关掉 = 改造前"任由模型思考"的行为）
     var agentReasoningControl: Bool
@@ -451,7 +393,6 @@ struct ModelSettings: Codable, Sendable {
         kvCacheQuantize: Bool = false,
         autoCheckUpdate: Bool = true,
         grayOptIn: Bool = false,
-        updateTapChannel: Bool = false,
         agentReasoningControl: Bool = true,
         agentToolRouting: Bool = true,
         agentResultReduction: Bool = true,
@@ -507,7 +448,6 @@ struct ModelSettings: Codable, Sendable {
         self.kvCacheQuantize = kvCacheQuantize
         self.autoCheckUpdate = autoCheckUpdate
         self.grayOptIn = grayOptIn
-        self.updateTapChannel = updateTapChannel
         self.agentReasoningControl = agentReasoningControl
         self.agentToolRouting = agentToolRouting
         self.agentResultReduction = agentResultReduction
@@ -537,7 +477,7 @@ struct ModelSettings: Codable, Sendable {
              apiEnabled, apiEndpoint, apiKey, apiModel, apiTemperature, apiMaxTokens,
              cloudWebSearch, ttsEngine, ttsVoice, ttsVoiceName, ttsModel, ttsProviderID, ttsKokoroVoice, ttsSpeed, language,
              keepScreenOn, memoryEnabled, worldBookEnabled, instructionEnabled,
-             promptStrategy, useMetalAuto, kvCacheQuantize, autoCheckUpdate, grayOptIn, updateTapChannel, autoExtractMemory,
+             promptStrategy, useMetalAuto, kvCacheQuantize, autoCheckUpdate, grayOptIn, autoExtractMemory,
              agentReasoningControl, agentToolRouting, agentResultReduction, agentHistoryCompaction, agentThinkBudgetTokens,
              memoryDefaultsV2,
              s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region,
@@ -601,7 +541,6 @@ struct ModelSettings: Codable, Sendable {
         kvCacheQuantize = try c.decodeIfPresent(Bool.self, forKey: .kvCacheQuantize) ?? false
         autoCheckUpdate = try c.decodeIfPresent(Bool.self, forKey: .autoCheckUpdate) ?? true
         grayOptIn = try c.decodeIfPresent(Bool.self, forKey: .grayOptIn) ?? false
-        updateTapChannel = try c.decodeIfPresent(Bool.self, forKey: .updateTapChannel) ?? false
         agentReasoningControl = try c.decodeIfPresent(Bool.self, forKey: .agentReasoningControl) ?? true
         agentToolRouting = try c.decodeIfPresent(Bool.self, forKey: .agentToolRouting) ?? true
         agentResultReduction = try c.decodeIfPresent(Bool.self, forKey: .agentResultReduction) ?? true
@@ -667,7 +606,6 @@ struct ModelSettings: Codable, Sendable {
         try c.encode(kvCacheQuantize, forKey: .kvCacheQuantize)
         try c.encode(autoCheckUpdate, forKey: .autoCheckUpdate)
         try c.encode(grayOptIn, forKey: .grayOptIn)
-        try c.encode(updateTapChannel, forKey: .updateTapChannel)
         try c.encode(agentReasoningControl, forKey: .agentReasoningControl)
         try c.encode(agentToolRouting, forKey: .agentToolRouting)
         try c.encode(agentResultReduction, forKey: .agentResultReduction)

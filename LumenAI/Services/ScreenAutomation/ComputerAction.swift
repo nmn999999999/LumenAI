@@ -15,11 +15,11 @@ import Foundation
 // MARK: - 动作
 
 /// 一个可被 Agent 请求的动作类别。
+///
+/// 只保留普通 iOS 上**真实可执行**的动作：打开 URL / 运行快捷指令 / 等待。
+/// 合成触摸（tap/swipe/type）已整体移除 —— 取而代之的是「实时指导用户操作」。
 enum ComputerActionKind: String, CaseIterable, Sendable {
     case screenshot
-    case tap
-    case swipe
-    case type
     case wait
     case openApp = "open_app"
     case openURL = "open_url"
@@ -29,19 +29,9 @@ enum ComputerActionKind: String, CaseIterable, Sendable {
     var opName: String { rawValue }
 }
 
-/// 归一化坐标点（x/y ∈ [0,1]）。单独成 struct 而不是元组：元组不满足 Equatable 合成，
-/// 枚举就没法 Equatable，测试也就没法直接断言动作相等。
-struct NormPoint: Equatable, Sendable {
-    var x: Double
-    var y: Double
-}
-
-/// 具体动作 + 参数。坐标一律归一化（x/y ∈ [0,1]），避免设备分辨率差异。
+/// 具体动作 + 参数。
 enum ComputerAction: Equatable, Sendable {
     case screenshot
-    case tap(x: Double, y: Double)
-    case swipe(from: NormPoint, to: NormPoint)
-    case type(text: String)
     case wait(milliseconds: Int)
     case openApp(name: String)
     case openURL(String)
@@ -50,9 +40,6 @@ enum ComputerAction: Equatable, Sendable {
     var kind: ComputerActionKind {
         switch self {
         case .screenshot: return .screenshot
-        case .tap: return .tap
-        case .swipe: return .swipe
-        case .type: return .type
         case .wait: return .wait
         case .openApp: return .openApp
         case .openURL: return .openURL
@@ -64,21 +51,12 @@ enum ComputerAction: Equatable, Sendable {
     var label: String {
         switch self {
         case .screenshot: return "screenshot"
-        case .tap(let x, let y): return String(format: "tap(%.2f, %.2f)", x, y)
-        case .swipe(let from, let to):
-            return String(format: "swipe(%.2f,%.2f → %.2f,%.2f)",
-                          from.x, from.y, to.x, to.y)
-        case .type(let t): return "type(\(t.prefix(40)))"
         case .wait(let ms): return "wait(\(ms)ms)"
         case .openApp(let n): return "open_app(\(n))"
         case .openURL(let u): return "open_url(\(u))"
         case .runShortcut(let n): return "run_shortcut(\(n))"
         }
     }
-
-    /// 归一化坐标裁剪到 [0,1]。越界坐标会被系统忽略或点到屏幕外，
-    /// 与其让它悄悄失败，不如在构造时就夹住并如实记进结果。
-    static func clamp(_ v: Double) -> Double { min(max(v, 0), 1) }
 }
 
 // MARK: - 能力
@@ -89,16 +67,12 @@ enum ComputerCapabilityStatus: String, Equatable, Sendable {
     case supported
     /// 部分可用：依赖用户预先配置（例如"打开 App"要靠用户自己建的快捷指令）。
     case restricted
-    /// 当前构建里**没有**这条执行路径（例如合规版的 tap）。
+    /// 当前构建里**没有**这条执行路径。
     case unsupported
-    /// 只有特殊环境才可能（Tap 自签变体的合成触摸，且以 probe 实测为准）。
-    case requiresSpecialEnvironment
 
     /// 是否值得让模型去尝试。
-    /// `requiresSpecialEnvironment` 也算 —— 它表示"本构建里编译进去了且 probe 实测命中"，
-    /// 在 Tap 变体上就该真去执行；在合规变体上这个状态根本不会出现（那里是 unsupported）。
     var isAttemptable: Bool {
-        self == .supported || self == .restricted || self == .requiresSpecialEnvironment
+        self == .supported || self == .restricted
     }
 }
 
@@ -287,48 +261,17 @@ struct ComputerRetryPolicy: Equatable, Sendable {
 /// 这样矩阵本身可以在测试里逐行断言，而不是"跑起来才知道"。
 enum ComputerCapabilityMatrix {
 
-    /// - Parameters:
-    ///   - isTapBuild: 是否 `SIMULATE_TAP` 变体。
-    ///   - tapProbeAvailable: Tap 变体里 probe 是否**实测**到派发符号（合规版恒 false）。
-    ///   - shortcutsAvailable: `shortcuts://` 是否被系统识别（probe 实测）。
-    static func make(isTapBuild: Bool, tapProbeAvailable: Bool,
-                     shortcutsAvailable: Bool) -> [ComputerCapability] {
+    /// - Parameter shortcutsAvailable: `shortcuts://` 是否被系统识别（probe 实测）。
+    static func make(shortcutsAvailable: Bool) -> [ComputerCapability] {
         var caps: [ComputerCapability] = []
 
         // 截图：iOS 没有"截取本机当前屏幕"的公共 API。
         //   · UIGraphicsImageRenderer 只能截**自己 App** 的画面；
         //   · RPScreenRecorder 要用户发起并常驻广播。
-        // 两条都不能拿来给"别的 App 在干什么"做证据，所以一律 unsupported ——
-        // 这是本次改造里最重要的一条诚实声明：Vision 循环在普通 iOS 上**没有输入源**。
+        // 所以 in-app 一律 unsupported —— 屏幕识别交给快捷指令的「截屏 + 从图像中提取文本」。
         caps.append(ComputerCapability(
             kind: .screenshot, status: .unsupported,
-            reason: "iOS 无截取整机屏幕的公共 API（只能截本机画面，录屏需用户发起广播），"
-                    + "Vision 循环在普通 iOS 上没有截图输入源",
-            verify: .none))
-
-        // 合成触摸 / 滑动 / 输入：合规版完全没有这条路径；
-        // Tap 变体里**编译进去了**，但能不能用由 probe 实测决定，且属于特殊环境。
-        let tapStatus: ComputerCapabilityStatus = {
-            guard isTapBuild else { return .unsupported }
-            return tapProbeAvailable ? .requiresSpecialEnvironment : .unsupported
-        }()
-        let tapReason: String = {
-            if !isTapBuild {
-                return "合规版未编译合成触摸路径；要点击请改造成快捷指令动作后用 run 执行"
-            }
-            return tapProbeAvailable
-                ? "Tap 变体已解析到派发符号（特殊环境），执行结果仍需目视确认"
-                : "Tap 变体但 probe 未解析到派发符号 —— 本机实测不可用"
-        }()
-        caps.append(ComputerCapability(kind: .tap, status: tapStatus, reason: tapReason, verify: .none))
-        caps.append(ComputerCapability(kind: .swipe, status: tapStatus,
-                                       reason: tapReason.replacingOccurrences(of: "合成触摸", with: "合成滑动"),
-                                       verify: .none))
-        caps.append(ComputerCapability(
-            kind: .type, status: tapStatus,
-            reason: isTapBuild
-                ? "Tap 变体的键盘事件签名未验证，未接线；文本输入请用快捷指令的「输入文本」"
-                : "没有系统级输入注入；文本输入请用快捷指令的「输入文本」动作后用 run 执行",
+            reason: "iOS 无截取整机屏幕的公共 API；屏幕识别请用快捷指令的「截屏 + 提取文本」",
             verify: .none))
 
         caps.append(ComputerCapability(

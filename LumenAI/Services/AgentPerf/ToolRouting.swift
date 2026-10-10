@@ -198,7 +198,7 @@ enum ToolRouter {
 /// Tool Executor 的真实 schema —— 执行侧仍然拿完整参数定义。
 ///
 /// compact 形式：`- tool_name(arg1, arg2) — 一句话说明`
-/// 完整形式：保持改造前的 `- name: desc` + `参数:` 明细（本地冻结契约用）。
+/// 完整形式：保持改造前的 `- name: desc` + `参数:` 明细（本地小模型用）。
 enum ToolSchemaFormatter {
 
     /// 渲染整个目录。
@@ -221,7 +221,7 @@ enum ToolSchemaFormatter {
         return "- \(tool.name)\(signature) — \(desc)"
     }
 
-    /// 完整形式（改造前行为，逐字保持；本地冻结契约使用）。
+    /// 完整形式（改造前行为，逐字保持；本地小模型用）。
     static func fullText(_ tool: AgentToolDefinition, descriptionLimit: Int = Int.max) -> String {
         var desc = tool.description
         if desc.count > descriptionLimit { desc = String(desc.prefix(descriptionLimit)) + "…" }

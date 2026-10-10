@@ -102,6 +102,10 @@ struct LumenAIApp: App {
                     // 按需加载的入口本来就有：设置页「测试本地语音 / 试听」按钮、
                     // 聊天里点「朗读」时 TTSService 会自己加载引擎（带进度提示）。
                 }
+                // 「手机协作」：快捷指令通过 lumenai://agent?... 与 App 通信（进度 / 指引 / 控制）。
+                .onOpenURL { url in
+                    MobileAgentBridge.shared.handle(url: url)
+                }
                 // 数据安全：切后台/退出时立即落盘对话，防止 500ms 防抖窗口内强杀 App 丢消息
                 .onChange(of: scenePhase) { _, phase in
                     if phase != .active {
