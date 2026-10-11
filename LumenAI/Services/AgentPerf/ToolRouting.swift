@@ -58,14 +58,14 @@ enum ToolRouter {
 
     /// 核心工具：无论路由结果如何都保留，作为"能力下限"。
     static let coreToolNames: [String] = [
-        "note", "todo", "web_search", "http_get",
+        "note", "todo", "web_search", "http_get", "browser",
         "current_time", "calculator", "device_info",
         "file_op", "shell", "create_plugin",
     ]
 
     /// 内置工具 → group 的显式映射。
     static let explicitGroup: [String: ToolGroup] = [
-        "http_get": .web, "web_search": .web, "extract_urls": .web,
+        "http_get": .web, "web_search": .web, "extract_urls": .web, "browser": .web,
         "file_op": .filesystem, "shell": .filesystem, "ssh": .filesystem,
         "create_plugin": .developer, "json_query": .developer, "json_format": .developer,
         "regex_extract": .developer, "jwt_decode": .developer, "hash_text": .developer,

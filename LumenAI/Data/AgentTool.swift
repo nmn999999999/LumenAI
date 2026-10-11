@@ -442,6 +442,20 @@ enum BuiltInTools {
             requiresApproval: true,
         ),
         AgentToolDefinition(
+            id: "browser",
+            name: "browser",
+            description: "在 App 内浏览器里浏览网页并可点击/输入（iOS 上唯一能真正操作页面的表面）：open 打开 URL；read 读取当前页文字 + 可操作元素编号；click 点第 index 个元素（或按 text 文字匹配）；type 往第 index 个输入框填 text；scroll 滚动（direction=down/up）；back/forward/reload。典型用法：open → read → 按编号 click / type。返回页面快照文本。",
+            parameters: [
+                "op": .init(type: "string", description: "操作（必填）", enumValues: ["open", "read", "click", "type", "scroll", "back", "forward", "reload"]),
+                "url": .init(type: "string", description: "open 必填：网址（可省略 https://）", enumValues: nil),
+                "index": .init(type: "number", description: "click/type 用：read 返回的元素编号", enumValues: nil),
+                "text": .init(type: "string", description: "click：按包含该文字的元素点击；type：要输入的文本", enumValues: nil),
+                "direction": .init(type: "string", description: "scroll 方向：down / up（默认 down）", enumValues: ["down", "up"])
+            ],
+            // 浏览在 App 内可见、且是用户要 agent 做的事，不额外弹审批（否则每次 open 都打断）。
+            requiresApproval: false,
+        ),
+        AgentToolDefinition(
             id: "regex_extract",
             name: "regex_extract",
             description: "用正则表达式从文本中提取匹配的内容。简单的查找替换用 find_replace。",
@@ -689,6 +703,7 @@ enum BuiltInTools {
         case "clipboard":       return executeClipboard(arguments: arguments)
         case "file_op":         return executeFileOp(arguments: arguments)
         case "web_search":      return await executeWebSearch(arguments: arguments)
+        case "browser":         return await executeBrowser(arguments: arguments)
         case "regex_extract":   return executeRegexExtract(arguments: arguments)
         case "text_summary":    return executeTextSummary(arguments: arguments)
         case "number_base":     return executeNumberBase(arguments: arguments)
@@ -1423,6 +1438,45 @@ enum BuiltInTools {
         #else
         return "错误: 剪贴板在当前平台不可用"
         #endif
+    }
+
+    /// `browser` 工具：驱动 App 内浏览器（WKWebView）浏览、读取、点击、输入。
+    /// iOS 上唯一能真正操作页面的表面 —— 与 `web_search`/`http_get` 的区别是它可交互。
+    private static func executeBrowser(arguments: [String: Any]) async -> String {
+        let op = (arguments["op"] as? String)?.lowercased() ?? ""
+        let url = arguments["url"] as? String ?? ""
+        let text = arguments["text"] as? String ?? ""
+        let direction = (arguments["direction"] as? String) ?? "down"
+        let index: Int? = {
+            if let i = arguments["index"] as? Int { return i }
+            if let d = arguments["index"] as? Double { return Int(d) }
+            if let n = arguments["index"] as? NSNumber { return n.intValue }
+            if let s = arguments["index"] as? String { return Int(s) }
+            return nil
+        }()
+
+        switch op {
+        case "open":
+            guard !url.isEmpty else { return "错误: open 需要 url" }
+            return await WebBrowserService.shared.open(url)
+        case "read":
+            return await WebBrowserService.shared.readPage()
+        case "click":
+            if let index { return await WebBrowserService.shared.click(index: index) }
+            if !text.isEmpty { return await WebBrowserService.shared.clickText(text) }
+            return "错误: click 需要 index 或 text"
+        case "type":
+            guard let index else { return "错误: type 需要 index（read 返回的输入框编号）" }
+            guard !text.isEmpty else { return "错误: type 需要 text" }
+            return await WebBrowserService.shared.type(index: index, text: text)
+        case "scroll":
+            return await WebBrowserService.shared.scroll(direction)
+        case "back":    return await WebBrowserService.shared.back()
+        case "forward": return await WebBrowserService.shared.forward()
+        case "reload":  return await WebBrowserService.shared.reload()
+        default:
+            return "错误: 不支持的 op: \(op)（可用 open/read/click/type/scroll/back/forward/reload）"
+        }
     }
 
     private static func executeWebSearch(arguments: [String: Any]) async -> String {

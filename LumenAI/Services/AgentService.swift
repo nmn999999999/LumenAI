@@ -152,6 +152,16 @@ final class AgentService: ObservableObject {
                          + " with `file_op` by running `ls` in `shell`.")
         }
 
+        // 应用内浏览器：iOS 上唯一能真正「点击/输入」的表面（WKWebView + JS 注入）。
+        if tools.contains(where: { $0.name == "browser" }) {
+            lines.append("- In-app browser: drive it with the `browser` tool"
+                         + " (open/read/click/type/scroll/back/forward/reload). It runs INSIDE this app,"
+                         + " so clicking elements and filling inputs genuinely work. Use `read` to get the"
+                         + " page text plus a numbered list of interactive elements, then `click`/`type` by"
+                         + " index (or `click` by matching text). Prefer it over `http_get` when you must"
+                         + " interact, log in, or navigate. The user sees the same page live.")
+        }
+
         // 关掉的工具（只说关掉的）
         let enabledNames = Set(tools.map(\.name))
         let allBuiltin = BuiltInTools.allTools.map(\.name)

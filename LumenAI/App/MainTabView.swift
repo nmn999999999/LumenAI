@@ -14,6 +14,11 @@ struct MainTabView: View {
                     Label(t("聊天"), systemImage: "bubble.left.and.bubble.right.fill")
                 }
 
+            BrowserView()
+                .tabItem {
+                    Label(t("浏览器"), systemImage: "safari.fill")
+                }
+
             ModelListView()
                 .tabItem {
                     Label(t("模型"), systemImage: "cpu.fill")
