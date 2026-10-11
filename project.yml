@@ -87,14 +87,14 @@ targets:
         # 暴露 C 桥接头文件给 Swift
         SWIFT_OBJC_BRIDGING_HEADER: LumenAI/LumenAI-Bridging-Header.h
         # llama.cpp / mtmd 头文件（来自 llama.xcframework 的 Headers）
-        HEADER_SEARCH_PATHS: $(SRCROOT)/llama.xcframework/ios-arm64/Headers $(SRCROOT)/ssh.xcframework/ios-arm64/Headers $(SRCROOT)/SherpaOnnxC.xcframework/ios-arm64/SherpaOnnxC.framework/Headers $(SRCROOT)/LumenAI/LlamaCore
+        HEADER_SEARCH_PATHS: $(SRCROOT)/llama.xcframework/ios-arm64/Headers $(SRCROOT)/ssh.xcframework/ios-arm64/Headers $(SRCROOT)/SherpaOnnxC.xcframework/ios-arm64/SherpaOnnxC.framework/Headers $(SRCROOT)/LumenAI/LlamaCore $(SRCROOT)/third_party/ish/app $(SRCROOT)/third_party/ish/deps/libarchive/libarchive
         # C++20 + 多模态开关
         CLANG_CXX_LANGUAGE_STANDARD: c++20
         OTHER_CPLUSPLUSFLAGS: -DBRIDGE_ENABLE_MTMD -std=c++20
         # 关闭 bitcode（iOS 已废弃）
         ENABLE_BITCODE: NO
         # 链接后端框架
-        OTHER_LDFLAGS: $(inherited) -framework Metal -framework Accelerate -framework Foundation
+        OTHER_LDFLAGS: $(inherited) -framework Metal -framework Accelerate -framework Foundation -framework WebKit $(SRCROOT)/third_party/ish/build/Release-iphoneos/libiSHApp.a $(SRCROOT)/third_party/ish/build/Release-iphoneos/meson/libish.a $(SRCROOT)/third_party/ish/build/Release-iphoneos/meson/libish_emu.a $(SRCROOT)/third_party/ish/build/Release-iphoneos/meson/libfakefs.a $(SRCROOT)/third_party/ish/deps/build/Release-iphoneos/libarchive.a
 
   # 灵动岛 / 锁屏实时活动扩展。
   LumenAIWidget:
@@ -144,6 +144,12 @@ schemes:
         - name: 修补 speech-swift（放行 4-bit CosyVoice3 权重）
           script: |
             /usr/bin/env python3 "$SRCROOT/scripts/patch-speech-swift.py" || true
+          settingsTarget: LumenAI
+        # 本地 Linux 模式：按需构建 iSH 引擎静态库（打 vdso 补丁用 zig；已存在则跳过）。
+        # 需要 meson/ninja/zig；缺失时脚本会失败，链接阶段即报错，提示明确。
+        - name: 构建 iSH 引擎静态库（Linux 模式）
+          script: |
+            /bin/bash "$SRCROOT/scripts/build-ish-libs.sh"
           settingsTarget: LumenAI
     run:
       config: Debug
