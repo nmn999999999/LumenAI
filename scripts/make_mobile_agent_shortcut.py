@@ -1,131 +1,185 @@
 #!/usr/bin/env python3
-"""生成「手机协作」快捷指令（LumenAgent.shortcut）。
+"""生成「手机协作」快捷指令（LumenAgent.shortcut）—— 云端 API 版 · 无文件。
 
-背景：本 App 不能合成点击，屏幕识别与交互由「快捷指令主导」的循环完成：
-    截屏 → 从图像提取文本(OCR) → 写入共享目录 inbox.txt → 唤起 Lumen 决策
-    → Lumen 把「下一步操作」写回 outbox.txt → 本指令读回并展示 → 用户照着点 → 循环
+架构：**独立的 agent 跑在快捷指令里**。
+    App 用 `shortcuts://run-shortcut?name=LumenAgent&input=text&text=<configJSON>` 启动它，
+    config = {"endpoint","model","apiKey","systemPrompt"}。快捷指令自循环：
+        截屏 → 提取文本(OCR) → Get Contents of URL 调云端 LLM → 拿到「下一步做什么」
+        → Show Result 展示给你 → 你照着操作 → Ask for Input 继续 → 下一轮
+    全程不落任何文件。
 
-共享目录：文件 App → 我的 iPhone → LumenAI → LumenAgent
-（由 App 的 UIFileSharingEnabled 暴露；App Group 对快捷指令不可见，故不用它。）
-
-⚠️ 快捷指令的 `.shortcut` 属性表格式没有公开规范，且需在「快捷指令」App 里导入验证。
-本脚本按常见 WFWorkflow 结构生成一个**未签名**的 XML plist；若导入后某个动作缺失或
-参数不对，请按 README 的「搭建配方」手搭一次（动作与顺序一致即可），本脚本的价值是
-给出字段名与连接关系的起点。
+⚠️ `.shortcut` 属性表无公开规范，且必须导入「快捷指令」App 验证。本脚本按常见
+WFWorkflow 结构生成**已签名**的 XML plist；若导入后某个动作缺失/参数不符，请在
+快捷指令 App 里按上面的动作与顺序手动校正（本脚本的价值是给出字段名与连接关系）。
 
 用法：
     python3 scripts/make_mobile_agent_shortcut.py
 产物：
-    LumenAI/Resources/LumenAgent.shortcut
+    LumenAI/Resources/LumenAgent.shortcut（已签名）
 """
 import os
 import plistlib
+import shutil
+import subprocess
 import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "LumenAI", "Resources", "LumenAgent.shortcut")
-
-SHARED_DIR = "LumenAgent"
-INBOX = f"{SHARED_DIR}/inbox.txt"
-OUTBOX = f"{SHARED_DIR}/outbox.txt"
-LOOP_COUNT = 50  # 上限步数，防死循环；用户可随时停止
+LOOP_COUNT = 60  # 上限步数，防死循环
 
 
 def u():
     return str(uuid.uuid4()).upper()
 
 
-def attachment(action_uuid):
-    """把某个动作的输出作为输入引用。"""
+def text(s):
+    return {"Value": {"string": s}, "WFSerializationType": "WFTextTokenString"}
+
+
+def attach(action_uuid, name=""):
     return {
-        "Value": {"OutputUUID": action_uuid, "OutputName": "", "Type": "ActionOutput"},
+        "Value": {"OutputUUID": action_uuid, "OutputName": name, "Type": "ActionOutput"},
         "WFSerializationType": "WFTextTokenAttachment",
     }
 
 
-def literal_string(text):
-    return {"Value": {"string": text}, "WFSerializationType": "WFTextTokenString"}
-
-
-def action(identifier, params=None):
+def shortcut_input():
+    """「快捷指令输入」魔法变量（由 run-shortcut 的 input 传入）。"""
     return {
-        "WFWorkflowActionIdentifier": identifier,
-        "WFWorkflowActionParameters": params or {},
+        "Value": {"Type": "ExtensionInput", "OutputName": "Shortcut Input"},
+        "WFSerializationType": "WFTextTokenAttachment",
     }
 
 
+def dict_item(key, value, item_type=0):
+    return {"WFItemType": item_type, "WFKey": text(key) if isinstance(key, str) else key,
+            "WFValue": value}
+
+
+def dict_value(items):
+    return {"Value": {"WFDictionaryFieldValueItems": items},
+            "WFSerializationType": "WFDictionaryFieldValue"}
+
+
+def array_value(items):
+    return {"WFItemType": 2,
+            "WFValue": {"Value": items, "WFSerializationType": "WFArrayParameterState"}}
+
+
+def action(identifier, params=None):
+    return {"WFWorkflowActionIdentifier": identifier,
+            "WFWorkflowActionParameters": params or {}}
+
+
 def build_actions():
-    actions = []
+    a = []
 
-    # Repeat <LOOP_COUNT>
+    # 1) 解析配置：Get Dictionary from Input
+    a_cfg = u()
+    a.append(action("is.workflow.actions.detect.dictionary", {"UUID": a_cfg, "WFInput": shortcut_input()}))
+
+    def get_key(key, source_uuid):
+        aid = u()
+        a.append(action("is.workflow.actions.getvalueforkey", {
+            "UUID": aid,
+            "WFGetDictionaryValueType": "Value",
+            "WFDictionaryKey": text(key),
+            "WFInput": attach(source_uuid),
+        }))
+        return aid
+
+    a_endpoint = get_key("endpoint", a_cfg)
+    a_model = get_key("model", a_cfg)
+    a_key = get_key("apiKey", a_cfg)
+    a_sys = get_key("systemPrompt", a_cfg)
+
+    # 2) Repeat <LOOP_COUNT>（控制流：start=0 / end=2，同一 identifier）
     a_repeat = u()
-    actions.append(action("is.workflow.actions.repeat.count", {
-        "UUID": a_repeat,
-        "WFRepeatCount": LOOP_COUNT,
+    a.append(action("is.workflow.actions.repeat.count", {
+        "UUID": a_repeat, "WFControlFlowMode": 0, "WFRepeatCount": LOOP_COUNT,
     }))
 
-    # Take Screenshot
+    # 2a) Take Screenshot
     a_shot = u()
-    actions.append(action("is.workflow.actions.takescreenshot", {
-        "UUID": a_shot,
-    }))
+    a.append(action("is.workflow.actions.takescreenshot", {"UUID": a_shot}))
 
-    # Extract Text from Image（输入 = 上一步截图）
+    # 2b) Extract Text from Image（输入 = 截图）
     a_ocr = u()
-    actions.append(action("is.workflow.actions.gettextfromimage", {
-        "UUID": a_ocr,
-        "WFInput": attachment(a_shot),
-        "WFGetTextFromImageLanguage": "zh-Hans",  # 中文优先；可按需改
+    a.append(action("is.workflow.actions.gettextfromimage", {
+        "UUID": a_ocr, "WFInput": attach(a_shot), "WFGetTextFromImageLanguage": "zh-Hans",
     }))
 
-    # Save File → LumenAgent/inbox.txt（供 App 轮询读取）
-    a_save = u()
-    actions.append(action("is.workflow.actions.documentpicker.save", {
-        "UUID": a_save,
-        "WFInput": attachment(a_ocr),
-        "WFFileDestinationPath": INBOX,
-        "WFAskWhereToSave": False,
-        "WFFileOverwrite": True,
+    # 2c) Get Contents of URL → 云端 LLM
+    # Authorization 需要 "Bearer " + apiKey：用带附件的文本 token 拼接。
+    headers = dict_value([
+        dict_item("Content-Type", text("application/json")),
+        dict_item("Authorization", {
+            "Value": {"string": "Bearer ", "attachmentsByRange": {"{0, 0}": {"OutputUUID": a_key, "Type": "ActionOutput"}}},
+            "WFSerializationType": "WFTextTokenString",
+        }),
+    ])
+    body = dict_value([
+        dict_item("model", attach(a_model)),
+        dict_item("messages", array_value([
+            {"WFItemType": 3, "WFValue": dict_value([
+                dict_item("role", text("system")),
+                dict_item("content", attach(a_sys)),
+            ])},
+            {"WFItemType": 3, "WFValue": dict_value([
+                dict_item("role", text("user")),
+                dict_item("content", attach(a_ocr)),
+            ])},
+        ])),
+    ])
+    a_llm = u()
+    a.append(action("is.workflow.actions.downloadurl", {
+        "UUID": a_llm,
+        "WFURL": attach(a_endpoint),
+        "WFHTTPMethod": "POST",
+        "WFHTTPHeaders": headers,
+        "WFHTTPBodyType": "Json",
+        "WFJSONValues": body,
     }))
 
-    # Open URLs → 通知 App「有新一屏」（App 也会轮询 inbox.txt，这里是双保险）
-    a_open = u()
-    actions.append(action("is.workflow.actions.openurl", {
-        "UUID": a_open,
-        "WFInput": literal_string("lumenai://agent?action=step"),
+    # 2d) 从响应里取 choices[0].message.content
+    a_choices = u()
+    a.append(action("is.workflow.actions.getvalueforkey", {
+        "UUID": a_choices, "WFGetDictionaryValueType": "Value",
+        "WFDictionaryKey": text("choices"), "WFInput": attach(a_llm),
+    }))
+    a_first = u()
+    a.append(action("is.workflow.actions.getitemfromlist", {
+        "UUID": a_first, "WFItemSpecifier": "First Item", "WFInput": attach(a_choices),
+    }))
+    a_msg = u()
+    a.append(action("is.workflow.actions.getvalueforkey", {
+        "UUID": a_msg, "WFGetDictionaryValueType": "Value",
+        "WFDictionaryKey": text("message"), "WFInput": attach(a_first),
+    }))
+    a_content = u()
+    a.append(action("is.workflow.actions.getvalueforkey", {
+        "UUID": a_content, "WFGetDictionaryValueType": "Value",
+        "WFDictionaryKey": text("content"), "WFInput": attach(a_msg),
     }))
 
-    # Wait 3s：给 Lumen 决策 + 写回 outbox 的时间
-    actions.append(action("is.workflow.actions.wait", {
-        "WFDelayTime": 3,
+    # 2e) 展示「下一步做什么」
+    a.append(action("is.workflow.actions.showresult", {
+        "Text": attach(a_content),
     }))
 
-    # Get File → LumenAgent/outbox.txt（App 写回的下一步指引）
-    a_get = u()
-    actions.append(action("is.workflow.actions.documentpicker.open", {
-        "UUID": a_get,
-        "WFFileDestinationPath": OUTBOX,
-        "WFGetFileShowPicker": False,
-    }))
-
-    # Show Result → 展示指引
-    actions.append(action("is.workflow.actions.showresult", {
-        "Text": attachment(a_get),
-    }))
-
-    # 等待用户操作完成再进入下一轮（用户点「完成」即继续）
-    actions.append(action("is.workflow.actions.ask", {
+    # 2f) 等用户操作完成后继续
+    a.append(action("is.workflow.actions.ask", {
         "WFAskActionPrompt": "照着上面的指引操作，完成后点这里继续。",
         "WFInputType": "Text",
         "WFAskActionDefaultAnswer": "继续",
     }))
 
-    # End Repeat
-    actions.append(action("is.workflow.actions.repeat.count.each", {
-        "UUID": a_repeat,
+    # 关闭 Repeat
+    a.append(action("is.workflow.actions.repeat.count", {
+        "UUID": a_repeat, "WFControlFlowMode": 2,
     }))
 
-    return actions
+    return a
 
 
 def main():
@@ -134,43 +188,32 @@ def main():
         "WFWorkflowClientRelease": "3.0",
         "WFWorkflowMinimumClientVersion": 900,
         "WFWorkflowMinimumClientVersionString": "900",
-        "WFWorkflowIcon": {
-            "WFWorkflowIconStartColor": 4282601983,
-            "WFWorkflowIconGlyphNumber": 59413,
-        },
+        "WFWorkflowIcon": {"WFWorkflowIconStartColor": 4282601983,
+                           "WFWorkflowIconGlyphNumber": 59413},
         "WFWorkflowImportQuestions": [],
         "WFWorkflowTypes": [],
-        "WFWorkflowHasShortcutInputVariables": False,
+        "WFWorkflowHasShortcutInputVariables": True,
         "WFWorkflowActions": build_actions(),
     }
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
 
-    # iOS 15+ 拒绝导入**未签名**的 .shortcut（报"未签名，无法打开"）。
-    # 用 macOS 自带的 `shortcuts sign` 签名（在装有「快捷指令」App 的 Mac 上可用）。
-    # ⚠️ `shortcuts sign` 要求输入的**扩展名必须是 .shortcut**（否则报"格式不正确"），
-    # 所以临时文件也要用 .shortcut 结尾。
+    # iOS 15+ 拒绝导入未签名的 .shortcut；用 macOS 自带 `shortcuts sign` 签名。
+    # ⚠️ 输入扩展名必须是 .shortcut，否则报「格式不正确」。
     unsigned = OUT + ".unsigned.shortcut"
     with open(unsigned, "wb") as f:
         plistlib.dump(workflow, f)
 
-    import shutil
-    import subprocess
     if shutil.which("shortcuts"):
         try:
-            subprocess.run(
-                ["shortcuts", "sign", "--mode", "people-who-know-me",
-                 "--input", unsigned, "--output", OUT],
-                check=True,
-            )
+            subprocess.run(["shortcuts", "sign", "--mode", "people-who-know-me",
+                            "--input", unsigned, "--output", OUT], check=True)
             os.remove(unsigned)
             print(f"signed  {OUT}")
             return
         except subprocess.CalledProcessError as e:
             print(f"⚠️ 签名失败（{e}），退回未签名文件 —— iOS 可能拒绝导入。")
-
     shutil.move(unsigned, OUT)
-    print(f"wrote   {OUT}（未签名；请在有「快捷指令」App 的 Mac 上执行："
-          f"shortcuts sign --input {OUT} --output {OUT}）")
+    print(f"wrote   {OUT}（未签名）")
 
 
 if __name__ == "__main__":

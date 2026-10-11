@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// 「手机协作」卡片：快捷指令主导的循环 + 实时进度 + 操作指引。
+/// 「手机协作」卡片（云端 API 版 · 无文件）。
 ///
-/// 工作方式：快捷指令（截屏 → OCR）把每一屏写进共享目录并唤起 App；
-/// Lumen 决策后把「下一步该点哪里 / 输入什么」写回，用户照着操作即可。
-/// 本构建不能自动点击，交互由用户完成（见 `ShortcutEngine` 能力边界）。
+/// 独立的 agent 跑在快捷指令里（截屏 → OCR → 调云端 LLM → 拿到「下一步做什么」→ 循环）。
+/// 这里只配置云端参数并启动快捷指令。
 struct MobileAgentCard: View {
 
     @StateObject private var bridge = MobileAgentBridge.shared
@@ -17,27 +16,32 @@ struct MobileAgentCard: View {
         GlassCard {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    SectionHeader(title: "手机协作", systemImage: "iphone.gen3")
+                    SectionHeader(title: "手机协作（云端 API）", systemImage: "iphone.gen3")
                     Spacer()
-                    Text(bridge.active ? "进行中 · 第 \(bridge.stepIndex) 步" : "未开始")
+                    Text(bridge.active ? "已启动 · 第 \(bridge.stepIndex) 步" : "未启动")
                         .font(.caption)
                         .foregroundStyle(bridge.active ? .green : .secondary)
                 }
 
-                Text("快捷指令主导的循环：截屏 → 识别屏幕 → 交给 Lumen 决策 → 把「下一步操作」实时展示给你 → 你照着点 → 继续。本 App 无法自动点击，交互由你完成。")
+                Text("独立的 agent 跑在快捷指令里：截屏 → 识别屏幕 → 调云端 LLM 得到「下一步做什么」→ 展示给你 → 你照着点 → 循环。无需任何文件；本 App 只提供云端参数并启动快捷指令。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                field("协作快捷指令名", text: $bridge.shortcutName, placeholder: "LumenAgent", secure: false)
+                field("API 端点（OpenAI 兼容）", text: $bridge.endpoint,
+                      placeholder: "https://api.openai.com/v1/chat/completions", secure: false)
+                field("模型", text: $bridge.model, placeholder: "gpt-4o-mini", secure: false)
+                field("API Key", text: $bridge.apiKey, placeholder: "sk-…", secure: true)
+
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("协作快捷指令名").font(.subheadline)
-                    TextField("例如 LumenAgent", text: $bridge.shortcutName)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout)
-                    Text("与你在「快捷指令」App 里创建的循环指令名称完全一致。")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    Text("系统提示词（交给快捷指令里的 agent）").font(.subheadline)
+                    TextEditor(text: $bridge.systemPrompt)
+                        .font(.caption)
+                        .frame(minHeight: 90)
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
                 }
 
                 HStack(spacing: 10) {
@@ -49,23 +53,17 @@ struct MobileAgentCard: View {
                     }
                     Spacer()
                     if bridge.active {
-                        Button("结束") { bridge.endSession() }
-                            .buttonStyle(.glass)
+                        Button("结束") { bridge.endSession() }.buttonStyle(.glass)
                     } else {
-                        Button("开始协作") {
-                            let name = bridge.shortcutName.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !name.isEmpty else { return }
-                            bridge.startSession(shortcutName: name)
-                        }
-                        .buttonStyle(.glassProminent)
+                        Button("开始协作") { bridge.startSession() }
+                            .buttonStyle(.glassProminent)
                     }
                 }
 
-                if let guidance = bridge.currentGuidance, bridge.active, !guidance.isEmpty {
+                if let g = bridge.currentGuidance, !g.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("当前操作指引").font(.caption).foregroundStyle(.secondary)
-                        Text(guidance).font(.callout)
-                            .fixedSize(horizontal: false, vertical: true)
+                        Text("当前指引").font(.caption).foregroundStyle(.secondary)
+                        Text(g).font(.callout).fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -74,26 +72,17 @@ struct MobileAgentCard: View {
 
                 if !bridge.events.isEmpty {
                     Divider()
-                    Text("实时进度").font(.subheadline)
-                    ForEach(bridge.events.suffix(12).reversed()) { event in
+                    Text("进度").font(.subheadline)
+                    ForEach(bridge.events.suffix(12).reversed()) { e in
                         HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: icon(event.kind))
-                                .font(.caption2)
-                                .foregroundStyle(color(event.kind))
-                                .frame(width: 14)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(event.text)
-                                    .font(.caption2)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                Text(event.at, style: .time)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
+                            Image(systemName: icon(e.kind))
+                                .font(.caption2).foregroundStyle(color(e.kind)).frame(width: 14)
+                            Text(e.text).font(.caption2).fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
 
-                Text("共享目录：文件 App → 我的 iPhone → LumenAI → LumenAgent（inbox.txt / outbox.txt / events.jsonl）。")
+                Text("说明：API Key 仅保存在本机并随启动参数传给快捷指令；请使用权限受限的密钥。")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -101,27 +90,41 @@ struct MobileAgentCard: View {
         }
     }
 
+    @ViewBuilder
+    private func field(_ title: String, text: Binding<String>, placeholder: String, secure: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.subheadline)
+            if secure {
+                SecureField(placeholder, text: text)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .font(.callout)
+            } else {
+                TextField(placeholder, text: text)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .font(.callout)
+            }
+        }
+    }
+
     private func icon(_ kind: MobileAgentBridge.Event.Kind) -> String {
         switch kind {
-        case .sessionStart: return "play.circle.fill"
-        case .step:         return "rectangle.on.rectangle"
-        case .guide:        return "hand.point.up.left.fill"
-        case .awaitingUser: return "hourglass"
-        case .message:      return "paperplane.fill"
-        case .done:         return "checkmark.circle.fill"
-        case .error:        return "exclamationmark.triangle.fill"
+        case .start: return "play.circle.fill"
+        case .step:  return "rectangle.on.rectangle"
+        case .guide: return "hand.point.up.left.fill"
+        case .done:  return "checkmark.circle.fill"
+        case .error: return "exclamationmark.triangle.fill"
         }
     }
 
     private func color(_ kind: MobileAgentBridge.Event.Kind) -> Color {
         switch kind {
-        case .sessionStart: return .blue
-        case .step:         return .secondary
-        case .guide:        return .accentColor
-        case .awaitingUser: return .orange
-        case .message:      return .purple
-        case .done:         return .green
-        case .error:        return .red
+        case .start: return .blue
+        case .step:  return .secondary
+        case .guide: return .accentColor
+        case .done:  return .green
+        case .error: return .red
         }
     }
 }
