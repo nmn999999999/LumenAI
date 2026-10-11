@@ -3,42 +3,42 @@ import Foundation
 import UIKit
 #endif
 
-// MARK: - 手机协作（云端 API 版 · 无文件）
+// MARK: - 手机协作（方案 B：agent 在 App 内 + 官方 x-callback-url）
 //
-// 架构：**独立的 agent 跑在快捷指令里**。
-//   · 快捷指令自循环：截屏 → 提取文本(OCR) → 用 `Get Contents of URL` 调云端 LLM →
-//     拿到「下一步做什么」→ 展示给用户 → 用户照做 → 再来一轮。
-//   · App 只负责两件事：① 保存云端配置（endpoint / model / key / 系统提示词）；
-//     ② 用 `shortcuts://run-shortcut` 把配置当 input 传给快捷指令并启动它。
+// 官方机制（Apple Shortcuts 使用手册已文档化）：
+//   · 启动：shortcuts://x-callback-url/run-shortcut?name=<采集指令>&x-success=lumenai://agent
+//   · 快捷指令跑完，会把**文本输出**（最后一个动作的结果）作为 `result` 参数追加到 x-success，
+//     即回调打开 `lumenai://agent?result=<OCR 文本>`（无需文件、无需本地服务器）。
 //
-// **不落任何文件**：没有 inbox/outbox/events.jsonl。进度是内存态，可选用
-// `lumenai://agent?report=` 回传（URL 参数，不写盘），或干脆只在快捷指令里展示。
+// 分工：
+//   · 快捷指令（LumenCapture，只有两个动作）：截屏 → 从图像中提取文本。输出即屏幕文字。
+//   · App（本类）：收到屏幕文字 → 调云端 LLM 得到「下一步做什么」→ 展示给用户 →
+//     用户照着操作 → 点「继续」→ App 再次启动采集指令，循环。
 //
-// 为什么用 URL 传配置而不是文件/App Group：快捷指令唯一能「同步拿到回复」的通道是
-// HTTP（Get Contents of URL）；配置是单向传给快捷指令的，用 run-shortcut 的 input 最干净。
+// 为什么这样更稳：快捷指令里**不再**包含 HTTP/JSON/循环等复杂动作（那些 `.shortcut`
+// 属性表没有官方规范、极易写错）。agent 逻辑全在可编译、可验证的 Swift 里。
 
 @MainActor
 final class MobileAgentBridge: ObservableObject {
 
     static let shared = MobileAgentBridge()
 
-    // MARK: 云端配置（持久化到 UserDefaults；不写文件）
+    // MARK: 配置（持久化到 UserDefaults；不写文件）
 
-    /// OpenAI 兼容的 chat completions 端点，如 https://api.openai.com/v1/chat/completions
-    @Published var endpoint: String { didSet { save() } }
-    /// 模型名，如 gpt-4o-mini / qwen-plus / deepseek-chat
-    @Published var model: String { didSet { save() } }
-    /// 密钥（Bearer）。仅存本机 UserDefaults，随 input 传给快捷指令。
-    @Published var apiKey: String { didSet { save() } }
-    /// 交给快捷指令里那个 agent 的系统提示词。
-    @Published var systemPrompt: String { didSet { save() } }
-    /// 协作快捷指令名（与快捷指令 App 里一致）。
+    /// 采集快捷指令名（只有「截屏 → 提取文本」两个动作）。
     @Published var shortcutName: String { didSet { save() } }
+    /// 用户的目标（交给 LLM 的上下文）。
+    @Published var task: String { didSet { save() } }
+    /// OpenAI 兼容的 chat completions 端点。
+    @Published var endpoint: String { didSet { save() } }
+    @Published var model: String { didSet { save() } }
+    @Published var apiKey: String { didSet { save() } }
+    @Published var systemPrompt: String { didSet { save() } }
 
     // MARK: 进度（内存态，不落盘）
 
     struct Event: Identifiable, Equatable {
-        enum Kind: String, Sendable { case start, step, guide, done, error }
+        enum Kind: String, Sendable { case start, screen, guide, error, done }
         let id = UUID()
         let kind: Kind
         let text: String
@@ -49,58 +49,52 @@ final class MobileAgentBridge: ObservableObject {
     @Published private(set) var active = false
     @Published private(set) var stepIndex = 0
     @Published private(set) var currentGuidance: String?
+    @Published private(set) var lastScreen: String = ""
+    @Published private(set) var isDeciding = false
 
-    private static let keyPrefix = "mobileAgent."
+    private static let kp = "mobileAgent."
     private static let defaultSystemPrompt = """
-    你是一个手机操作助手。用户正在操作 iPhone，下面是当前屏幕的文字内容。
-    请只输出「下一步该做什么」——要具体到点哪里或输入什么（例如「点击顶部的『设置』图标」）。
-    如果任务已经完成，就输出「✅ 已完成」，不要输出别的内容。
+    你是一个手机操作助手。用户会给你当前屏幕上的文字内容和他的目标。
+    请只输出「下一步该做什么」，要具体到点哪里或输入什么（例如「点击顶部的『设置』」）。
+    如果目标已经完成，只输出「✅ 已完成」。
     """
 
     private init() {
         let d = UserDefaults.standard
-        endpoint = d.string(forKey: Self.keyPrefix + "endpoint") ?? "https://api.openai.com/v1/chat/completions"
-        model = d.string(forKey: Self.keyPrefix + "model") ?? "gpt-4o-mini"
-        apiKey = d.string(forKey: Self.keyPrefix + "apiKey") ?? ""
-        systemPrompt = d.string(forKey: Self.keyPrefix + "systemPrompt") ?? Self.defaultSystemPrompt
-        shortcutName = d.string(forKey: Self.keyPrefix + "shortcutName") ?? "LumenAgent"
+        shortcutName = d.string(forKey: Self.kp + "captureShortcut") ?? "LumenCapture"
+        task = d.string(forKey: Self.kp + "task") ?? ""
+        endpoint = d.string(forKey: Self.kp + "endpoint") ?? "https://api.openai.com/v1/chat/completions"
+        model = d.string(forKey: Self.kp + "model") ?? "gpt-4o-mini"
+        apiKey = d.string(forKey: Self.kp + "apiKey") ?? ""
+        systemPrompt = d.string(forKey: Self.kp + "systemPrompt") ?? Self.defaultSystemPrompt
     }
 
     private func save() {
         let d = UserDefaults.standard
-        d.set(endpoint, forKey: Self.keyPrefix + "endpoint")
-        d.set(model, forKey: Self.keyPrefix + "model")
-        d.set(apiKey, forKey: Self.keyPrefix + "apiKey")
-        d.set(systemPrompt, forKey: Self.keyPrefix + "systemPrompt")
-        d.set(shortcutName, forKey: Self.keyPrefix + "shortcutName")
+        d.set(shortcutName, forKey: Self.kp + "captureShortcut")
+        d.set(task, forKey: Self.kp + "task")
+        d.set(endpoint, forKey: Self.kp + "endpoint")
+        d.set(model, forKey: Self.kp + "model")
+        d.set(apiKey, forKey: Self.kp + "apiKey")
+        d.set(systemPrompt, forKey: Self.kp + "systemPrompt")
     }
 
-    // MARK: 传给快捷指令的配置
+    // MARK: 会话
 
-    /// 供快捷指令解析的配置 JSON（endpoint / model / key / systemPrompt）。
-    var configJSON: String {
-        let obj: [String: Any] = [
-            "endpoint": endpoint,
-            "model": model,
-            "apiKey": apiKey,
-            "systemPrompt": systemPrompt,
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: obj),
-              let text = String(data: data, encoding: .utf8) else { return "{}" }
-        return text
-    }
-
-    // MARK: 启动 / 消息
-
-    /// 启动协作：把配置当 input 传给快捷指令并运行。
-    func startSession(extraMessage: String = "") {
-        let name = shortcutName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
+    func startSession() {
         active = true
         stepIndex = 0
         events = []
-        append(.start, "启动协作快捷指令「\(name)」")
-        launchShortcut(named: name, text: configJSON)
+        currentGuidance = nil
+        lastScreen = ""
+        append(.start, "开始协作：\(task.isEmpty ? "（未填写目标）" : task)")
+        launchCapture()
+    }
+
+    /// 用户照做后点「继续」：再截一屏。
+    func continueLoop() {
+        guard active else { return }
+        launchCapture()
     }
 
     func endSession() {
@@ -108,50 +102,103 @@ final class MobileAgentBridge: ObservableObject {
         append(.done, "会话结束")
     }
 
-    /// 给快捷指令发一条消息（作为新的 input 重新运行它）。
-    func sendMessageToShortcut(_ message: String) {
+    /// 启动采集快捷指令，并让它用官方 x-callback-url 把屏幕文字回调给 App。
+    func launchCapture() {
         let name = shortcutName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        append(.guide, message)
-        launchShortcut(named: name, text: message)
-    }
-
-    private func launchShortcut(named name: String, text: String) {
         var allowed = CharacterSet.urlQueryAllowed
         allowed.remove(charactersIn: "&+=")
-        let enc = { (s: String) in s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s }
-        let urlString = text.isEmpty
-            ? "shortcuts://run-shortcut?name=\(enc(name))"
-            : "shortcuts://run-shortcut?name=\(enc(name))&input=text&text=\(enc(text))"
-        guard let url = URL(string: urlString) else { return }
+        func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s }
+        // x-success / x-cancel / x-error 都回到本 App 的 agent host。
+        let urlStr = "shortcuts://x-callback-url/run-shortcut"
+            + "?name=\(enc(name))"
+            + "&x-success=\(enc("lumenai://agent"))"
+            + "&x-cancel=\(enc("lumenai://agent?cancelled=1"))"
+            + "&x-error=\(enc("lumenai://agent?failed=1"))"
+        guard let url = URL(string: urlStr) else { return }
         UIApplication.shared.open(url, options: [:], completionHandler: nil)
     }
 
-    // MARK: 进度（内存 + 可选 URL 回传）
+    // MARK: URL 回调（快捷指令 → App）
 
-    /// App 内 Agent 的 `phone` 工具 `op=guide` 调用：把指引推给用户看。
-    func publishGuidance(_ text: String) {
-        currentGuidance = text
-        append(.guide, text)
-    }
-
-    /// 处理 `lumenai://agent?report=...&step=...`（快捷指令可选地回传进度；不写盘）。
+    /// `lumenai://agent?result=<屏幕文字>`（官方 x-success 回调）或 cancelled/failed。
     func handle(url: URL) {
         guard url.scheme?.lowercased() == "lumenai",
               url.host?.lowercased() == "agent" else { return }
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        func q(_ name: String) -> String? {
-            comps?.queryItems?.first(where: { $0.name == name })?.value
+        func q(_ n: String) -> String? { comps?.queryItems?.first(where: { $0.name == n })?.value }
+
+        if q("cancelled") != nil { append(.error, "用户在快捷指令里取消了"); return }
+        if q("failed") != nil { append(.error, "快捷指令出错了"); return }
+
+        let screen = q("result") ?? ""
+        guard !screen.isEmpty else { return }
+        active = true
+        lastScreen = screen
+        stepIndex += 1
+        append(.screen, "第 \(stepIndex) 屏：\(screen.prefix(200))")
+        Task { await decide(screen: screen) }
+    }
+
+    // MARK: 调云端 LLM 决策
+
+    private func decide(screen: String) async {
+        guard let url = URL(string: endpoint), !endpoint.isEmpty else {
+            append(.error, "未配置 API 端点"); return
         }
-        if let report = q("report"), !report.isEmpty {
-            active = true
-            append(.step, report)
+        isDeciding = true
+        defer { isDeciding = false }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty { req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+
+        let userContent = "用户目标：\(task.isEmpty ? "（未提供，请根据屏幕推断合理目标）" : task)\n\n当前屏幕文字：\n\(screen)\n\n请给出下一步操作。"
+        let body: [String: Any] = [
+            "model": model,
+            "temperature": 0.2,
+            "messages": [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user", "content": userContent],
+            ],
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            guard (200...299).contains(code) else {
+                let text = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
+                append(.error, "接口返回 HTTP \(code)：\(text)")
+                return
+            }
+            let guidance = Self.extractContent(data) ?? ""
+            guard !guidance.isEmpty else { append(.error, "接口返回为空"); return }
+            currentGuidance = guidance
+            append(.guide, guidance)
+        } catch {
+            append(.error, "请求失败：\(error.localizedDescription)")
         }
-        if let guide = q("guide"), !guide.isEmpty {
-            active = true
-            publishGuidance(guide)
+    }
+
+    /// 兼容 OpenAI 风格的 `choices[0].message.content`；取不到就退而用整段文本。
+    static func extractContent(_ data: Data) -> String? {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let choices = obj["choices"] as? [[String: Any]],
+           let message = choices.first?["message"] as? [String: Any],
+           let content = message["content"] as? String {
+            return content.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if (q("action") ?? "") == "end" { endSession() }
+        return String(data: data, encoding: .utf8)
+    }
+
+    // MARK: 进度
+
+    func publishGuidance(_ text: String) {
+        currentGuidance = text
+        append(.guide, text)
     }
 
     private func append(_ kind: Event.Kind, _ text: String) {
