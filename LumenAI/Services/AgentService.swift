@@ -429,6 +429,12 @@ final class AgentService: ObservableObject {
         var workingHistory = history
         var allToolCalls: [ChatMessage.ToolCall] = []
         var lastThinking: String?
+        // 连续「纯正文」轮：既没结束暗号、也没工具调用的轮次。
+        // 用途只有一个 —— **兜底终止**：模型（尤其小模型）经常直接写出结论却不带结束暗号，
+        // 若只认暗号，循环会一直重复「请继续」，用户看到的是"答案已经出来了还在转圈"。
+        // 当它连续两轮写出高度相似的正文（不再调用工具）时，就把这段正文当作最终答案返回。
+        var lastPlainThinking: String?
+        var plainThinkingStreak = 0
         /// `lastThinking` 是在**第几轮**写下的。
         ///
         /// 为什么必须记这个：循环退出后有一段兜底「返回最后一轮思考内容，保证不吞回答」，
@@ -661,6 +667,9 @@ final class AgentService: ObservableObject {
                 // Reasoning 门控：已确定动作 → 结束 reasoning。重置预算与重复检测，
                 // 让"下一步"从最小预算重新开始（阶段 2 的渐进式预算语义）。
                 reasoningRuntime.registerAction()
+                // 有工具调用 = 模型在真正推进，纯正文兜底计数清零。
+                plainThinkingStreak = 0
+                lastPlainThinking = nil
                 // 本地 / 云端在这里**分叉**，两边的行为差异是有意的、必须保持（原因见下面两个分支）：
                 //   云端 useCloud == true  → 一轮可发多个独立调用：逐个授权 → 并发执行 → 按原顺序回填
                 //   本地 useCloud == false → 一轮只执行第一个调用（小模型小步快跑更稳）
@@ -1071,6 +1080,22 @@ final class AgentService: ObservableObject {
                 if let id = iterationID { bridge?.endIteration(id) }
 
                 workingHistory.append(ChatMessage(role: .assistant, content: content))
+
+                // ── 纯正文兜底终止 ──
+                // 模型没有输出结束暗号，也没有调用工具，只写了一段正文。
+                // 若它**连续两轮**写出高度相似的正文（说明它其实已经答完，只是没按约定给暗号），
+                // 就把这段正文当作最终答案返回 —— 否则循环会一直重复"请继续"，用户看到答案却停不下来。
+                plainThinkingStreak += 1
+                let repeatedAnswer = lastPlainThinking.map {
+                    Self.sameAnswer($0, content)
+                } ?? false
+                lastPlainThinking = content
+                if (repeatedAnswer || plainThinkingStreak >= 4),
+                   content.trimmingCharacters(in: .whitespacesAndNewlines).count >= 40 {
+                    appendStep(.finalAnswer, "未检测到结束暗号，已把模型最后一段回答作为最终答案")
+                    if let id = iterationID { bridge?.endIteration(id) }
+                    return (content, allToolCalls)
+                }
 
                 // ── Reasoning 门控（阶段 2-4，可由开关关闭以复现 baseline）──
                 // 这是一轮"纯思考"：既没产出结束暗号，也没产出合法工具调用。
@@ -1638,6 +1663,19 @@ final class AgentService: ObservableObject {
             .replacingOccurrences(of: "\n", with: " ")
         guard oneLine.count > maxLength else { return oneLine }
         return String(oneLine.prefix(maxLength)) + "…"
+    }
+
+    /// 两段「纯正文」是否高度相似（用于兜底终止：模型已经答完却不出结束暗号）。
+    /// 判据保守 —— 只有整段相等、或一段以另一段为前缀/包含时才认为相似，
+    /// 且要求足够长（≥40 字），避免把两段短思考误判成"答完了"。
+    static func sameAnswer(_ a: String, _ b: String) -> Bool {
+        let na = a.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nb = b.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard na.count >= 40, nb.count >= 40 else { return false }
+        if na == nb { return true }
+        let short = na.count <= nb.count ? na : nb
+        let long = na.count <= nb.count ? nb : na
+        return long.hasPrefix(short) || long.contains(short)
     }
 
     // MARK: - 一轮多调用的并发执行（仅云端）

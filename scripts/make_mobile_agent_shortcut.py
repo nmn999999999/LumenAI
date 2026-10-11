@@ -144,9 +144,33 @@ def main():
         "WFWorkflowActions": build_actions(),
     }
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "wb") as f:
+
+    # iOS 15+ 拒绝导入**未签名**的 .shortcut（报"未签名，无法打开"）。
+    # 用 macOS 自带的 `shortcuts sign` 签名（在装有「快捷指令」App 的 Mac 上可用）。
+    # ⚠️ `shortcuts sign` 要求输入的**扩展名必须是 .shortcut**（否则报"格式不正确"），
+    # 所以临时文件也要用 .shortcut 结尾。
+    unsigned = OUT + ".unsigned.shortcut"
+    with open(unsigned, "wb") as f:
         plistlib.dump(workflow, f)
-    print(f"wrote {OUT}")
+
+    import shutil
+    import subprocess
+    if shutil.which("shortcuts"):
+        try:
+            subprocess.run(
+                ["shortcuts", "sign", "--mode", "people-who-know-me",
+                 "--input", unsigned, "--output", OUT],
+                check=True,
+            )
+            os.remove(unsigned)
+            print(f"signed  {OUT}")
+            return
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️ 签名失败（{e}），退回未签名文件 —— iOS 可能拒绝导入。")
+
+    shutil.move(unsigned, OUT)
+    print(f"wrote   {OUT}（未签名；请在有「快捷指令」App 的 Mac 上执行："
+          f"shortcuts sign --input {OUT} --output {OUT}）")
 
 
 if __name__ == "__main__":
