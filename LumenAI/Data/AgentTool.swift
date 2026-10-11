@@ -373,28 +373,6 @@ enum BuiltInTools {
             ],
             requiresApproval: false,
         ),
-        // ── phone：把"操作手机"这件事变成**有边界、有回执**的能力 ──
-        //
-        // 能力边界写进描述里是必须的，不是谦虚：合规版只能打开 URL / 触发已装快捷指令
-        // （系统还会弹确认），根本没有系统级点击与输入。如果描述里不写死，
-        // 模型会拿"tap 成功"这种不存在的返回值去向用户复述 —— 那是这个工具最危险的失败模式。
-        //
-        // requiresApproval 必须是 true：它会切换到别的 App、跑用户编的自动化。
-        // 这是本仓库里少数几个"读也该批"的工具（`probe` 也会打开 URL 做实测）。
-        AgentToolDefinition(
-            id: "phone",
-            name: "phone",
-            description: "操作手机 / 操作其他 App（capability-aware，本机构建不能合成点击）：probe 查能力矩阵与实测、capability 查可用动作、list/run/save/delete 管理配方、open/app 打开 URL 或 App、wait 等待 UI 稳定、guide 把操作指引实时展示给用户。⚠️ 点击/输入/切屏本构建无法自动执行：需要交互时用 guide 给出「下一步点哪里 / 输入什么」的指引让用户操作，或把该动作做成快捷指令后用 run 执行。返回 JSON 回执 {status, executed, verified}，取值 success / executed_unverified / failed / timeout / unsupported。只有 status=success 才算成功；executed_unverified 只能说「已执行但未验证」；unsupported 说明本机做不到，不要反复重试同一动作。",
-            parameters: [
-                "op": .init(type: "string", description: "操作（必填）", enumValues: ["probe", "capability", "stats", "list", "run", "save", "delete", "open", "app", "wait", "screenshot", "guide"]),
-                "name": .init(type: "string", description: "配方 / 快捷指令名 / URL / App 名（run/save/delete 用配方名；open 用 URL；app 用 App 名；run 时若无同名配方则直接按名字触发快捷指令）", enumValues: nil),
-                "summary": .init(type: "string", description: "一句话说明这条配方干什么（save 可选）", enumValues: nil),
-                "steps": .init(type: "string", description: "配方步骤，每行一条：run <快捷指令名> / open <url> / wait <秒> / # 注释（save 时可选，留空则只按 name 触发快捷指令）", enumValues: nil),
-                "ms": .init(type: "number", description: "等待毫秒数，0..30000（op=wait 必填）", enumValues: nil),
-                "text": .init(type: "string", description: "op=guide 必填：给用户看的下一步操作指引，例如「在设置页点『通用』→『关于本机』」", enumValues: nil)
-            ],
-            requiresApproval: true,
-        ),
         // ⚠️ `todo` **刻意不进** `BuiltInTools.defaultEnabledNames`（见本文件末尾那份清单）。
         //
         // 默认清单只有 12 个位置，是给本地小模型的核心工具箱（顺序即目录顺序）。
@@ -707,7 +685,6 @@ enum BuiltInTools {
         case "url_codec":       return executeUrlCodec(arguments: arguments)
         case "note":            return await executeNote(arguments: arguments)
         case "memory":          return await executeMemory(arguments: arguments)
-        case "phone":           return await executePhone(arguments: arguments)
         case "todo":            return await executeTodo(arguments: arguments)
         case "clipboard":       return executeClipboard(arguments: arguments)
         case "file_op":         return executeFileOp(arguments: arguments)
@@ -1358,128 +1335,6 @@ enum BuiltInTools {
                 return "错误: 不支持的 op: \(op)"
             }
         }
-    }
-
-    /// `phone` 工具：配方管理 + 运行 + 能力探测 + 操作指引（guide）。
-    ///
-    /// 所有"动作是否真的发生"都由 `ShortcutEngine` 判定并原样回传：
-    /// 这里**不补任何乐观文案**。这个工具最坏的失败不是报错，而是让模型
-    /// 向用户复述"已经点过了"—— 那会让用户以为自动化生效了，其实屏幕上什么都没发生。
-    private static func executePhone(arguments: [String: Any]) async -> String {
-        let opRead = enumeratedArgument(
-            arguments, "op", label: "操作",
-            allowed: allowedValues(tool: "phone", parameter: "op",
-                                   fallback: ["probe", "capability", "stats", "list", "run", "save",
-                                              "delete", "open", "app", "wait", "screenshot", "guide"]),
-            default: nil)
-        guard let op = opRead.value else { return opRead.error ?? "错误: 参数 op 无效" }
-
-        let name = (arguments["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let summary = arguments["summary"] as? String ?? ""
-        let steps = arguments["steps"] as? String ?? ""
-
-        switch op {
-        case "list":
-            return await MainActor.run {
-                let recipes = ShortcutStore.shared.recipes
-                guard !recipes.isEmpty else {
-                    return "（暂无配方。用 save 保存一条，或直接用 run + 快捷指令名触发系统里的指令）"
-                }
-                return recipes.map { r in
-                    "\(r.id.uuidString.prefix(8)) \(r.name) — \(r.summary.isEmpty ? "(无说明)" : r.summary)"
-                        + (r.actions.isEmpty ? "" : "（\(r.actions.count) 步）")
-                }.joined(separator: "\n")
-            }
-
-        case "save":
-            guard !name.isEmpty else {
-                return "错误: save 需要 name（快捷指令名或配方名）"
-            }
-            return await MainActor.run {
-                guard let recipe = ShortcutStore.shared.save(name: name, summary: summary, actionsText: steps) else {
-                    return "错误: 配方名不能为空"
-                }
-                let body = recipe.actions.isEmpty
-                    ? "（未填 steps，之后 run 会直接按名字触发同名快捷指令）"
-                    : "\n\(recipe.actionDescriptions.map { "  · " + $0 }.joined(separator: "\n"))"
-                return "已保存「\(recipe.name)」：\(recipe.summary.isEmpty ? "(无说明)" : recipe.summary)\(body)"
-            }
-
-        case "delete":
-            guard !name.isEmpty else { return "错误: delete 需要 name 或 id" }
-            return await MainActor.run {
-                guard let removed = ShortcutStore.shared.delete(id: name) else {
-                    return "错误: 找不到配方「\(name)」（先用 list 核对）"
-                }
-                return "已删除配方「\(removed)」"
-            }
-
-        case "run":
-            guard !name.isEmpty else { return "错误: run 需要 name" }
-            // 配方优先：有同名配方就按它执行（run/open/wait/注释），没有就直接触发快捷指令。
-            let recipe = await MainActor.run { ShortcutStore.shared.recipe(id: name) }
-            if let recipe { return await ShortcutEngine.run(recipe) }
-            return await ShortcutEngine.runShortcut(named: name)
-
-        case "probe":
-            let caps = await ShortcutEngine.capabilities()
-            let matrix = await ShortcutEngine.capabilityText(caps)
-            let report = await ShortcutEngine.probe()
-            let m = await ShortcutEngine.metrics
-            return report
-                + "\n\n## 能力矩阵（capability-first）\n" + matrix
-                + "\n\n## 步骤指标\n" + m.summaryLine
-
-        case "capability":
-            let caps = await ShortcutEngine.capabilities()
-            let text = await ShortcutEngine.capabilityText(caps)
-            let policy = ComputerRetryPolicy.default
-            return "能力矩阵\n" + text
-                + "\n重试上限 maxRetries=\(policy.maxRetries)，"
-                + "单动作超时 \(policy.actionTimeoutMs)ms —— 超过就停下汇报，不要无限重试。"
-
-        case "stats":
-            let m = await ShortcutEngine.metrics
-            return "步骤指标：\(m.summaryLine)"
-
-        case "screenshot":
-            return (await ShortcutEngine.execute(.screenshot, attempt: 1)).jsonString
-
-        case "wait":
-            guard let ms = arguments["ms"] as? Double ?? (arguments["ms"] as? Int).map(Double.init) else {
-                return "错误: wait 需要 ms（0..30000）"
-            }
-            return (await ShortcutEngine.execute(.wait(milliseconds: Int(ms)), attempt: 1)).jsonString
-
-        case "open":
-            guard !name.isEmpty else { return "错误: open 需要 name（URL）" }
-            return (await ShortcutEngine.execute(.openURL(name), attempt: 1)).jsonString
-
-        case "app":
-            guard !name.isEmpty else { return "错误: app 需要 name（App 名）" }
-            return (await ShortcutEngine.execute(.openApp(name: name), attempt: 1)).jsonString
-
-        case "guide":
-            // 「实时指导用户操作」：本构建不能合成点击，交互由用户完成。
-            // 这条指引会进入「手机协作」会话，展示给用户照着做。
-            guard let text = arguments["text"] as? String,
-                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return "错误: guide 需要 text（给用户看的操作指引）"
-            }
-            await MobileAgentBridge.shared.publishGuidance(text)
-            return "已把操作指引展示给用户：\(text)"
-
-        default:
-            return "错误: 不支持的 op: \(op)"
-        }
-    }
-
-    /// 从工具参数里读一个浮点数（模型可能发 Double、整数或字符串）。
-    private static func doubleArgument(_ arguments: [String: Any], _ key: String) -> Double? {
-        if let d = arguments[key] as? Double { return d }
-        if let n = arguments[key] as? NSNumber { return n.doubleValue }
-        if let s = arguments[key] as? String { return Double(s) }
-        return nil
     }
 
     /// `todo` 工具：维护当前任务的步骤清单（面板上可见的进度）。

@@ -14,9 +14,6 @@ struct SettingsView: View {
     @State private var showDeleteConfirm = false
     /// Kokoro 语音模型删除确认（约 175 MB，删了要重下）
     @State private var showKokoroDeleteConfirm = false
-    /// 「Agent 智能体」卡片展示的屏幕自动化能力矩阵（现查现显，与提示词同源）。
-    /// 空 = 尚未探测完成，卡片显示"正在检测…"。
-    @State private var agentCaps: [ComputerCapability] = []
     @FocusState private var focusedField: Field?
     
     private enum Field: Hashable {
@@ -74,7 +71,6 @@ struct SettingsView: View {
                     systemPromptCard
                     toolsCard
                     agentCard
-                    MobileAgentCard()
                     FeaturesCard
                     cloudStorageCard
                     updateCard
@@ -507,26 +503,18 @@ struct SettingsView: View {
 
     // MARK: - 工具（可开关，总数上限不变）
 
-    /// 「Agent 智能体」卡片：Agent 优化开关 + 思考预算 + 屏幕自动化能力状态。
+    /// 「Agent 智能体」卡片：Agent 优化开关 + 思考预算。
     ///
     /// 为什么必须有这张卡：`AgentOptimizations` 的四项优化（reasoning 控制 / 工具路由 /
     /// 结果压缩 / 历史压缩）和思考预算此前**没有任何设置入口** —— 代码里只有
     /// `.optimized` / `.baseline` 两档，线上永远是全开，用户既看不到也关不掉。
     /// 现在每一项都落到 `ModelSettings`，由这张卡读写，`ChatView` 发起 run 时
     /// 用 `AgentOptimizations.from(settings:)` 还原成优化集合。
-    ///
-    /// 右上角的 capability 状态行**现查** `ShortcutEngine.capabilities()`：
-    /// 这是模型在提示词里看到的同一份能力矩阵，用户在这儿看到的若与模型不一致，
-    /// 就说明两边读的不是同一个真源。
     private var agentCard: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     SectionHeader(title: "Agent 智能体", systemImage: "cpu")
-                    Spacer()
-                    Text(agentCapabilityBadge)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
 
                 Text("控制 Agent 循环的行为。关掉某项会回到该功能上线前的老行为，用于排查问题或省 token。")
@@ -575,40 +563,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Divider()
-
-                // 屏幕自动化（phone 工具）能力：现查现显，与提示词里的能力矩阵同源
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("屏幕自动化能力（phone 工具）")
-                        .font(.subheadline)
-                    if agentCaps.isEmpty {
-                        Text("正在检测…")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(agentCaps, id: \.line) { cap in
-                            HStack(alignment: .top, spacing: 6) {
-                                Image(systemName: agentStatusIcon(cap.status))
-                                    .font(.caption2)
-                                    .foregroundStyle(agentStatusColor(cap.status))
-                                    .frame(width: 14)
-                                Text(cap.line)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                    Text("以上是模型在提示词里看到的同一份能力矩阵。合成点击/输入已移除（普通 App 无法获得 IOHID 特权）—— 交互由 Agent 实时指导，或交给快捷指令完成。")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
-        }
-        .task {
-            agentCaps = await ShortcutEngine.capabilities()
         }
     }
 
@@ -625,26 +580,6 @@ struct SettingsView: View {
             }
         }
         .tint(.purple)
-    }
-
-    private func agentStatusIcon(_ status: ComputerCapabilityStatus) -> String {
-        switch status {
-        case .supported: return "checkmark.circle.fill"
-        case .restricted: return "exclamationmark.circle.fill"
-        case .unsupported: return "xmark.circle.fill"
-        }
-    }
-
-    private func agentStatusColor(_ status: ComputerCapabilityStatus) -> Color {
-        switch status {
-        case .supported: return .green
-        case .restricted: return .orange
-        case .unsupported: return .secondary
-        }
-    }
-
-    private var agentCapabilityBadge: String {
-        "仅 URL / 快捷指令"
     }
 
     /// 内置工具的选择界面。

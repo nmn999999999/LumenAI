@@ -29,7 +29,6 @@ struct AgentPromptContext: Sendable {
     let environment: String
     /// 当前目录里是否含这些工具 —— 决定可选段落是否拼入。
     let hasTodo: Bool
-    let hasPhone: Bool
     let hasCreatePlugin: Bool
     /// 工具结果的不可信数据包裹说明（本地与云端都会用到）。
     let untrustedWrapped: Bool
@@ -85,15 +84,6 @@ enum AgentPrompts {
         3. Execute step by step — one call is one clear unit, not everything at once.
         4. Verify before claiming success: re-read, re-query, check status. A command that returned without an error is not proof it worked.
         """)
-
-        if c.hasPhone {
-            sections.append("""
-            ## Phone & other apps (`phone` tool)
-            - Capability-first: the Environment section prints the live matrix for this build. Trust it. `unsupported` = do not attempt and do not retry; offer the alternative named in its reason instead. `executed_unverified` = it ran but is unverified; report exactly what the tool returned. Only status=success may be called a success.
-            - This build CANNOT synthesize taps, swipes, or text input, and cannot capture the whole screen. These need IOHID-level privileges a normal app lacks — never invent a `tap`/`swipe`/`type` op and never claim you performed an on-screen action yourself.
-            - For any interaction (tap / type / switch screen), use `op=guide` to hand the user a precise, real-time instruction (exactly what to tap or enter), then continue. This guidance flow is how on-screen work actually gets done.
-            """)
-        }
 
         sections.append("""
         ## Autonomy & confirmation

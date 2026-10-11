@@ -136,33 +136,6 @@ final class AgentService: ObservableObject {
                          + " ask for a remote operation.")
         }
 
-        // 手机操作（phone 工具）。必须把**做得到 / 做不到**写清楚，而且这段话必须
-        // 来自**真实能力矩阵**（每次现算：scheme 可用性会变）。
-        if tools.contains(where: { $0.name == "phone" }) {
-            let caps = await ShortcutEngine.capabilities()
-            lines.append("- Phone automation via the `phone` tool."
-                         + " Live capability matrix for THIS build (a `phone`/`op=capability` call"
-                         + " returns exactly these rows):")
-            for cap in caps {
-                lines.append("  - \(cap.line)")
-            }
-            lines.append("  Also available: `op=probe` (full report incl. recipe list),"
-                         + " `op=list/save/delete/run` (recipes), `op=stats`, `op=capability`."
-                         + " Shortcuts run through `shortcuts://` (the system may prompt the user), and"
-                         + " a successful launch is NOT a completion receipt — report exactly what the"
-                         + " tool returned. Every step returns requested/executed/verified/status:"
-                         + " `unsupported` means this build cannot do it — stop, do not retry, and offer"
-                         + " the alternative listed in the reason instead; `executed_unverified` means it"
-                         + " ran but could not be verified — never call that a success; only"
-                         + " `status=success` may be described as succeeded.")
-            lines.append("  This build CANNOT synthesize taps, swipes, or text input, and cannot"
-                         + " capture the whole screen — these need IOHID-level privileges a normal app"
-                         + " lacks. For any interaction (tap / type / switch screen), use `op=guide` to"
-                         + " hand the user a precise, real-time instruction (what to tap or enter) and"
-                         + " let them do it, then continue. Do not invent a tap/swipe/type op and do not"
-                         + " claim you performed an on-screen action yourself.")
-        }
-
         // 用户文件工作区。为什么值得单列一条：它是**唯一**能让模型"动手改东西"的地方，
         // 而模型对它的默认假设是错的 —— 它会以为自己在通用文件系统上（写 `/tmp/x.txt`、
         // 读 `~/Documents/...`），于是列出不存在的路径、或者干脆声称改好了。
@@ -1391,7 +1364,6 @@ final class AgentService: ObservableObject {
             toolList: catalog,
             environment: environment,
             hasTodo: visible.contains("todo"),
-            hasPhone: visible.contains("phone"),
             hasCreatePlugin: visible.contains("create_plugin"),
             untrustedWrapped: true)
         let effectiveInstruction = useCloud ? AgentPrompts.cloud(context) : AgentPrompts.local(context)
