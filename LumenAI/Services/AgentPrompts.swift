@@ -129,7 +129,7 @@ enum AgentPrompts {
 
         {"name": "<tool_name>", "arguments": {"<arg>": <value>}}
 
-        Argument names must match the definitions exactly. Numbers as plain values (5, 3.14); booleans as true/false; everything else as strings. Any turn without tool-call JSON is treated as thinking — the system continues the loop and your reasoning is preserved.
+        Argument names must match the definitions exactly. Numbers as plain values (5, 3.14); booleans as true/false; everything else as strings. Any turn without tool-call JSON is treated as thinking — the system continues the loop and your reasoning is preserved. Do not spend turns on thinking alone: every turn must either call a tool or end the loop with the end signal plus the final answer.
         """)
 
         sections.append("""
@@ -232,6 +232,8 @@ enum AgentPrompts {
         \(c.endSignal)
 
         紧接着输出最终回答正文。暗号是循环结束的唯一信号：只要不输出暗号，系统就会认为你仍在思考并让你继续。
+        但**不要只输出思考**：每一轮都必须二选一 —— 调用工具，或输出暗号+正文。
+        连续多轮只写正文、不动手，系统会认为你已经说完了，直接拿最后一段正文收尾。
         """)
 
         sections.append("""

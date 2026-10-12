@@ -75,6 +75,7 @@ struct SettingsView: View {
                     cloudStorageCard
                     updateCard
                     searchCard
+                    shellCard
                     sshCard
                     moduleSettingsCard
                     diagnosticsCard
@@ -1634,6 +1635,61 @@ struct SettingsView: View {
 
     // MARK: - SSH 配置（Agent ssh 工具默认连接）
 
+    /// 本地终端 + Linux 模式（iSH）状态。
+    ///
+    /// 为什么单开一张卡：用户要的「shell 界面」是**本地沙盒终端**（与 agent 的 `shell`
+    /// 工具共用同一个解释器），而 iSH 的 Linux 模式目前只到"引擎已链接"这一步。
+    /// 两者都很容易和上面的 SSH（跑在远程主机上）混起来，所以集中在这里把各自是什么、
+    /// 边界在哪一次讲清楚，而不是让用户点了才发现"Linux 会话还没接好"。
+    private var shellCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionHeader(title: "终端 / Linux 模式", systemImage: "terminal.fill")
+
+                NavigationLink {
+                    ShellView()
+                } label: {
+                    HStack {
+                        Label("本地终端（沙盒 Shell）", systemImage: "chevron.left.forwardslash.chevron.right")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                Divider()
+
+                capabilityRow("Linux 内核", LinuxMode.isLinked ? "已链接进 App" : "未链接", ok: LinuxMode.isLinked)
+                capabilityRow("模拟器（asbestos）", LinuxMode.isEmuAvailable ? "可用" : "缺失", ok: LinuxMode.isEmuAvailable)
+                capabilityRow("Linux 状态", LinuxBoot.shared.phase.label,
+                              ok: LinuxBoot.shared.phase == .running || LinuxBoot.shared.phase == .ready)
+                capabilityRow("Metal 加速", MetalCapability.statusLine, ok: MetalCapability.isAvailable)
+
+                Text("沙盒终端与 agent 的 shell 工具共用同一个会话（cwd / 环境变量 / 历史）。真 Linux 会话在终端页里：导入 rootfs（约 3 MB）→ 启动内核 → 进去敲命令。终端目前按原始字节显示（含 ANSI 清洗），还没有 VT100 屏幕语义。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// 能力行：左勾/右警号 + 名称 + 取值。ok=false 用橙色警告而不是红色错误 ——
+    /// "未接入"是当前阶段的已知状态，不是故障。
+    private func capabilityRow(_ title: String, _ value: String, ok: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(ok ? .green : .orange)
+            Text(title).font(.subheadline)
+            Spacer()
+            Text(value)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
     private var sshCard: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 14) {
@@ -1723,6 +1779,8 @@ struct SettingsView: View {
 
     @ObservedObject private var pluginManager = PluginManager.shared
 
+    @ObservedObject private var linuxRuntime = LinuxBoot.shared
+
     @ViewBuilder
     private var moduleSettingsCard: some View {
         let withUI = pluginManager.modules.filter { $0.manifest.settingsUI?.isEmpty == false }
@@ -1765,8 +1823,51 @@ struct SettingsView: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
+
+                Divider()
+
+                // 运行态取数：这三条都是**真值**（内核里/进程里问出来的），不是配置回显。
+                HStack(spacing: 6) {
+                    Text("运行态（Linux / Metal）").font(.caption.weight(.semibold))
+                    Spacer()
+                    if linuxRuntime.readingDiagnostics {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button {
+                        Task { await linuxRuntime.refreshDiagnostics() }
+                    } label: {
+                        Label("刷新", systemImage: "arrow.clockwise").font(.caption2)
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(linuxRuntime.readingDiagnostics)
+                }
+                capabilityRow("Linux 内存（客户机）", guestMemoryText, ok: linuxRuntime.mem.hasGuest)
+                capabilityRow("Linux 内存（宿主 App）", hostMemoryText, ok: linuxRuntime.mem.hostFootprint > 0)
+                capabilityRow("Linux 联网（golp 网卡）", linuxRuntime.netSummary,
+                              ok: linuxRuntime.netOK)
+                capabilityRow("Linux DNS", linuxRuntime.dnsSummary, ok: linuxRuntime.dnsRC == 0)
+                capabilityRow("Metal 运行证据", MetalCapability.runtimeEvidence,
+                              ok: MetalCapability.isAvailable && MetalCapability.lastLoadBackendNote != nil)
+                Text("客户机内存 = iSH 内核里那固定 256 MB 用了多少（只有内核知道，宿主看不见客户机页表）；宿主内存 = 这个 App 自己吃掉的物理内存（iSH 的内存映射只是保留地址空间，真正吃物理内存的是被触碰过的页）。联网那条判据是内核里的 golp 网卡 —— 它注册在内核里，宿主侧没有对应物。Metal 只用于本地模型推理，Linux 终端渲染走 UIKit + Core Graphics，不碰 Metal。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
+        .task { await linuxRuntime.refreshDiagnostics() }
+    }
+
+    private var guestMemoryText: String {
+        guard linuxRuntime.mem.hasGuest else { return "取不到（内核未启动/已停止）" }
+        return "已用 \(Self.mbyte(linuxRuntime.mem.guestUsed)) / 共 \(Self.mbyte(linuxRuntime.mem.guestTotal))"
+    }
+
+    private var hostMemoryText: String {
+        guard linuxRuntime.mem.hostFootprint > 0 else { return "—" }
+        return "footprint \(Self.mbyte(linuxRuntime.mem.hostFootprint)) · resident \(Self.mbyte(linuxRuntime.mem.hostResident))"
+    }
+
+    private static func mbyte(_ bytes: UInt64) -> String {
+        String(format: "%.0f MB", Double(bytes) / (1024 * 1024))
     }
 
     private var aboutCard: some View {

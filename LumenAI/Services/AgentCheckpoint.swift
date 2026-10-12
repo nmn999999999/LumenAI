@@ -53,14 +53,23 @@ struct AgentRunCheckpoint: Codable, Sendable {
 /// 和"agent 怎么跑"无关；塞进去会让 AgentService 再多一份不属于它的职责。
 @MainActor
 final class AgentCheckpointStore {
-    static let shared = AgentCheckpointStore()
+    static let shared = AgentCheckpointStore(url: AgentCheckpointStore.defaultURL())
 
-    private let url: URL = {
+    /// 存档文件位置。
+    ///
+    /// 之所以做成可注入（而不是写死在 `shared` 里）：`tests/agent_checkpoint` 要验证"
+    /// 任务真的结束后存档必须消失"——这条规则正是 P0 里"答案出完还会自己复活再跑一遍"
+    /// 的根因。用固定路径的话，测试就得往用户真实的 Documents 目录里写文件。
+    let url: URL
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    private static func defaultURL() -> URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         return docs.appendingPathComponent("agent_run_checkpoint.json")
-    }()
-
-    private init() {}
+    }
 
     func load() -> AgentRunCheckpoint? {
         guard let data = try? Data(contentsOf: url) else { return nil }

@@ -17,6 +17,8 @@ struct FilesView: View {
     @FocusState private var dialogFocused: Bool
     @State private var pendingDelete: String?
     @State private var shareURL: URL?
+    /// 终端入口：文件页和 shellbox 都是"文件系统"语义，从这里的工具栏进终端最顺手。
+    @State private var showShell = false
 
     private enum NameDialog: Identifiable {
         case newFolder
@@ -74,6 +76,9 @@ struct FilesView: View {
                 showImporter = false
             }
             .ignoresSafeArea()
+        }
+        .sheet(isPresented: $showShell) {
+            ShellView()
         }
         // v0.3.73：自定义居中输入弹窗（替代系统 .alert，见 nameDialog 注释）
         .overlay {
@@ -259,6 +264,13 @@ struct FilesView: View {
             }
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+                showShell = true
+            } label: {
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+            }
+            .accessibilityLabel(t("终端"))
+
             Menu {
                 Button(t("新建文件夹"), systemImage: "folder.badge.plus") {
                     dialogText = ""

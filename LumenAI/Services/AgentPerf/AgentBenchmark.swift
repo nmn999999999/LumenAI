@@ -450,7 +450,10 @@ extension AgentBenchmarkRunner {
                 toolsEnabledTools: tools,
                 llm: llm(),
                 bridge: bridge,
-                optimizations: variant.optimizations)
+                optimizations: variant.optimizations,
+                // 终止策略也要跟着变体走：baseline 复现"修复前会把答案丢掉/多请求几轮"的行为，
+                // optimized 用修复后的规则。否则两组只差性能开关、差不出这次修复的收益。
+                loopPolicy: variant == .baseline ? .legacy : .fixed)
             // 调用明细：判定与轨迹指标只吃这份纯数据（不依赖 ChatMessage 类型）。
             let records = calls.map {
                 BenchmarkToolCallRecord(name: $0.name,

@@ -213,6 +213,28 @@ const char * llama_bridge_last_error(llama_bridge * b) {
     return b ? b->last_error.c_str() : "null bridge";
 }
 
+const char * llama_bridge_backend_note(llama_bridge * b) {
+    // thread_local：返回的指针要活到调用方把它拷走，而各线程可能同时问。
+    static thread_local std::string note;
+    note.clear();
+    if (!b) return note.c_str();
+    std::lock_guard<std::mutex> lock(b->log_mutex);
+    // 从后往前找：日志是追加的，最后一条匹配的才是本次加载的结论。
+    for (auto it = b->log_lines.rbegin(); it != b->log_lines.rend(); ++it) {
+        const std::string & line = *it;
+        if (line.find("offloaded") != std::string::npos ||
+            line.find("ggml_metal") != std::string::npos ||
+            line.find("Metal") != std::string::npos) {
+            note = line;
+            // 去掉尾随换行：llama.cpp 的日志行带 \n，直接放进 UI 会多一个空行。
+            while (!note.empty() && (note.back() == '\n' || note.back() == '\r'))
+                note.pop_back();
+            break;
+        }
+    }
+    return note.c_str();
+}
+
 void llama_bridge_stop(llama_bridge * b) {
     if (b) b->stop = true;
 }

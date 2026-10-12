@@ -155,6 +155,21 @@ enum L10n {
         "保存到相册": ["zh": "保存到相册", "en": "Save to Photos"],
         "已保存到相册": ["zh": "已保存到相册", "en": "Saved to Photos"],
         "跟随 App 语言": ["zh": "跟随 App 语言", "en": "Follow App language"],
+
+        // 终端（Shell）页
+        "终端": ["zh": "终端", "en": "Terminal"],
+        "终端 / Linux 模式": ["zh": "终端 / Linux 模式", "en": "Terminal / Linux mode"],
+        "本地终端（沙盒 Shell）": ["zh": "本地终端（沙盒 Shell）", "en": "Local terminal (sandbox shell)"],
+        "输入命令…": ["zh": "输入命令…", "en": "Type a command…"],
+        "你": ["zh": "你", "en": "You"],
+        "清空输出": ["zh": "清空输出", "en": "Clear output"],
+        "复制全部输出": ["zh": "复制全部输出", "en": "Copy all output"],
+        "重置会话": ["zh": "重置会话", "en": "Reset session"],
+        "已复制全部输出": ["zh": "已复制全部输出", "en": "Copied all output"],
+        "已重置会话（cwd / 环境变量 / 历史已清空）": [
+            "zh": "已重置会话（cwd / 环境变量 / 历史已清空）",
+            "en": "Session reset (cwd / env / history cleared)"
+        ],
     ]
 }
 

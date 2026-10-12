@@ -65,7 +65,31 @@ final class LlamaSwiftEngine: LLMEngine, @unchecked Sendable {
             let err = String(cString: llama_bridge_last_error(handle))
             throw LLMError.loadFailed("模型加载失败: \(err)")
         }
+        // 采一次 llama.cpp **自己**报的后端结论（典型："load_tensors: offloaded 32/33 layers to GPU"）。
+        // 为什么要它：`n_gpu_layers` 只是我们**要求**的层数，真正跑没跑 GPU 只有后端自己知道
+        // （Metal 初始化失败会静默回落 CPU）。设置页显示这条 = 这件事可被验证。
+        LlamaSwiftEngine.storeBackendNote(String(cString: llama_bridge_backend_note(handle)))
         self.bridge = handle
+    }
+
+    // MARK: - 运行期后端证据（给设置页「Metal 到底用没用」）
+
+    /// `nonisolated(unsafe)`：写发生在加载模型的 detached 线程上，读发生在主 actor 上，
+    /// 用一把锁护住 —— 与 `_lastKVCacheReuse` 同样的处理方式。
+    private static let backendNoteLock = NSLock()
+    nonisolated(unsafe) private static var _lastBackendNote: String?
+
+    /// 最近一次成功加载模型时，llama.cpp 自己报的 offload 结论（空串 = 没这条日志）。
+    /// 例："load_tensors: offloaded 32/33 layers to GPU" / "… offloaded 0/33 layers to GPU"。
+    static var lastBackendNote: String? {
+        backendNoteLock.lock(); defer { backendNoteLock.unlock() }
+        return _lastBackendNote
+    }
+
+    private static func storeBackendNote(_ note: String) {
+        backendNoteLock.lock(); defer { backendNoteLock.unlock() }
+        let trimmed = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        _lastBackendNote = trimmed.isEmpty ? nil : trimmed
     }
 
     deinit {

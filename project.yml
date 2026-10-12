@@ -22,7 +22,16 @@ targets:
     type: application
     platform: iOS
     sources:
-      - LumenAI
+      - path: LumenAI
+        # 这两个是**内核侧**源码，不能由 Xcode 编：
+        #   · lumen_kernel_addon.c 要 __KERNEL__ + 内核头（-include linux/kconfig.h 等）；
+        #   · lumen_percpu_align.S 是给链接器补页对齐的，和内核成员必须落在一起。
+        # 它们由 scripts/build-ish-libs.sh 用内核那套 flag 编好、合成进 liblumen-linux.a。
+        # 让 Xcode 也编一遍的话，前者会直接编译失败，后者会变成"内核里那份 + App 里那份"
+        # 两份对齐块（不致命但没意义）。
+        excludes:
+          - "Services/Linux/lumen_kernel_addon.c"
+          - "Services/Linux/lumen_percpu_align.S"
       - path: appicon.icon
         buildPhase: resources
     dependencies:
@@ -60,8 +69,8 @@ targets:
         # iOS 26 App 图标：Icon Composer 工程（appicon.icon）作为官方 AppIcon 源，
         # 由 actool 用 Icon Composer 渲染管线生成含液态玻璃效果的全部变体
         ASSETCATALOG_COMPILER_APPICON_NAME: appicon
-        MARKETING_VERSION: 0.3.85
-        CURRENT_PROJECT_VERSION: 85
+        MARKETING_VERSION: 0.3.87
+        CURRENT_PROJECT_VERSION: 87
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         # 实时活动（灵动岛 / 锁屏）的开关。**缺了它 Activity.request 会直接抛异常**，
         # 而错误信息只说请求失败，不会告诉你"是 Info.plist 少了个 key"。
@@ -94,7 +103,21 @@ targets:
         # 关闭 bitcode（iOS 已废弃）
         ENABLE_BITCODE: NO
         # 链接后端框架
-        OTHER_LDFLAGS: $(inherited) -framework Metal -framework Accelerate -framework Foundation -framework WebKit $(SRCROOT)/third_party/ish/build/Release-iphoneos/libiSHApp.a $(SRCROOT)/third_party/ish/build/Release-iphoneos/meson/libish.a $(SRCROOT)/third_party/ish/build/Release-iphoneos/meson/libish_emu.a $(SRCROOT)/third_party/ish/build/Release-iphoneos/meson/libfakefs.a $(SRCROOT)/third_party/ish/deps/build/Release-iphoneos/libarchive.a
+        # iSH「Linux 模式」= 真 Linux 内核（liblinux）+ iSH 的 Linux 接口层（libiSHLinux）
+        # + 模拟器（libish_emu）+ fakefs + 我们那两个内核侧补丁 —— **合成一个** liblumen-linux.a。
+        #
+        # 为什么必须合成（而不是在这里分别列 .a）：initcall 的执行顺序 = 目标文件在链接命令行上的
+        # 先后。内核侧的 init_devpts_fs（level 6）必须先于 app 侧的 ios_pty_init（也是 level 6）跑，
+        # 否则 do_mount("devpts") 返回 -ENODEV，而 LinuxPTY.c 那行是 panic()。
+        # Xcode 的链接行是「app 的所有 .o → 再 …OTHER_LDFLAGS」，-force_load 只会落在 app 对象之后，
+        # 所以分别列的话顺序必然是反的；合成库里成员顺序由脚本固定成「内核 → app 层」。
+        # ⚠️ 这个库由 scripts/build-ish-libs.sh 的 ISH_BUILD_LINUX=1 生成（CI 里也是这一步）。
+        # -lsqlite3：fakefs 的元数据库（meta.db）。-liconv：libarchive 解 tar 时要转字符集
+        # （少了它报的是 libarchive.a 里 _iconv_open 未定义，看着像 libarchive 的问题，其实是链接缺库）。
+        # -lresolv：把宿主 DNS 注入客户机 /etc/resolv.conf 要用 res_ninit / res_getservers
+        # （符号在 iOS 上是 res_9_* 别名，所以必须真链上 libresolv —— 少了它 ld 报的是
+        # "_res_9_ninit undefined"，看着像代码写错，其实是链接缺库）。上游 iSH 也链它。
+        OTHER_LDFLAGS: $(inherited) -framework Metal -framework Accelerate -framework Foundation -framework WebKit -Wl,-u,_lumen_linux_kernel_entry -Wl,-u,_lumen_linux_emu_marker -Wl,-force_load,$(SRCROOT)/third_party/ish/build/ReleaseLinux-iphoneos/liblumen-linux.a $(SRCROOT)/third_party/ish/build/ReleaseLinux-iphoneos/meson/libish_emu.a $(SRCROOT)/third_party/ish/build/ReleaseLinux-iphoneos/meson/libfakefs.a $(SRCROOT)/third_party/ish/deps/build/Release-iphoneos/libarchive.a -lsqlite3 -liconv -lresolv
 
   # 灵动岛 / 锁屏实时活动扩展。
   LumenAIWidget:
@@ -126,8 +149,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lumenai.app.widget
-        MARKETING_VERSION: 0.3.85
-        CURRENT_PROJECT_VERSION: 85
+        MARKETING_VERSION: 0.3.87
+        CURRENT_PROJECT_VERSION: 87
         TARGETED_DEVICE_FAMILY: "1,2"
         # 扩展不单独安装进 /Applications
         SKIP_INSTALL: YES

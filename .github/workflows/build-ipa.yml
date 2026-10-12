@@ -74,6 +74,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # third_party/ish 是 iSH（Linux 模式引擎）的源代码，主工程的链接阶段要用它编出来的
+          # 5 个 .a。**没有这一步 CI 必挂**（实测：run 38117739105 —— 子模块是空的，
+          # 只看到 "iSH 子模块缺失，跳过"，随后 xcodebuild 报
+          # "third_party/ish/iSH.xcodeproj does not exist"，构建在 3 分钟内失败）。
+          submodules: recursive
 
       # 选一个与**本地构建工具链一致**的 Xcode：本地是 Xcode 26.1
       # （IPA 的 Info.plist: DTXcode=2610 / DTXcodeBuild=17B55 / SDK iphoneos26.1=23B77），Swift 6.2.x。
@@ -159,6 +165,27 @@ jobs:
           /tmp/agent_parts_tests
           echo "✅ agentParts 分段测试全部通过"
 
+          # Agent 主循环终止行为（P0）：断言"模型请求次数 / 终止原因 / 返回正文 / 是否清档"。
+          # 这是"答案已经显示、agent 还在继续循环/继续请求模型"那类 bug 的唯一自动化防线 ——
+          # 界面上看不出问题，多出来的请求发生在后台。纯逻辑，不依赖网络与模拟器。
+          echo "=== agent_loop 终止行为测试 ==="
+          swiftc -o /tmp/agent_loop_tests \
+            LumenAI/Services/AgentPerf/AgentLoopPolicy.swift \
+            Tests/agent_loop/main.swift
+          /tmp/agent_loop_tests
+          echo "✅ agent_loop 终止行为测试全部通过"
+
+          # 断点存档的清档规则（P0 根因）：只有"任务真的结束"才清档。
+          # 漏清一次，下一次前台化/冷启动就会把一个完成的任务重跑一遍。
+          echo "=== agent_checkpoint 清档规则测试 ==="
+          swiftc -o /tmp/agent_checkpoint_tests \
+            LumenAI/Data/ChatMessage.swift \
+            LumenAI/Services/AgentCheckpoint.swift \
+            LumenAI/Services/AgentPerf/AgentLoopPolicy.swift \
+            Tests/agent_checkpoint/main.swift
+          /tmp/agent_checkpoint_tests
+          echo "✅ agent_checkpoint 清档规则测试全部通过"
+
           # project.yml 的 YAML 合法性：有 pyyaml 就提前校验（xcodegen 那步也会再校验一次），
           # 没有就跳过 —— 它缺席不该让整个构建挂掉。
           echo "=== project.yml YAML 校验 ==="
@@ -223,6 +250,50 @@ jobs:
           xcodebuild -resolvePackageDependencies \
             -project LumenAI.xcodeproj
 
+      # iSH（Linux 模式）静态库的构建工具链。
+      #
+      # 为什么单独一步、而不是让 scheme 的 preAction 顺手做：preAction 是在 xcodebuild
+      # 内部跑的，工具缺失时的报错会被埋在整包构建的日志里（表现为"链接失败"或
+      # "某个 .a 找不到"），而真正的原因是 meson/zig 不存在。单独一步能让失败点一眼可见。
+      #
+      # zig 用 pip 装（`ziglang` 包自带二进制）：这台 runner 上没装 Homebrew LLVM，
+      # 而 iSH 的 vdso 需要一个能交叉编译 x86-linux 的编译器 —— zig 内置 clang+lld，
+      # 正好绕开 "Homebrew 是 Tier3、装不了 llvm" 这个坑。
+      - name: Install iSH build tools (meson/ninja/zig)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ish-tools"
+          "$RUNNER_TEMP/ish-tools/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/ish-tools/bin/pip" install --quiet meson ninja ziglang
+          echo "$RUNNER_TEMP/ish-tools/bin" >> "$GITHUB_PATH"
+          # patch-ish-vdso.sh 自己会按 ISH_ZIG → PATH → pip 包 的顺序找 zig，
+          # 这里显式给一个，省掉"在 runner 上猜路径"的不确定性。
+          ZIG="$("$RUNNER_TEMP/ish-tools/bin/python" -c 'import os,ziglang;print(os.path.join(os.path.dirname(ziglang.__file__),"zig"))')"
+          echo "ISH_ZIG=$ZIG" >> "$GITHUB_ENV"
+          echo "zig = $ZIG"
+          "$ZIG" version
+          meson --version; ninja --version
+
+      # 把 iSH「Linux 模式」引擎编出来（主工程的 LDFLAGS 引用的就是它）。
+      # ISH_BUILD_LINUX=1 会：按需 clone Linux 内核源码（359MB）→ 编 liblinux/libiSHLinux
+      # → 再合成主工程真正 -force_load 的那个 liblumen-linux.a（成员顺序 = initcall 顺序，
+      # 见该脚本里的长注释）。ISH_SKIP_NOTLINUX=1 跳过已经用不到的 NotLinux 那套。
+      # 脚本幂等：已存在就跳过，所以本地重复构建没有额外代价。
+      - name: Build iSH static libs
+        run: |
+          set -euo pipefail
+          ISH_ZIG="$ISH_ZIG" SRCROOT="$GITHUB_WORKSPACE" \
+            ISH_BUILD_LINUX=1 ISH_SKIP_NOTLINUX=1 \
+            /bin/bash scripts/build-ish-libs.sh
+          for lib in \
+            third_party/ish/build/ReleaseLinux-iphoneos/liblumen-linux.a \
+            third_party/ish/build/ReleaseLinux-iphoneos/meson/libish_emu.a \
+            third_party/ish/build/ReleaseLinux-iphoneos/meson/libfakefs.a \
+            third_party/ish/deps/build/Release-iphoneos/libarchive.a; do
+            [ -f "$lib" ] || { echo "::error::缺少 $lib"; exit 1; }
+            echo "✅ $lib  $(lipo -info "$lib" 2>/dev/null | tail -1)"
+          done
+
       # 无证书编译真机包（未签名 .app）。
       # speech-swift 的 4-bit 放行补丁由 scheme 的 preAction 自动执行（见 project.yml），
       # 这里不需要单独跑。
@@ -241,6 +312,53 @@ jobs:
             COMPILER_INDEX_STORE_ENABLE=NO \
             -skipMacroValidation \
             -skipPackagePluginValidation
+
+      # 三条断言，都指向"实际会 panic / 实际会白跑"的失败模式，而不是"看起来接上了"：
+      #   1) 内核符号在不在 —— 惰性链接下"库写在 LDFLAGS 里" != "代码在包里"（实测过死链接）；
+      #   2) initcall 顺序 —— 内核的 init_devpts_fs(level 6) 必须排在内核侧的 ios_pty_init(level 6)
+      #      前面，否则 do_mount("devpts") 返回 -ENODEV，而 LinuxPTY.c 那行是 panic()。
+      #      链接顺序由 liblumen-linux.a 的成员顺序保证，这条断言就是防它被改回去；
+      #   3) __percpu_first 的页对齐 —— 不对齐的话内核第一条断言就 panic("BUG!")。
+      - name: Assert Linux kernel is linked and ordered
+        run: |
+          set -euo pipefail
+          BIN="build/Build/Products/Release-iphoneos/LumenAI.app/LumenAI"
+          # 后四个来自我们自己的内核侧补丁（lumen_kernel_addon.c，随 liblumen-linux.a 合成进来）：
+          # 它们是「开发者面板取数（内存/网卡）」和「关闭 Linux」「注入 /etc/resolv.conf」的唯一实现，
+          # 合成库的成员一改就可能整块掉出去 —— 而那样 App 只是链接失败或静默行为错，看不出来。
+          for s in _run_kernel _actuate_kernel _linux_start_session _init_devpts_fs \
+                   _fakefs_import _asbestos_new _lumen_linux_kernel_entry _ConsoleLog \
+                   _lumen_meminfo _lumen_net_info _lumen_write_guest_file \
+                   _lumen_kill_user_processes; do
+            if ! nm -j "$BIN" | grep -qx "$s"; then
+              echo "::error::$s 不在最终二进制里 —— Linux 内核退回惰性链接（死链接）"
+              exit 1
+            fi
+            echo "✅ $s"
+          done
+
+          # 两套内核不能共存：NotLinux 的 become_first_process 不该再出现。
+          if nm -j "$BIN" | grep -qx _become_first_process; then
+            echo "::error::NotLinux 与 Linux 模式两套内核同时在包里 —— 链接没切干净"
+            exit 1
+          fi
+          echo "✅ NotLinux 引擎已移除"
+
+          devpts=$(nm -n "$BIN" | awk '/_init_devpts_fs6$/ {print $1; exit}')
+          pty=$(nm -n "$BIN" | awk '/_ios_pty_init6$/ {print $1; exit}')
+          [ -n "$devpts" ] && [ -n "$pty" ] || { echo "::error::找不到 devpts/ios_pty 的 initcall 符号"; exit 1; }
+          if [ "$((16#$devpts))" -ge "$((16#$pty))" ]; then
+            echo "::error::initcall 顺序反了（devpts=$devpts >= ios_pty=$pty）—— 内核会 panic 在挂 devpts 上"
+            exit 1
+          fi
+          echo "✅ initcall 顺序：devpts($devpts) 先于 ios_pty($pty)"
+
+          align=$(otool -l "$BIN" | awk '/sectname __percpu_first/ {f=1} f && /align/ {print $2; exit}')
+          if [ "$align" != "2^12" ]; then
+            echo "::error::__percpu_first 没页对齐（align=$align）—— 内核第一条断言就会 panic"
+            exit 1
+          fi
+          echo "✅ __percpu_first 页对齐（$align）"
 
       # 检测是否配置了签名 Secrets
       - name: Check signing availability

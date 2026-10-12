@@ -96,6 +96,10 @@ final class AgentService: ObservableObject {
         lines.append("- Running on a **cloud model**: \(selection).")
 
         // 联网搜索：这是最容易被模型"假装做到"的一项
+        // Linux 模式：引擎（iSH）是否真的链接进本二进制。放在这里不只是"给模型看"——
+        // 它同时是**真实引用点**：Release 的 -dead_strip 会剥掉没有调用点的代码，
+        // 一旦剥掉，`libish/libish_emu` 又会退回惰性链接（实测二进制里 iSH 符号数会变回 0）。
+        lines.append("- Linux mode (iSH engine): \(LinuxMode.statusLine).")
         lines.append(s.cloudWebSearch
                      ? "- Web search: **enabled** (results come back through the web_search tool;"
                        + " cite sources)."
@@ -232,10 +236,20 @@ final class AgentService: ObservableObject {
         return "\n" + lines.joined(separator: "\n")
     }
 
+    /// 本次修复后的主循环策略（终止条件、重复判定、相似度阈值、清档规则……）。
+    ///
+    /// 「什么时候可以停」这件事以前散在这个文件的十几个出口里，各自判断、各自 return，
+    /// 于是出口之间不一致（有的清了断点存档、有的没清）。现在统一收在
+    /// `AgentLoopPolicy` / `AgentLoopTerminator`（纯逻辑，见 AgentPerf/AgentLoopPolicy.swift），
+    /// 这样它能被 tests/agent_loop 用脚本直接驱动、断言"模型请求了几次"。
+    /// 需要复现修复前行为时改用 `.legacy`（benchmark / 紧急回滚用）。
+    static let loopPolicy: AgentLoopPolicy = .fixed
+
     /// 循环不设硬性轮数上限：正常终止条件是模型输出结束暗号（或生成失败/任务取消）。
     /// 但设一个很大的「软上限」兜底：防止模型永远不输出暗号导致死循环烧电。
     /// 到达软上限前一轮会先通知模型强制收尾；若仍无暗号则优雅退出并返回最后一轮内容。
-    static let softIterationLimit = 150
+    /// 取值来自 `loopPolicy`，避免同一件事有两个真源。
+    static let softIterationLimit = AgentLoopPolicy.fixed.softIterationLimit
     // ↑ 为什么从 50 提到 150：50 对**长任务**是够不着天花板的 —— 一个真实的
     // 「读几个文件 → 逐个改 → 跑验证」很容易用掉三四十轮，跑到一半被强制收尾，
     // 用户看到的是"它明明还在干活、突然就说结束了"。
@@ -259,17 +273,19 @@ final class AgentService: ObservableObject {
     /// 检测暗号并提取最终回答。返回 nil 表示输出中没有暗号。
     /// 兼容暗号在前（`暗号+正文`）与在后（`正文+暗号`）两种写法。
     /// 暗号对用户永远隐藏——展示/返回的只有正文。
+    ///
+    /// 实现委托给纯函数 `AgentFinalAnswer.extract`：同一段解析逻辑同时被
+    /// 主循环（判定能不能收尾）与 tests/agent_loop 使用，避免两套实现漂移。
+    /// ⚠️ 注意它的第二种 nil：**只有暗号、没有正文**时同样返回 nil。
+    /// 调用方必须把这种情况当成"本轮没有可用的最终答案"处理，而不是"继续请求模型"
+    /// —— 后者会退化成"每轮都只吐一个暗号"的无限循环（见 AgentLoopTerminator.evaluateEndSignal）。
     static func extractFinalAnswer(from text: String) -> String? {
-        guard text.range(of: endSignal, options: [.caseInsensitive]) != nil else { return nil }
-        let cleaned = text
-            .replacingOccurrences(
-                of: endSignal, with: "\n",
-                options: [.caseInsensitive]
-            )
-            .replacingOccurrences(of: "```", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // 只输出了暗号没有正文：交给上层兜底
-        return cleaned.isEmpty ? nil : cleaned
+        AgentFinalAnswer.extract(from: text, endSignal: endSignal)
+    }
+
+    /// 本轮是否出现了结束暗号（不区分大小写）。
+    static func containsEndSignal(_ text: String) -> Bool {
+        AgentFinalAnswer.contains(text, endSignal: endSignal)
     }
 
     /// 去除推理模型（DeepSeek-R1 / Qwen3 等）的 `<think>…</think>` / `<reasoning>…</reasoning>` 块，
@@ -378,7 +394,14 @@ final class AgentService: ObservableObject {
         resuming checkpoint: AgentRunCheckpoint? = nil,
         /// 优化开关集合。默认全部开启（线上行为）；benchmark 传 `.baseline`
         /// 即可复现改造前的行为，用于对比与紧急回滚。详见 `AgentOptimizations`。
-        optimizations: AgentOptimizations = .optimized
+        optimizations: AgentOptimizations = .optimized,
+        /// 主循环终止策略覆盖。
+        ///
+        /// 为什么单独开一个口子：终止条件（暗号后是否掐断流、纯正文能连续几轮、
+        /// 是否清断点存档）**不属于** `AgentOptimizations` 那组"可关掉的性能优化"——
+        /// 它们是正确性规则，线上必须永远是 `.fixed`。但 A/B benchmark 需要一个
+        /// "修复前行为"的对照臂，所以由 benchmark 显式传 `.legacy`，线上不传。
+        loopPolicy policyOverride: AgentLoopPolicy? = nil
     ) async -> (content: String, toolCalls: [ChatMessage.ToolCall]) {
 
         steps.removeAll()
@@ -389,7 +412,24 @@ final class AgentService: ObservableObject {
         let checkpointBubbleID = checkpoint?.bubbleID ?? bubbleID
         let checkpointResumeCount = (checkpoint?.resumeCount ?? 0)
         let checkpointStartedAt = checkpoint?.startedAt ?? Date()
+        // ── 终止状态机（P0）──
+        // 所有"能不能停"的判定都走它；出口只负责动作（发请求 / 执行工具 / 返回）。
+        let loopPolicy = policyOverride ?? Self.loopPolicy
+        var terminator = AgentLoopTerminator(policy: loopPolicy)
         defer { isRunning = false }
+        // 断点存档的统一清档点（P0 根因修复）。
+        //
+        // 以前只有"跑完 while 循环"那一条路会清档，而"拿到最终答案就 return"的几条路
+        // 全都把存档留在盘上了。后果不是"多一个文件"：ChatView 在回前台 / 冷启动时
+        // 会读这份存档并**自动续跑**，于是用户看到的是"答案都已经显示出来了，
+        // agent 还在继续跑、还在请求模型"——而且每次都把整段历史重发一遍。
+        // 现在收敛成一条规则：**只有"任务真的结束"的出口才清档**（取消 / 生成失败保留，
+        // 那两种才是真的需要续跑）。
+        defer {
+            if terminator.clearsCheckpointOnFinish {
+                AgentCheckpointStore.shared.clear()
+            }
+        }
 
         // ── 性能观测（阶段 1）：不参与任何控制流，只记录 ──
         // run 总墙钟起点 + 每轮累积器。埋点通过轮首的 `defer` 集中提交，
@@ -412,12 +452,8 @@ final class AgentService: ObservableObject {
         var workingHistory = history
         var allToolCalls: [ChatMessage.ToolCall] = []
         var lastThinking: String?
-        // 连续「纯正文」轮：既没结束暗号、也没工具调用的轮次。
-        // 用途只有一个 —— **兜底终止**：模型（尤其小模型）经常直接写出结论却不带结束暗号，
-        // 若只认暗号，循环会一直重复「请继续」，用户看到的是"答案已经出来了还在转圈"。
-        // 当它连续两轮写出高度相似的正文（不再调用工具）时，就把这段正文当作最终答案返回。
-        var lastPlainThinking: String?
-        var plainThinkingStreak = 0
+        // 「连续纯正文 / 连续重复调用 / 连续空回复」这三类记账都在 terminator 里 ——
+        // 它们决定"还应不应该再请求一轮"，属于循环控制，不属于这里。
         /// `lastThinking` 是在**第几轮**写下的。
         ///
         /// 为什么必须记这个：循环退出后有一段兜底「返回最后一轮思考内容，保证不吞回答」，
@@ -428,13 +464,8 @@ final class AgentService: ObservableObject {
         /// 这比"什么都不返回"更糟 —— 什么都不返回至少看起来是失败的。
         var lastThinkingIteration = 0
         var iteration = 0
-        // 重复调用检测：本地小模型很容易陷入"同一个工具、同一组参数"来回调。
-        // 原来只有 softIterationLimit 这一个兜底（50 轮），等它触发已经浪费了几十次生成。
-        var recentSignatures: [String] = []
-        var repeatStreak = 0
-        // 云端「一轮多调用」的重复判定用**上一轮签名集合**（本地仍用上面的逐次签名，理由见 run 内注释）。
-        // 两边分开存：本地走逐次签名、云端走集合签名，两种判定各自独立，互不影响。
-        var lastRoundSignatures: Set<String>?
+        // 重复调用检测（本地逐次签名 / 云端集合签名）也收在 terminator 里：
+        // 它同样是"还应不应该再请求一轮"的判定，和终止条件必须用同一套状态。
         // 「本会话内总是允许」的工具名集合（会话 = **本次 run**，即用户发出的这一个 agent 任务）。
         //
         // 为什么作用域是本次 run 而不是整个对话：
@@ -480,6 +511,9 @@ final class AgentService: ObservableObject {
             }
             iteration += 1
             liveIteration = iteration
+            // 记一轮（指标/断言用）。放在真正发起请求之前：从"决策"的角度，
+            // 这一轮的代价已经注定要付了。
+            terminator.beginRound()
 
             // 性能观测：本轮累积器。defer 会在本轮任一出口（continue / break / return）
             // 自动提交，因此埋点不会污染下面的控制流。
@@ -508,7 +542,7 @@ final class AgentService: ObservableObject {
                            reason: "App 在上一轮进行中被系统回收")
 
             // 软上限前一轮：通知模型这是最后一轮，必须收尾
-            if iteration == Self.softIterationLimit {
+            if iteration == loopPolicy.softIterationLimit {
                 appendStep(.thinking, "已连续思考 \(iteration - 1) 轮未结束，通知模型收尾")
                 workingHistory.append(ChatMessage(role: .tool, content: """
                 你已连续思考很多轮。本轮是最后一轮：不要再调用工具，\
@@ -516,7 +550,7 @@ final class AgentService: ObservableObject {
                 """))
             }
             // 超过软上限仍未结束：优雅退出，返回最后一轮内容
-            if iteration > Self.softIterationLimit { break }
+            if iteration > loopPolicy.softIterationLimit { break }
 
             let iterationID = bridge?.beginIteration()
             // 提示词分化（v0.3.45）：云端模型 → 全量工具目录 + 英文强化指令；
@@ -538,6 +572,9 @@ final class AgentService: ObservableObject {
             let genStart = Date()
             var firstTokenAt: Date?
             var raw = ""
+            // 结束暗号之后又收了多少字符（防跑飞尾巴的预算，见 loopPolicy 注释）。
+            var tailCharactersAfterSignal = 0
+            var sawEndSignal = false
             do {
                 if let bridge {
                     // 流式：逐 token 透传原始文本，气泡自动解析 <think> 思考块与正文
@@ -550,12 +587,28 @@ final class AgentService: ObservableObject {
 
                         // ── Reasoning 早停（阶段 2-3，可由开关关闭以复现 baseline）──
                         // Runtime 拥有停止权：一旦产出可执行的内容，就不再陪它继续生成。
-                        // 1) 结束暗号：云/本地都安全 —— 暗号之后的文本本来也会被丢弃。
+                        // 1) 结束暗号：**不能**在暗号处掐断这一轮。
+                        //
+                        // 提示词要求模型「先输出暗号，再输出最终回答正文」——所以暗号处掐断
+                        // 恰好把正文（用户唯一想看的东西）全部丢掉，`extractFinalAnswer`
+                        // 于是拿到"只有暗号没有正文"返回 nil，本轮被判成"纯思考"，循环继续，
+                        // 下一轮再掐一次……这是"答案不出、agent 一直转"的最凶的一条路径。
+                        // 现在只做两件事：标记"已进入收尾"，以及给尾巴一个防跑飞上限。
                         if optimizations.reasoningControl, token.contains("]"),
-                           raw.range(of: Self.endSignal, options: .caseInsensitive) != nil {
-                            reasoningRuntime.markFinalReady()
-                            appendStep(.thinking, "已产生最终答案信号，提前结束本轮生成")
-                            break
+                           Self.containsEndSignal(raw) {
+                            if !sawEndSignal {
+                                sawEndSignal = true
+                                reasoningRuntime.markFinalReady()
+                                appendStep(.thinking, "已产生最终答案信号，读完本轮正文")
+                            }
+                            // legacy 复现用：掐断这一轮（正文一起丢），线上为 false。
+                            if loopPolicy.stopStreamAtEndSignal { break }
+                            tailCharactersAfterSignal += token.count
+                            if loopPolicy.maxTailCharactersAfterSignal > 0,
+                               tailCharactersAfterSignal > loopPolicy.maxTailCharactersAfterSignal {
+                                appendStep(.thinking, "结束标记后仍持续长写，已截断本轮生成")
+                                break
+                            }
                         }
                         // 2) 完整合法工具调用：仅本地「一轮一调用」契约下早停。
                         //    云端一轮可能发多个独立调用，截断会丢掉后续调用，绝不早停。
@@ -617,20 +670,52 @@ final class AgentService: ObservableObject {
             // 1) 结束暗号优先：在【原始文本】上检测，避免答案被裹在 <think> 内时
             //    被提前剥离思考块而连暗号一起丢失。命中后再对最终答案单独剥离思考块，
             //    保证正文干净、不被当成"思考内容"吞掉。
-            if let pre = Self.extractFinalAnswer(from: raw) {
-                let answer = Self.stripThinkTags(pre)
-                reasoningRuntime.markFinalReady()
-                appendStep(.finalAnswer, "检测到结束暗号，输出最终回答")
-                if let id = iterationID { bridge?.endIteration(id) }
-                return (answer, allToolCalls)
+            //    「只有暗号、正文为空」也是一种状态：允许补一次正文，但**不允许**无限重试
+            //    （修复前它正是那个"每轮只吐一个暗号、循环停不下来"的死循环）。
+            // 先解析「是不是有效的工具调用」：结束暗号与工具调用同时出现时，
+            // **工具调用优先**（协议上工具调用是必须被执行的，不能因为顺带写了个结束标记就丢掉它）。
+            // 推理模型会把工具 JSON 裹在 <think> 里，所以先剥离思考块再解析。
+            let content = Self.stripThinkTags(raw)
+            let outcome = Self.parseToolOutcome(from: content, tools: liveTools)
+            var hasValidToolCall = false
+            if case .call = outcome { hasValidToolCall = true }
+            // 「工具名不认识」也是一种"有动作意图"：此时**不能**走下面的结束暗号分支。
+            // 否则这段工具 JSON 会被 extractFinalAnswer 当成正文返回（用户看到一段原始 JSON），
+            // 而且跳过后面那条"未知工具 → 回填可用工具名、让模型改对"的纠正路径。
+            var hasUnknownToolCall = false
+            if case .unknownTool = outcome { hasUnknownToolCall = true }
+
+            if Self.containsEndSignal(raw), hasValidToolCall {
+                // 不在这里收尾：本轮的调用照常执行，下一轮模型再给结论时收尾。
+                appendStep(.thinking, "本轮同时出现工具调用与结束标记：先执行工具调用")
             }
 
-            // 其余路径：推理模型会把工具 JSON 裹在 <think> 里，先剥离思考块再解析
-            let content = Self.stripThinkTags(raw)
+            if Self.containsEndSignal(raw), !hasValidToolCall, !hasUnknownToolCall {
+                reasoningRuntime.markFinalReady()
+                let extracted = Self.extractFinalAnswer(from: raw).map(Self.stripThinkTags)
+                switch terminator.evaluateEndSignal(answer: extracted) {
+                case .finalAnswer(let answer):
+                    appendStep(.finalAnswer, "检测到结束暗号，输出最终回答")
+                    if let id = iterationID { bridge?.endIteration(id) }
+                    return (answer, allToolCalls)
+                case .retryOnceForBody:
+                    appendStep(.thinking, "只出现了结束标记、没有正文，请求模型补上正文")
+                    if let id = iterationID { bridge?.endIteration(id) }
+                    workingHistory.append(ChatMessage(role: .assistant, content: raw))
+                    workingHistory.append(ChatMessage(role: .tool, content: """
+                    你输出了 \(Self.endSignal) 但没有给出最终回答正文。
+                    请直接输出最终回答正文（不要再输出结束标记，也不要调用工具）。
+                    """))
+                    continue
+                case .finishWithoutBody(let fallback):
+                    appendStep(.finalAnswer, "只有结束标记、没有正文，已停止本次运行")
+                    if let id = iterationID { bridge?.endIteration(id) }
+                    return (fallback, allToolCalls)
+                }
+            }
 
             // 2) 有效的工具调用：执行并把结果回填上下文，进入下一轮
             // 用**本轮实际可用的工具**校验（含 MCP / 插件），修掉"广告了却调不到"
-            let outcome = Self.parseToolOutcome(from: content, tools: liveTools)
             if case .unknownTool(let badName) = outcome {
                 // JSON 合法但工具名不认识：回填一条**精确**错误 + 可用工具名，
                 // 让模型下一轮能直接改对。原来这里会落进模糊提示，白费一轮。
@@ -650,9 +735,8 @@ final class AgentService: ObservableObject {
                 // Reasoning 门控：已确定动作 → 结束 reasoning。重置预算与重复检测，
                 // 让"下一步"从最小预算重新开始（阶段 2 的渐进式预算语义）。
                 reasoningRuntime.registerAction()
-                // 有工具调用 = 模型在真正推进，纯正文兜底计数清零。
-                plainThinkingStreak = 0
-                lastPlainThinking = nil
+                // 有工具调用 = 模型在真正推进，纯正文 / 空回复计数清零。
+                terminator.noteToolCall()
                 // 本地 / 云端在这里**分叉**，两边的行为差异是有意的、必须保持（原因见下面两个分支）：
                 //   云端 useCloud == true  → 一轮可发多个独立调用：逐个授权 → 并发执行 → 按原顺序回填
                 //   本地 useCloud == false → 一轮只执行第一个调用（小模型小步快跑更稳）
@@ -677,24 +761,20 @@ final class AgentService: ObservableObject {
                     // · 用 Set 顺带吸收同一批调用的顺序变化（[A,B] 与 [B,A] 是同一批工作）。
                     // 本地一侧仍走下面逐次比较的判定。
                     let signatures = calls.map { $0.name + "|" + Self.compactJSON($0.arguments) }
-                    let roundSignatures = Set(signatures)
-                    if let previous = lastRoundSignatures, previous == roundSignatures {
-                        repeatStreak += 1
-                    } else {
-                        repeatStreak = 0
-                    }
-                    lastRoundSignatures = roundSignatures
-                    if repeatStreak >= 1 {
+                    switch terminator.registerCallSet(Set(signatures)) {
+                    case .proceed:
+                        break
+                    case .warning(let round):
                         appendStep(.thinking,
-                                   "检测到重复调用（第 \(repeatStreak + 1) 轮：与上一轮完全相同的调用集合）："
+                                   "检测到重复调用（第 \(round) 轮：与上一轮完全相同的调用集合）："
                                    + calls.map(\.name).joined(separator: ", "))
-                    }
-                    if repeatStreak >= 2 {
+                    case .abort:
                         appendStep(.finalAnswer, "同一批调用已连续 3 轮完全相同，停止以避免空转")
                         if let id = iterationID { bridge?.endIteration(id) }
                         let names = calls.map(\.name).joined(separator: "、")
                         let msg = "已停止：同一批工具调用（\(names)）用同一组参数连续 3 轮完全相同，"
                             + "结果不可能改变。以上是用当前结果能给出的回答。"
+                        terminator.finish(.repeatToolCalls, answer: msg)
                         return (msg, allToolCalls)
                     }
 
@@ -923,20 +1003,17 @@ final class AgentService: ObservableObject {
                 // 同工具 + 同参数连续重复：先注入一条强提示，连续第 3 次就中止，
                 // 避免把 50 轮上限耗在同一次无效调用上（小模型上很容易发生）。
                 let signature = call.name + "|" + argsJSON
-                if recentSignatures.last == signature {
-                    repeatStreak += 1
-                } else {
-                    repeatStreak = 0
-                }
-                recentSignatures.append(signature)
-                if repeatStreak >= 1 {
-                    appendStep(.thinking, "检测到重复调用 \(call.name)（第 \(repeatStreak + 1) 次）")
-                }
-                if repeatStreak >= 2 {
+                switch terminator.registerCallSignature(signature) {
+                case .proceed:
+                    break
+                case .warning(let round):
+                    appendStep(.thinking, "检测到重复调用 \(call.name)（第 \(round) 次）")
+                case .abort:
                     appendStep(.finalAnswer, "同一工具同一参数已连续调用 3 次，停止以避免空转")
                     if let id = iterationID { bridge?.endIteration(id) }
                     let msg = "已停止：同一工具（\(call.name)）用同一组参数连续调用了 3 次仍未推进。"
                         + "以上是用当前结果能给出的回答。"
+                    terminator.finish(.repeatToolCalls, answer: msg)
                     return (msg, allToolCalls)
                 }
 
@@ -1066,18 +1143,22 @@ final class AgentService: ObservableObject {
 
                 // ── 纯正文兜底终止 ──
                 // 模型没有输出结束暗号，也没有调用工具，只写了一段正文。
-                // 若它**连续两轮**写出高度相似的正文（说明它其实已经答完，只是没按约定给暗号），
-                // 就把这段正文当作最终答案返回 —— 否则循环会一直重复"请继续"，用户看到答案却停不下来。
-                plainThinkingStreak += 1
-                let repeatedAnswer = lastPlainThinking.map {
-                    Self.sameAnswer($0, content)
-                } ?? false
-                lastPlainThinking = content
-                if (repeatedAnswer || plainThinkingStreak >= 4),
-                   content.trimmingCharacters(in: .whitespacesAndNewlines).count >= 40 {
-                    appendStep(.finalAnswer, "未检测到结束暗号，已把模型最后一段回答作为最终答案")
+                // 判定交给 terminator（连续两轮相似 / 连续多轮无动作 / 连续空回复）。
+                // 修复前这里是「相似 **或** 连续 4 轮」+ ≥40 字：模型已经把结论写出来时，
+                // 还要再烧 1~3 次完整请求（每次重发整段历史）才停 —— 用户看到的正是
+                // "答案都在界面上了，它还在转"。
+                switch terminator.evaluatePlainRound(content) {
+                case .finishAsAnswer(let answer, let reason):
+                    appendStep(.finalAnswer, "未检测到结束暗号（\(reason.label)），已停止并采用最后一段回答")
                     if let id = iterationID { bridge?.endIteration(id) }
-                    return (content, allToolCalls)
+                    return (answer, allToolCalls)
+                case .keepThinking:
+                    break
+                }
+                if terminator.isFinished {
+                    // 理论上不可达（上面已处理）；留一道防线，避免"已结束"还继续请求模型。
+                    if let id = iterationID { bridge?.endIteration(id) }
+                    return (terminator.finalAnswer ?? content, allToolCalls)
                 }
 
                 // ── Reasoning 门控（阶段 2-4，可由开关关闭以复现 baseline）──
@@ -1117,6 +1198,16 @@ final class AgentService: ObservableObject {
                     """
                 } else if let forced = reasoningRuntime.forcedActionDirective() {
                     hint = forced
+                } else if terminator.plainTextStreak >= 2 {
+                    // 已经连着两轮"只写正文、不调用工具"：按主流编码 agent 的语义，
+                    // 这时模型给不出下一步动作了。给一次强指令逼它二选一；
+                    // 仍不动手就由 policy.plainTextHardLimit 收尾，不再重发到软上限。
+                    hint = """
+                    你已经连续 \(terminator.plainTextStreak) 轮只输出正文、没有调用任何工具。
+                    现在必须二选一，不要再只写思考：
+                    - 需要工具：只输出一个工具 JSON，如 {"name": "<工具名>", "arguments": {...}}
+                    - 已经够了：先输出 \(Self.endSignal)，紧接着输出最终回答正文。
+                    """
                 } else {
                     hint = """
                     继续。若需调用工具，只输出工具 JSON；
@@ -1127,13 +1218,9 @@ final class AgentService: ObservableObject {
             }
         }
 
-        // 走到这里说明是正常结束（出了结束暗号 / 软上限 / 取消）——
-        // 正常结束就把存档清掉，否则下次启动会去"续"一个早就完成的任务。
-        if !Task.isCancelled {
-            AgentCheckpointStore.shared.clear()
-        }
-
         // 循环只在「取消」或「软上限耗尽」时到达这里。
+        // 清档不在这里做：统一由 run 开头的 defer 按 terminator 的终止原因决定
+        // （取消 / 生成失败保留存档，其余完成态清档）。散着写就是这次 P0 bug 的成因。
         //
         // 兜底的第一条判据是「最后一次思考**就是上一轮**写的」。只判 `lastThinking` 非空
         // 是不够的：它可能来自几十轮之前（见上面 lastThinkingIteration 的注释），
@@ -1141,6 +1228,7 @@ final class AgentService: ObservableObject {
         // 其实没有"，比明确说失败更糟。
         if let last = lastThinking, !last.isEmpty, lastThinkingIteration >= iteration - 1 {
             appendStep(.finalAnswer, "已停止（未输出结束暗号），返回最后一轮内容")
+            terminator.finish(Task.isCancelled ? .cancelled : .softLimit, answer: last)
             return (last, allToolCalls)
         }
 
@@ -1153,13 +1241,15 @@ final class AgentService: ObservableObject {
         // 然后就停了 —— 它认为"清单全绿"就等于交付完成，而报告一个字都没写。
         // 提示词里已经要求它先输出结束暗号再写正文，但模型不一定遵守；
         // 运行时这一侧至少不能把这种失败伪装成成功。
-        let reason = Task.isCancelled ? "任务被取消" : "已达到 \(Self.softIterationLimit) 轮上限"
+        let reason = Task.isCancelled ? "任务被取消" : "已达到 \(loopPolicy.softIterationLimit) 轮上限"
         let fallback = """
         ⚠️ 这次没有产出最终答案（\(reason)）。
         模型在最后一轮只调用了工具、没有写出结论正文 —— 这通常意味着它把"步骤跑完"当成了"任务完成"。
         建议：直接回一句「把结果汇总给我」，或把任务拆小一点重发一次。
         """
         appendStep(.finalAnswer, fallback)
+        // 取消时**不**记成"完成"：取消要保留断点存档，回前台才能续跑。
+        terminator.finish(Task.isCancelled ? .cancelled : .softLimit, answer: fallback)
         return (fallback, allToolCalls)
     }
 
@@ -1648,16 +1738,12 @@ final class AgentService: ObservableObject {
     }
 
     /// 两段「纯正文」是否高度相似（用于兜底终止：模型已经答完却不出结束暗号）。
-    /// 判据保守 —— 只有整段相等、或一段以另一段为前缀/包含时才认为相似，
-    /// 且要求足够长（≥40 字），避免把两段短思考误判成"答完了"。
+    ///
+    /// 委托给 `AgentAnswerSimilarity`（纯函数，可测）：判据在"整段相等 / 前缀 / 包含"
+    /// 之外补了词袋相似度 —— 模型把同一段结论换个措辞重写是最常见的收尾形态，
+    /// 旧的判据认不出来，于是循环继续、请求继续。
     static func sameAnswer(_ a: String, _ b: String) -> Bool {
-        let na = a.trimmingCharacters(in: .whitespacesAndNewlines)
-        let nb = b.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard na.count >= 40, nb.count >= 40 else { return false }
-        if na == nb { return true }
-        let short = na.count <= nb.count ? na : nb
-        let long = na.count <= nb.count ? nb : na
-        return long.hasPrefix(short) || long.contains(short)
+        AgentAnswerSimilarity.isSameAnswer(a, b, policy: loopPolicy)
     }
 
     // MARK: - 一轮多调用的并发执行（仅云端）

@@ -238,6 +238,33 @@ enum ShellSandbox {
         }
     }
 
+    /// `runWithExitCode` 的异步包装:语义与 `runAsync` 完全一致,只是额外把
+    /// **退出码**带出来(终端页要显示每一步的 `$?`,而 `runAsync` 只返回文本)。
+    ///
+    /// 局限与 `runAsync` 逐条相同:底层仍是同步阻塞实现,`timeoutSeconds` 的含义是
+    /// "调用方不再等待"(命令仍会在 execQueue 上跑完),不是真的中断执行。
+    /// 超时时返回退出码 124(沿用 GNU `timeout` 的惯例),便于界面显示成"超时"。
+    static func runWithExitCodeAsync(_ input: String, timeoutSeconds: Double? = nil) async -> (text: String, exitCode: Int) {
+        await withCheckedContinuation { (cont: CheckedContinuation<(text: String, exitCode: Int), Never>) in
+            let once = OnceFlag()
+            execQueue.async {
+                let out = runWithExitCode(input)
+                once.fireOnce { cont.resume(returning: out) }
+            }
+            if let timeoutSeconds, timeoutSeconds > 0 {
+                Task.detached(priority: .utility) {
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    once.fireOnce {
+                        cont.resume(returning: (
+                            text: "(shell 超时:命令在 \(timeoutSeconds)s 内未返回，已放弃等待；该命令的后台执行仍可能继续)\n",
+                            exitCode: 124
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - 会话状态重置
 
     /// 重置"会话级"状态:cwd / PWD 回沙盒根、export 的环境变量清空、命令历史清空。

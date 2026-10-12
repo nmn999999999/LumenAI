@@ -2348,6 +2348,11 @@ enum BuiltInTools {
         // 变的只是"退出码现在能带出去了"。
         let (raw, exitCode) = ShellSandbox.runWithExitCode(command)
 
+        // 记进终端 transcript：这条命令与终端页手敲的命令用的是同一个沙盒会话，
+        // 只有写进同一份记录，用户在终端页才看得到 agent 到底跑了什么、退出码是多少。
+        // 放在这里（唯一的执行点）而不是包装成第二个入口，避免"某个分支忘了记"。
+        ShellTranscript.shared.record(source: .agent, command: command, output: raw, exitCode: exitCode)
+
         // 失败前缀**只加在"沙盒不认识这条命令"这一种情况**上，判据与改之前完全一致。
         //
         // 为什么不再顺手把"退出码非 0"也判成失败：退出码非 0 不都是错误。

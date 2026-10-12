@@ -32,6 +32,19 @@ bool llama_bridge_load_model(llama_bridge * b,
 // Returns a UTF-8 error string (valid until the next bridge call).
 const char * llama_bridge_last_error(llama_bridge * b);
 
+// Report whether the loaded model actually went to the GPU: returns the most
+// recent llama.cpp log line about offload / the Metal backend, e.g.
+//   "load_tensors: offloaded 32/33 layers to GPU"
+//   "load_tensors: offloaded 0/33 layers to GPU"      (纯 CPU)
+//   "ggml_metal_init: found device: Apple A17 Pro GPU"
+// Returns "" when there is no such line yet (model not loaded on this bridge).
+// The pointer is owned by the bridge and stays valid until the next call to
+// this function on the same thread.
+//
+// 为什么要这条：`n_gpu_layers` 只是我们**要求**的，真正跑没跑 GPU 只有 llama.cpp
+// 自己知道（后端初始化可能失败并回落到 CPU 而不报错）。设置页显示这条 = 可验证。
+const char * llama_bridge_backend_note(llama_bridge * b);
+
 // Request the running chat generation to stop at the next token boundary.
 // Safe to call from any thread while llama_bridge_chat() is running.
 void llama_bridge_stop(llama_bridge * b);
