@@ -26,7 +26,7 @@
 | **Metal 运行期证据** | ✅ 从 llama.cpp 自己的日志取 offload 结论（`load_tensors: offloaded N/M layers to GPU`），不拿开关冒充；**真机输出未取证** |
 | VT100 终端渲染 | ⬜ **未做**——现在是原始字节 + ANSI 清洗，全屏程序（vim/top）显示会不对 |
 | 真实模型的 token / TTFT / P95 | ⛔ 本机无 API Key，**不可观测**，不伪造 |
-| 提交到 git | ⛔ **还没 commit**（改动全在工作区） |
+| 提交到 git | ✅ 已提交（特性 `c89c3e8` + 本索引提交）；**推送与 GitHub Release 待本机凭据**（`gh` token 失效 + 钥匙串里没有 github.com 凭据，见最后一节） |
 
 ---
 
@@ -473,3 +473,38 @@ LUMEN_NET_PROBE=1 ./tests/ish_boot/run.sh /tmp/ish-rootfs/iSH-root.tar.gz /tmp/i
 LUMEN_SHUTDOWN_PROBE=1 ./tests/ish_boot/run.sh /tmp/ish-rootfs/iSH-root.tar.gz /tmp/ish-rootfs/root 90
 # 期望："[lumen] RESULT SHUTDOWN_OK … 杀掉 N 个客户机用户进程后 pty 被清理（会话确实结束了）"
 ```
+
+## 五、发布（v0.3.87）
+
+本地产物已经做好，**只差推送和造 Release** —— 这两步需要 GitHub 凭据，而当前环境里：
+`gh auth status` 报 token 失效（`~/.config/gh/hosts.yml` 里读不到可用 token）、
+钥匙串里没有 `github.com` 的凭据（`git credential-osxkeychain get` 返回空）、
+`~/.ssh/id_ed25519` 也没在 GitHub 上注册（`ssh -T git@github.com` → `Permission denied (publickey)`）。
+所以推送/发 Release 没法由代理代做。
+
+已备好：
+- `LumenAI-v0.3.87.ipa`（28,499,045 B，未签名，`Payload` 结构与 CI 一致：主二进制 61,408,328 B、
+  `SherpaOnnxC.framework`、`LumenAIWidget.appex`（版本同样 0.3.87/87）、`mlx-swift_Cmlx.bundle`）；
+- `update/index.json` 已升到 0.3.87（单独一个提交，见下）；
+- 发布说明：`/tmp/lumenai-v0.3.87-notes.md`。
+
+**执行顺序不能反**（先造 Release 再推索引提交）：
+
+```bash
+gh auth login                                   # 一次性：重新登录，拿到有 repo 权限的 token
+
+# 1) 先推特性提交（此时索引还是 0.3.85，用户不会被引到还不存在的下载链接）
+git push origin c89c3e8:main
+
+# 2) 造 v0.3.87 的 Release（tag 指向 c89c3e8）并上传 IPA
+gh release create v0.3.87 --target c89c3e8 \
+  --title "LumenAI v0.3.87 — 真 Linux 会话：联网 / DNS / 关闭 + 开发者诊断" \
+  --notes-file /tmp/lumenai-v0.3.87-notes.md \
+  LumenAI-v0.3.87.ipa
+
+# 3) 再推索引提交（这时 …/download/v0.3.87/LumenAI-v0.3.87.ipa 已经有效）
+git push origin main
+```
+
+为什么顺序只能这样：索引**超前**而资产不存在时，App 会把它当成新版本并把用户引到 404 的下载链接
+（`checkGrayIndex` 只在"索引落后"时能靠 GitHub `releases/latest` 交叉取较大者自愈，反过来不能）。
