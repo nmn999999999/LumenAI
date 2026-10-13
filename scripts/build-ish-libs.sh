@@ -54,7 +54,11 @@ build_linux_mode() {
 build_linux_engines() {
   if [ ! -f "${ISH}/deps/linux/arch/ish/x86/Makefile" ]; then
     echo "拉取 Linux 模式内核源码（ish-app/linux，sparse+depth1）…"
-    /bin/sh "${ISH}/deps/clone-linux.sh"
+    # clone-linux.sh 里全是**相对路径**（deps/linux、deps/linux-sparse.txt），必须在 iSH
+    # 仓库根目录下跑。从 LumenAI 根直接调会先报 "pathspec 'deps/linux' did not match"，
+    # 再拿空 URL 去 clone —— 于是整个构建挂掉（CI run 38410175462 即如此，本机因为
+    # deps/linux 目录早就位、从没走到这条分支，所以一直没暴露）。
+    (cd "${ISH}" && /bin/sh deps/clone-linux.sh)
     /bin/bash "${SRCROOT}/scripts/patch-ish-vdso.sh"   # 内核 vdso 的链接补丁在 clone 之后才生效
   fi
   LCOMMON=(-configuration ReleaseLinux -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="")

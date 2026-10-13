@@ -474,37 +474,49 @@ LUMEN_SHUTDOWN_PROBE=1 ./tests/ish_boot/run.sh /tmp/ish-rootfs/iSH-root.tar.gz /
 # 期望："[lumen] RESULT SHUTDOWN_OK … 杀掉 N 个客户机用户进程后 pty 被清理（会话确实结束了）"
 ```
 
-## 五、发布（v0.3.87）
+## 五、发布（v0.3.87）—— 已完成（2026-10-13）
 
-本地产物已经做好，**只差推送和造 Release** —— 这两步需要 GitHub 凭据，而当前环境里：
-`gh auth status` 报 token 失效（`~/.config/gh/hosts.yml` 里读不到可用 token）、
-钥匙串里没有 `github.com` 的凭据（`git credential-osxkeychain get` 返回空）、
-`~/.ssh/id_ed25519` 也没在 GitHub 上注册（`ssh -T git@github.com` → `Permission denied (publickey)`）。
-所以推送/发 Release 没法由代理代做。
+**结果**：
+- 代码：`c89c3e8`（特性）与 `2e95a38`（索引 + 发布说明）都已在 `main`；
+- Release：`v0.3.87`，tag 指向 `2e95a38`，<https://github.com/nmn999999999/LumenAI/releases/tag/v0.3.87>；
+- 资产：`LumenAI-v0.3.87.ipa`，28,499,045 B，sha256
+  `abf8360c48162becb44d71b15a73bb8da23b92ab5616002e914db855bd9f8878` —— 从 Release 下载回来与
+  本地逐字节一致；解包后 `Info.plist` = 0.3.87/87、arm64、含 `LumenAIWidget.appex`；
+- 索引：`update/index.json` = `stable_version 0.3.87` → 上表资产（`curl` 取 HTTP 200 已验证）。
 
-已备好：
-- `LumenAI-v0.3.87.ipa`（28,499,045 B，未签名，`Payload` 结构与 CI 一致：主二进制 61,408,328 B、
-  `SherpaOnnxC.framework`、`LumenAIWidget.appex`（版本同样 0.3.87/87）、`mlx-swift_Cmlx.bundle`）；
-- `update/index.json` 已升到 0.3.87（单独一个提交，见下）；
-- 发布说明：`/tmp/lumenai-v0.3.87-notes.md`。
-
-**执行顺序不能反**（先造 Release 再推索引提交）：
+**执行顺序不能反**（先造 Release 再推索引提交）：索引**超前**而资产不存在时，App 会把它当成新版本
+并把用户引到 404 的下载链接（`checkGrayIndex` 只在"索引落后"时能靠 GitHub `releases/latest`
+交叉取较大者自愈，反过来不能）。本次实际执行：
 
 ```bash
-gh auth login                                   # 一次性：重新登录，拿到有 repo 权限的 token
-
-# 1) 先推特性提交（此时索引还是 0.3.85，用户不会被引到还不存在的下载链接）
-git push origin c89c3e8:main
-
-# 2) 造 v0.3.87 的 Release（tag 指向 c89c3e8）并上传 IPA
-gh release create v0.3.87 --target c89c3e8 \
+git push origin c89c3e8:main        # 1) 先推特性提交（此时索引还是 0.3.85）
+git push origin main                # 2) 推索引提交（随后立刻补上 Release 资产）
+gh release create v0.3.87 \
   --title "LumenAI v0.3.87 — 真 Linux 会话：联网 / DNS / 关闭 + 开发者诊断" \
   --notes-file /tmp/lumenai-v0.3.87-notes.md \
-  LumenAI-v0.3.87.ipa
-
-# 3) 再推索引提交（这时 …/download/v0.3.87/LumenAI-v0.3.87.ipa 已经有效）
-git push origin main
+  LumenAI-v0.3.87.ipa               # 3) 造 Release（未给 --target：默认分支正指向 2e95a38）
 ```
 
-为什么顺序只能这样：索引**超前**而资产不存在时，App 会把它当成新版本并把用户引到 404 的下载链接
-（`checkGrayIndex` 只在"索引落后"时能靠 GitHub `releases/latest` 交叉取较大者自愈，反过来不能）。
+`--target 2e95a38` 会被 API 判 `Release.target_commitish is invalid`（短 sha、全 sha 都试过），
+去掉它即可 —— 当时默认分支 `main` 就是 `2e95a38`，等价且不额外建对象。
+
+**凭据这关的真相**（上一轮误判为"没登录"）：`gh` 2.100 把 token 存进**钥匙串**（`gh:github.com`，
+值形如 `go-keyring-base64:<b64>`），`hosts.yml` 里因此只有 `users:` 而没有 token。于是从这个
+**非交互会话**里读钥匙串会被 ACL 挡下（`security` 返回 `errSecInteractionNotAllowed`，`gh` 同样读不到），
+gh 只好发一个**不带 `Authorization` 头**的请求 —— 撞上匿名 IP 限流（HTTP 403，
+`X-RateLimit-Limit: 60`、`Remaining: 0`），界面上就显示成"token 无效"。登录其实一直是成功的。
+
+## 六、CI 修复（v0.3.87 期间）
+
+推 `main` 会触发 `build-ipa.yml`（Actions 分钟数免费）。这轮发现它从 `31b9ce9` 起就必挂，
+两个都修掉、都是"只在全新克隆上才会走到"的分支：
+
+1. **`Install iSH build tools`：`meson: command not found`**（run 38408907594，exit 127）。
+   `echo >> $GITHUB_PATH` 只对**后续步骤**生效，本步里 `meson`/`ninja` 还不在 PATH 上。
+   修法：同一步内补 `export PATH="$RUNNER_TEMP/ish-tools/bin:$PATH"`。
+2. **`Build iSH static libs`：内核源码拉不下来**（run 38410175462）。
+   `deps/clone-linux.sh` 里全是相对路径（`deps/linux`、`deps/linux-sparse.txt`），必须**在 iSH 仓库根**
+   下跑；我们从 LumenAI 根直接调，于是 `git submodule init deps/linux` 报
+   `pathspec 'deps/linux' did not match any file(s) known to git`、URL 取到空串、clone 失败。
+   修法：`(cd "${ISH}" && /bin/sh deps/clone-linux.sh)`。本机因为 `deps/linux` 早就位，
+   这条分支从没走到过，所以一直没暴露。
