@@ -290,6 +290,8 @@ jobs:
             /bin/bash scripts/build-ish-libs.sh
           for lib in \
             third_party/ish/build/ReleaseLinux-iphoneos/liblumen-linux.a \
+            third_party/ish/build/ReleaseLinux-iphoneos/libiSHLinux.a \
+            third_party/ish/build/ReleaseLinux-iphoneos/libiSHLinuxUser.a \
             third_party/ish/build/ReleaseLinux-iphoneos/meson/libish_emu.a \
             third_party/ish/build/ReleaseLinux-iphoneos/meson/libfakefs.a \
             third_party/ish/deps/build/Release-iphoneos/libarchive.a; do

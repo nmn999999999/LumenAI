@@ -520,3 +520,12 @@ gh 只好发一个**不带 `Authorization` 头**的请求 —— 撞上匿名 IP
    `pathspec 'deps/linux' did not match any file(s) known to git`、URL 取到空串、clone 失败。
    修法：`(cd "${ISH}" && /bin/sh deps/clone-linux.sh)`。本机因为 `deps/linux` 早就位，
    这条分支从没走到过，所以一直没暴露。
+3. **`Build iSH static libs`：缺 `libiSHLinuxUser.a`**（run 38411310394）。上面两处修好后，
+   内核源码拉下来了、`liblinux.a` + `libiSHLinux.a` 也编出来了（`** BUILD SUCCEEDED **`），
+   但 `libiSHLinuxUser` 是 `iSH.xcodeproj` 里**独立 target**，不是那两个的依赖 —— 脚本只编了
+   `liblinux`/`libiSHLinux`，合成 `liblumen-linux.a` 时 `/usr/bin/libtool` 报
+   `can't open file: …/libiSHLinuxUser.a`。本机那份也是手动编的，所以同样没暴露。
+   修法：脚本补一条 `xcodebuild -target libiSHLinuxUser`（本地已验证该 target 可编、合成出
+   784 个成员且 `_run_kernel`/`_actuate_kernel`/`_linux_start_session`/`_init_devpts_fs`/
+   `_fakefs_import` 都在）；工作流的存在性检查里补上 `libiSHLinux.a` / `libiSHLinuxUser.a`，
+   以后"少一个 .a"会被点名，而不是只甩一句 libtool 错。

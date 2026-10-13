@@ -64,6 +64,10 @@ build_linux_engines() {
   LCOMMON=(-configuration ReleaseLinux -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="")
   xcodebuild -project "${ISH}/iSH.xcodeproj" -target liblinux    "${LCOMMON[@]}" build
   xcodebuild -project "${ISH}/iSH.xcodeproj" -target libiSHLinux "${LCOMMON[@]}" build
+  # libiSHLinuxUser 是**独立 target**，不是上面两个的依赖 —— 不单独编就没有
+  # libiSHLinuxUser.a，合成 liblumen-linux.a 时 /usr/bin/libtool 会直接
+  # "can't open file" 挂掉（CI run 38411310394）。本机那份是手动编出来的，所以一直没暴露。
+  xcodebuild -project "${ISH}/iSH.xcodeproj" -target libiSHLinuxUser "${LCOMMON[@]}" build
   echo "iSH Linux 模式库构建完成"
 }
 
