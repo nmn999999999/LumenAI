@@ -266,6 +266,9 @@ jobs:
           "$RUNNER_TEMP/ish-tools/bin/pip" install --quiet --upgrade pip
           "$RUNNER_TEMP/ish-tools/bin/pip" install --quiet meson ninja ziglang
           echo "$RUNNER_TEMP/ish-tools/bin" >> "$GITHUB_PATH"
+          # $GITHUB_PATH 只对**之后的步骤**生效，本步自己还得手动进 PATH：
+          # 不加这一行，下面的 meson/ninja 会 command not found（CI run 38408907594 即如此挂掉）。
+          export PATH="$RUNNER_TEMP/ish-tools/bin:$PATH"
           # patch-ish-vdso.sh 自己会按 ISH_ZIG → PATH → pip 包 的顺序找 zig，
           # 这里显式给一个，省掉"在 runner 上猜路径"的不确定性。
           ZIG="$("$RUNNER_TEMP/ish-tools/bin/python" -c 'import os,ziglang;print(os.path.join(os.path.dirname(ziglang.__file__),"zig"))')"
